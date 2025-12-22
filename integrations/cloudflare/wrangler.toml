@@ -1,0 +1,4 @@
+name = "cheq-rti-v4-integration-cloudflare"
+main = "src/index.ts"
+compatibility_date = "2025-12-22"
+usage_model = "bundled"

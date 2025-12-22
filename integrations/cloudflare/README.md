@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/cheq-ai/rti-cdn-integrations/main/assets/cheq-logo.svg">
 </div>
 
-# rti-cdn-integrations
+# cheq-rti-cdn-integrations::cloudflare
 
 ![Integration Version](https://img.shields.io/github/v/release/cheq-ai/cheq-rti-integration-cloudflare?label=Integration%20Version)
 ![Cloudflare Wrangler](https://img.shields.io/badge/Cloudflare_Wrangler-3.6.0-44cc11)
