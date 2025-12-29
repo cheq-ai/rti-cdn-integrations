@@ -11,13 +11,13 @@ This repository provides the components to invoke RTI from Cloudflare.
 
 ### Documentation
 
-[Cloudflare Integration](https://cheq-ai.github.io/cheq-rti-integration-cloudflare)
+[Cloudflare Integration](https://cheq-ai.github.io/rti-cdn-integrations/integrations/cloudflare)
 
 Built with [Cloudflare Wrangler](https://developers.cloudflare.com/workers/wrangler/)
 
 ### Prerequisites:
 
-Modify the [configuration](https://cheq-ai.github.io/cheq-rti-integration-cloudflare/interfaces/CloudflareConfig.html)
+Modify the [configuration](https://cheq-ai.github.io/rti-cdn-integrations/integrations/cloudflare/interfaces/CloudflareConfig.html)
 at `src/config.ts` to set your `apiKey` and `tagHash`
 
 ### Verify config

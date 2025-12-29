@@ -3,7 +3,7 @@ import { Mode } from '../../core/models/mode.model';
 import { RTIResponse } from '../../core/models/rti-response.model';
 
 /**
- * See {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html | Config}
+ * See {@link https://cheq-ai.github.io/rti-cdn-integrations/interfaces/Config.html | Config}
  */
 export interface CloudflareConfig extends Config {
     /**
@@ -12,7 +12,7 @@ export interface CloudflareConfig extends Config {
     telemetry: boolean;
 
     /**
-     * Called when {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html#challengeCodes | challengeCodes } are configured
+     * Called when {@link https://cheq-ai.github.io/rti-cdn-integrations/interfaces/Config.html#challengeCodes | challengeCodes } are configured
      * @param request
      * @param response
      */
