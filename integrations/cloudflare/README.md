@@ -4,7 +4,7 @@
 
 # cheq-rti-cdn-integrations::cloudflare
 
-![Integration Version](https://img.shields.io/github/v/release/cheq-ai/cheq-rti-integration-cloudflare?label=Integration%20Version)
+![Integration Version](https://img.shields.io/github/v/release/cheq-ai/rti-cdn-integrations?label=Integration%20Version)
 ![Cloudflare Wrangler](https://img.shields.io/badge/Cloudflare_Wrangler-3.6.0-44cc11)
 
 This repository provides the components to invoke RTI from Cloudflare.
