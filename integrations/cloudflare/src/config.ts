@@ -17,20 +17,20 @@ export interface CloudflareConfig extends Config {
      * @param response
      */
     challenge?: (request: Request, response: RTIResponse) => Promise<Response>;
-
-    /**
-     * Enables local debug logging
-     */
-    debug?: boolean;
 }
 
 export const config: CloudflareConfig = {
     mode: Mode.MONITORING,
-    apiKey: 'REPLACE_ME',
-    tagHash: 'REPLACE_ME',
-    blockCodes: [7, 10, 11, 16, 18],
-    redirectCodes: [2, 3, 6],
+    apiKey: "REPLACE_ME",
+    tagHash: "REPLACE_ME",
+    blockCodes: [7, 10, 11, 16, 18, 13],
+    redirectCodes: [2, 3],
     redirectLocation: "https://www.cheq.ai/",
-    timeout: 300,
+    challengeCodes: [6],
+    challenge: async (request: Request, response: RTIResponse) => {
+        return new Response("<html>captcha</html>");
+    },
+    timeout: 500,
     telemetry: true,
+    // debug: true,
 };

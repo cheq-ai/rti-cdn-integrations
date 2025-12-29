@@ -35,7 +35,7 @@ export default {
                 endUserParams: {
                     clientIp: request.headers.get('x-real-ip')!,
                     requestUrl: requestURL.href,
-                    headerNames: Object.keys(fetchedHeaders).join(","),
+                    headerNames: Object.keys(fetchedHeaders).filter(x => fetchedHeaders[x]).join(","),
                     method: request.method,
                     headers: fetchedHeaders,
                 },
@@ -103,10 +103,9 @@ function getHeaders(headerNames: string[], headers: Headers): RequestHeaders {
 
 function setHeaders(headers: Headers, rtiResponse: RTIResponse) {
     const result = [
-        `version=4`,
+        `version=${rtiResponse.metadata.version}`,
         `verdict=${rtiResponse.decision.verdict}`,
         `threat-type-code=${rtiResponse.classification.code}`,
-        `threat-type-name=${rtiResponse.classification.name}`,
         `ids=${JSON.stringify(rtiResponse.ids)}`,
     ].join(';');
     headers.set('x-cheq-rti-result', result);

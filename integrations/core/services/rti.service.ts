@@ -20,7 +20,7 @@ export class RTIService implements IRTIService {
         },
         body: JSON.stringify(payload),
         // @ts-ignore
-        signal: AbortSignal.timeout(config.timeout ?? rtiTimeout),
+        signal: AbortSignal.timeout(this.config.timeout ?? rtiTimeout),
         };
         try {
         const response = await fetch(url, options);
