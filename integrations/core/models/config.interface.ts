@@ -20,12 +20,17 @@ export interface Config {
   tagHash: string;
 
   /**
-   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will be blocked or redirected if {@link redirectLocation} is defined.
+   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will be blocked.
    */
-  blockRedirectCodes: number[];
+  blockCodes: number[];
 
   /**
-   * Location to redirect, if not set, users will be blocked instead of redirected.
+   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will be redirected.
+   */
+  redirectCodes?: number[];
+
+  /**
+   * Location to redirect.
    */
   redirectLocation?: string;
 

@@ -28,7 +28,9 @@ export const config: CloudflareConfig = {
     mode: Mode.MONITORING,
     apiKey: 'REPLACE_ME',
     tagHash: 'REPLACE_ME',
-    blockRedirectCodes: [2, 3, 6, 7, 10, 11, 16, 18],
+    blockCodes: [7, 10, 11, 16, 18],
+    redirectCodes: [2, 3, 6],
+    redirectLocation: "https://www.cheq.ai/",
     timeout: 300,
     telemetry: true,
 };

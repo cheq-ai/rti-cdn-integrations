@@ -1,49 +1,459 @@
+/**
+ * Rules engine integration response payload
+ */
 export interface RTIResponse {
   /**
-   * API version
+   * Response metadata (timestamp, version, tag info, etc.)
    */
-  version: number;
+  metadata: Metadata;
 
   /**
-   * Indicates whether the request is valid or invalid
+   * Decision outcome returned by the rules engine (verdict, rule, score)
    */
-  isInvalid: boolean;
+  decision: Decision;
 
   /**
-   * Threat type code identified for request
-   *
-   * | Code | Type | Group | Description |
-   * | ---- | ---- | ----- | ----------- |
-   * | 0 | Valid | | |
-   * | 2 | Scrapers | Invalid Bot Activity | Scrapers are used for content scraping from web applications. A web scraper extracts underlying code as well as stored data. This extracted information can be used then to retrieve business intelligence, to replicate the web service and more. |
-   * | 3 | Automation Tools | Invalid Bot Activity | Automation tools are used to perform automatic activity usually at scale in a repetitive and fast manner. Such activity can be sometimes executed for malicious purposes such as false-clicks and fraudulent display of web-placed ads. |
-   * | 4 | Frequency Capping | Invalid Suspicious Activity | Ad fatigue occurs when your audience sees your ads too often and disproportionally which causes your campaigns to become less effective. Using frequency capping, you can limit the number of times your ads appear to the same user. |
-   * | 5 | Abnormal Rate Limit | Invalid Suspicious Activity | An abnormal and disproportional number of clicks on ads that is performed by users posing as legitimate users but without any intention of following through and convert. |
-   * | 6 | Excessive Rate Limit | Invalid Malicious Activity | An excessive number of clicks on ads that is performed by users posing as legitimate users but without any intention of following through and convert. |
-   * | 7 | Disabled JavaScript | Invalid Malicious Activity | When JavaScript is disabled in the user browser, certain features on a website might not work or even the website might not operate completely. Users with disabled JS deliberately don't intent to interact with the website the way it was designed to. |
-   * | 8 | Behavioral Anomalies | Invalid Malicious Activity | Behavioral anomalies is a method of detecting individuals with hostile intentions by observing their behavior and activities on digital assets. |
-   * | 9 | Click Farm | Invalid Malicious Activity | A click farm is an organized fraud that leverages tools and large groups of humans to manually click on paid ads online. Click farms have people clicking on ads with no intent of normally converting. |
-   * | 10 | Malicious Bots | Invalid Bot Activity | A malicious bot is a malware designed to perform a variety of attack patterns. |
-   * | 11 | False Representation | Invalid Malicious Activity | False Representation such as User Agent Spoofing is the situation where the user information is modified to hide and lie about its real characteristics and identity. It is most often seen with bots trying to hide their tracks, but some malicious human users will occasionally engage in this way as well. |
-   * | 13 | Data Centers | Invalid Suspicious Activity | Data-center traffic is any traffic that has been detected to originate in a data-center. As such, it is very likely to have come from a server rather than a laptop, smartphone, tablet or other personal device that may indicate a source of non-human traffic. |
-   * | 14 | VPN | Invalid Suspicious Activity | VPNs are being used to access services or websites that are out of reach, which can only be done with a VPN or proxy. This may be considered as a suspicious use to commit fraud. |
-   * | 15 | Proxy | Invalid Suspicious Activity | Many proxies frequently hide or facilitate invalid activity. Invalid proxy activity can originate from an intermediary proxy device that exists to manipulate traffic counts or create/pass-on non-human or invalid traffic or otherwise failing to meet protocol validation. |
-   * | 16 | Disabled Cookies | Invalid Malicious Activity | Disabling the browser’s cookies is common with bots and fraudsters. Users that have their cookies disabled will not be able to use most of the websites functionality. This means that these users would not be able to progress within the funnel and most likely won’t convert. |
-   * | 17 | Click Hijacking | Invalid Malicious Activity | Click Hijacking is an attack vector that tricks a user into clicking a web element which is invisible or disguised as another element. This can cause users to unwittingly download malware, visit malicious web pages, provide credentials or sensitive information, transfer money, or purchase products online. |
-   * | 18 | Network Anomalies | Invalid Malicious Activity | User traffic that includes one or more attributes (e.g., IP, user cookie) associated with known irregular patterns, such as non-disclosed auto-refresh traffic, duplicate clicks, and attribute mismatch. |
-   * | 19 | Good Bot | Known Bots | A known bot is any bot that performs useful or helpful tasks that aren't detrimental to a user's experience on the Internet. Because good bots can share similar characteristics with malicious bots, the challenge is ensuring good bots aren’t blocked when putting together a bot management strategy. |
-   * | 20 | Crawlers | Undeclared Bots | Undeclared crawlers are automated programs from legitimate organizations that systematically browse the internet to index and gather information about web pages, but do not explicitly identify themselves as bots or disclose their purpose or origin. |
-   * | 21 | Geo Exclusions | Invalid Suspicious Activity | Fraudsters tend to obfuscate their true geolocation by using different kinds of tools such as VPN’s and Proxies. This allows them to  interact with campaigns that are outside of the original targeting strategy and potentially facilitate targeted attacks. |
+   * Final classification for the request/device
    */
-  threatTypeCode: number;
+  classification: Classification;
 
   /**
-   * Request ID generated by CHEQ RTI
+   * Identifiers associated with the request/session/user
    */
-  requestId: string;
+  ids: Ids;
 
   /**
-   * Data to set the CHEQ RTI Cookie
+   * Device attributes detected/observed for the request
    */
-  setCookie: string;
+  device: Device;
+
+  /**
+   * Network attributes detected/observed for the request
+   */
+  network: Network;
+
+  /**
+   * Fingerprint signals collected for the request
+   */
+  fingerprints: Fingerprints;
+
+  /**
+   * CHEQ detection details and reasons behind the classification
+   */
+  cheqDetection: CheqDetection;
+}
+
+/**
+ * Response metadata container
+ */
+export interface Metadata {
+  /**
+   * ISO timestamp when the response was generated
+   */
+  timestamp: string;
+
+  /**
+   * Response schema / engine version
+   */
+  version: string;
+
+  /**
+   * Human-readable tag name for the integration or configuration
+   */
+  tagName: string;
+
+  /**
+   * Indicates whether a session was found (null when unknown/not available)
+   */
+  sessionFound: boolean | null;
+}
+
+/**
+ * Rules engine decision details
+ */
+export interface Decision {
+  /**
+   * Decision verdict (e.g., benign, suspicious, malicious)
+   */
+  verdict: string;
+
+  /**
+   * Name of the rule that produced the verdict (null if none matched)
+   */
+  ruleName: string | null;
+
+  /**
+   * Risk score as a string representation (e.g., "0.00")
+   */
+  riskScore: string;
+}
+
+/**
+ * Classification details for the request/device
+ */
+export interface Classification {
+  /**
+   * Numeric classification code
+   */
+  code: number;
+
+  /**
+   * Classification name (empty string if not set)
+   */
+  name: string;
+
+  /**
+   * Classification group/category (empty string if not set)
+   */
+  group: string;
+}
+
+/**
+ * Identifiers included in the response
+ */
+export interface Ids {
+  /**
+   * Ray/request identifier (trace id)
+   */
+  rayId: string;
+
+  /**
+   * Page view identifier (null if not available)
+   */
+  pageViewId: string | null;
+
+  /**
+   * Device unique identifier (null if not available)
+   */
+  duid: string | null;
+
+  /**
+   * Unique visit identifier (null if not available)
+   */
+  uniqueVisitId: string | null;
+
+  /**
+   * Custom parameter 1
+   */
+  customParam1: string | null;
+
+  /**
+   * Custom parameter 2
+   */
+  customParam2: string | null;
+
+  /**
+   * Custom parameter 3
+   */
+  customParam3: string | null;
+
+  /**
+   * Custom parameter 4
+   */
+  customParam4: string | null;
+}
+
+/**
+ * Device attributes observed/detected
+ */
+export interface Device {
+  /**
+   * Device type (e.g., Desktop, Mobile)
+   */
+  type: string;
+
+  /**
+   * Operating system identifier
+   */
+  os: string;
+
+  /**
+   * Browser identifier
+   */
+  browser: string;
+
+  /**
+   * Browser timezone (null if not available)
+   */
+  browserTimezone: string | null;
+
+  /**
+   * Device model (null if not available)
+   */
+  model: string | null;
+
+  /**
+   * Device vendor/manufacturer (null if not available)
+   */
+  vendor: string | null;
+
+  /**
+   * Full user-agent string
+   */
+  userAgent: string;
+
+  /**
+   * Brave mode indicator (null if not available)
+   */
+  braveMode: string | null;
+
+  /**
+   * Screen orientation (null if not available)
+   */
+  screenOrientation: string | null;
+
+  /**
+   * Number of logical CPU cores available to the browser (null if not available)
+   */
+  hardwareConcurrency: string | null;
+
+  /**
+   * Whether cookies are disabled in the client
+   */
+  cookiesOff: boolean;
+
+  /**
+   * Whether JavaScript is disabled in the client
+   */
+  jsOff: boolean;
+
+  /**
+   * Battery percentage (null if not available)
+   */
+  batteryPercentage: number | null;
+
+  /**
+   * Battery charging state (null if not available)
+   */
+  batteryState: string | null;
+}
+
+/**
+ * Network information observed/detected
+ */
+export interface Network {
+  /**
+   * Client IP address
+   */
+  ip: string;
+
+  /**
+   * X-Forwarded-For value (null if not available)
+   */
+  xForwardedFor: string | null;
+
+  /**
+   * GeoIP-derived location details
+   */
+  geoIp: GeoIp;
+
+  /**
+   * Autonomous system details
+   */
+  as: ASNData;
+}
+
+/**
+ * GeoIP location details
+ */
+export interface GeoIp {
+  /**
+   * Country code (e.g., "LV")
+   */
+  country: string;
+
+  /**
+   * City name
+   */
+  city: string;
+
+  /**
+   * State/region name (may be empty)
+   */
+  state: string;
+
+  /**
+   * ZIP/postal code
+   */
+  zip: string;
+
+  /**
+   * Timezone derived from geolocation
+   */
+  geoTimezone: string;
+}
+
+/**
+ * Autonomous system (AS) details for the IP
+ */
+export interface ASNData {
+  /**
+   * ASN number
+   */
+  asNumber: number;
+
+  /**
+   * ASN organization name
+   */
+  asName: string;
+}
+
+/**
+ * Fingerprinting signals container
+ */
+export interface Fingerprints {
+  /**
+   * HTTP/2 fingerprint data (null if not available)
+   */
+  http2: string | null;
+
+  /**
+   * CHEQ IP/TCP fingerprint (null if not available)
+   */
+  cheqIpTcp: string | null;
+
+  /**
+   * TLS fingerprint data (JA3/JA4)
+   */
+  tls: TlsFingerprints;
+
+  /**
+   * Canvas fingerprint value (null if not available)
+   */
+  canvas: string | null;
+
+  /**
+   * WebGL fingerprint value (null if not available)
+   */
+  webgl: string | null;
+
+  /**
+   * JS heap size limit (null if not available)
+   */
+  heapSizeLimit: number | null;
+
+  /**
+   * Screen fingerprint/metrics data (null if not available)
+   */
+  screenData: string | null;
+
+  /**
+   * Screen aspect ratio (null if not available)
+   */
+  aspectRatio: string | null;
+}
+
+/**
+ * TLS fingerprint details
+ */
+export interface TlsFingerprints {
+  /**
+   * JA3 TLS fingerprint (null if not available)
+   */
+  ja3: string | null;
+
+  /**
+   * Sorted JA3 TLS fingerprint (null if not available)
+   */
+  ja3Sorted: string | null;
+
+  /**
+   * JA4 TLS fingerprint (null if not available)
+   */
+  ja4: string | null;
+}
+
+/**
+ * CHEQ detection outcome and reasoning
+ */
+export interface CheqDetection {
+  /**
+   * Risk score detected by CHEQ as a string representation (e.g., "0.00")
+   */
+  detectedRiskScore: string;
+
+  /**
+   * Classification code detected by CHEQ
+   */
+  detectedClassificationCode: number;
+
+  /**
+   * Classification name detected by CHEQ (empty string if not set)
+   */
+  detectedClassificationName: string;
+
+  /**
+   * Classification group detected by CHEQ (empty string if not set)
+   */
+  detectedClassificationGroup: string;
+
+  /**
+   * Whether the request is considered automated
+   */
+  isAutomated: boolean;
+
+  /**
+   * Detected entity type/category (e.g., Unspecified)
+   */
+  entity: string;
+
+  /**
+   * Whether spoofing was detected
+   */
+  isSpoofed: boolean;
+
+  /**
+   * Whether an emulator environment was detected
+   */
+  isEmulator: boolean;
+
+  /**
+   * Whether proxy usage was detected
+   */
+  isProxy: boolean;
+
+  /**
+   * List of detected proxy types (empty when none)
+   */
+  proxyTypes: string[];
+
+  /**
+   * Rate-limit detection details
+   */
+  rateLimit: RateLimitDetection;
+
+  /**
+   * Whether programmatic (synthetic) user interaction was detected
+   */
+  progUserInteraction: boolean;
+
+  /**
+   * Whether expected user interaction signals are missing
+   */
+  missingUserInteraction: boolean;
+
+  /**
+   * Numeric reason codes contributing to the detection
+   */
+  reasons: number[];
+
+  /**
+   * Reason codes that were disabled/ignored
+   */
+  disabledReasons: number[];
+}
+
+/**
+ * Rate-limit detection details
+ */
+export interface RateLimitDetection {
+  /**
+   * Whether the rate limit was hit
+   */
+  hit: boolean;
+
+  /**
+   * Identifiers involved in the rate-limit decision (empty when none)
+   */
+  ids: string[];
 }
