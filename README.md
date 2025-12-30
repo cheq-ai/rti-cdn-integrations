@@ -8,6 +8,6 @@ This repository provides the components to invoke RTI from any of the supported 
 
 ### Documentation
 
-[Cloudflare Integration](https://cheq-ai.github.io/cheq-cdn-integrations/integrations/cloudflare)
-[CloudFront Integration](https://cheq-ai.github.io/cheq-cdn-integrations/integrations/cloudfront)
-[Akamai Integration](https://cheq-ai.github.io/cheq-cdn-integrations/integrations/akamai)
+[Cloudflare Integration](https://github.com/cheq-ai/rti-cdn-integrations/blob/main/integrations/cloudflare/README.md)
+[CloudFront Integration](https://github.com/cheq-ai/rti-cdn-integrations/blob/main/integrations/cloudfront/README.md)
+[Akamai Integration](https://github.com/cheq-ai/rti-cdn-integrations/blob/main/integrations/akamai/README.md)
