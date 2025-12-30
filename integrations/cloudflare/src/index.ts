@@ -1,11 +1,11 @@
-import { config } from './config';
-import { RTILoggerService } from '../../core/services/rti-logger.service';
-import { RTIService } from '../../core/services/rti.service';
-import { Action } from '../../core/models/action.model';
-import { RTIHelperService } from '../../core/services/rti-helper.service';
-import { RTIResponse } from '../../core/models/rti-response.model';
-import { name, version } from '../package.json';
-import { RequestHeaders, RTIRequest } from '../../core/models/rti-request.model';
+import { config } from "./config";
+import { RTILoggerService } from "../../core/services/rti-logger.service";
+import { RTIService } from "../../core/services/rti.service";
+import { Action } from "../../core/models/action.model";
+import { RTIHelperService } from "../../core/services/rti-helper.service";
+import { RTIResponse } from "../../core/models/rti-response.model";
+import { name, version } from "../package.json";
+import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
 
 const logger = new RTILoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
@@ -26,6 +26,7 @@ export default {
             }
             const startRTI = Date.now();
             const fetchedHeaders = getHeaders(headerNames, request.headers);
+            const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
             let payload: RTIRequest = {
                 tagHash: config.tagHash,
                 apiKey: config.apiKey,
@@ -33,17 +34,17 @@ export default {
                 channel: "cloudflare-cdn-integration",
                 customId1: rtiHelperService.getEventType(requestURL.pathname, request.method),
                 endUserParams: {
-                    clientIp: request.headers.get('x-real-ip')!,
+                    clientIp: request.headers.get("x-real-ip")!,
                     requestUrl: requestURL.href,
                     headerNames: Object.keys(fetchedHeaders).filter(x => fetchedHeaders[x]).join(","),
                     method: request.method,
                     headers: fetchedHeaders,
                 },
-                duidCookie: request.headers.get('_cq_duid')!,
-                pvidCookie: request.headers.get('_cq_pvid')!,
+                duidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_duid="))?.split("=")[1],
+                pvidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_pvid="))?.split("=")[1],
             };
             // @ts-ignore: This specific line is known to be safe
-            payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement.ja3Hash;
+            payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement?.ja3Hash;
             if (config.debug) { console.log(`requset payload: ${JSON.stringify(payload)}`); }
 
             const rtiResponse = await rtiService.callRTI(payload);
@@ -61,7 +62,7 @@ export default {
                 return new Response(null, { status: 403 });
             } else if (action === Action.REDIRECT) {
                 const headers = new Headers();
-                headers.append('location', config.redirectLocation!);
+                headers.append("location", config.redirectLocation!);
                 return new Response(null, { status: 302, headers });
             } else if (action === Action.CHALLENGE && config.challenge) {
                 try {
@@ -69,7 +70,7 @@ export default {
                     return challengeResult;
                 } catch (e) {
                     const err: Error = e as Error;
-                    console.error('challenge error', err);
+                    console.error("challenge error", err);
                     context.waitUntil(logger.error(`challenge error: ${err.message}`));
                     const originResponse = await fetch(request);
                     return originResponse;
@@ -85,7 +86,7 @@ export default {
             return newResponse;
         } catch (e) {
             const err: Error = e as Error;
-            console.error('error', err);
+            console.error("error", err);
             context.waitUntil(logger.error(`error: ${err.message}`));
             const originResponse = await fetch(request);
             return originResponse;
@@ -107,8 +108,8 @@ function setHeaders(headers: Headers, rtiResponse: RTIResponse) {
         `verdict=${rtiResponse.decision.verdict}`,
         `threat-type-code=${rtiResponse.classification.code}`,
         `ids=${JSON.stringify(rtiResponse.ids)}`,
-    ].join(';');
-    headers.set('x-cheq-rti-result', result);
+    ].join(";");
+    headers.set("x-cheq-rti-result", result);
 }
 
 function log(duration: number) {

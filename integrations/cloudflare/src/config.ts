@@ -20,9 +20,9 @@ export interface CloudflareConfig extends Config {
 }
 
 export const config: CloudflareConfig = {
-    mode: Mode.MONITORING,
-    apiKey: "REPLACE_ME",
-    tagHash: "REPLACE_ME",
+    mode: Mode.BLOCKING,
+    apiKey: "bde56677-f159-4b48-a2d2-6a17cf07df56",
+    tagHash: "025cc3a294c91f7ed20b1082706fc4f8",
     blockCodes: [7, 10, 11, 16, 18, 13],
     redirectCodes: [2, 3],
     redirectLocation: "https://www.cheq.ai/",
@@ -32,5 +32,5 @@ export const config: CloudflareConfig = {
     },
     timeout: 500,
     telemetry: true,
-    // debug: true,
+    debug: true,
 };
