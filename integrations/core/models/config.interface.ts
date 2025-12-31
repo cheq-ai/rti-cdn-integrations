@@ -65,12 +65,12 @@ export interface Config {
    * 
    * {@link ActionStrategy.REDIRECT| Redirect} will return HTTP status 302 and redirect to {@link Config.redirectLocation | Redirect Location}.
    * 
-   * {@link ActionStrategy.CAPTCHA| Captch} will trigger captcha function if configured.
+   * {@link ActionStrategy.CAPTCHA| Captcha} will trigger captcha function if configured.
    */
   blockingStrategy?: ActionStrategy;
 
   /**
-   * Define the action strategy for suspicious traffic, the default is {@link ActionStrategy.CAPTCHA| Captch}.
+   * Define the action strategy for suspicious traffic, the default is {@link ActionStrategy.CAPTCHA| Captcha}.
    * 
    * {@link ActionStrategy.ACCESS_DENIED| Access Denied} will return HTTP status 403.
    *
@@ -78,9 +78,9 @@ export interface Config {
    * 
    * {@link ActionStrategy.REDIRECT| Redirect} will return HTTP status 302 and redirect to {@link Config.redirectLocation | Redirect Location}.
    * 
-   * {@link ActionStrategy.CAPTCHA| Captch} will trigger captcha function if configured.
+   * {@link ActionStrategy.CAPTCHA| Captcha} will trigger captcha function if configured.
    */
-  chalangingStrategy?: ActionStrategy;
+  challengingStrategy?: ActionStrategy;
 
   /**
    * Paths that are ignored.
@@ -119,7 +119,7 @@ export interface Config {
   routeToEventType?: RouteToEventType[];
 
   /**
-   * Timeout in milliseconds before cancelling RTI request.
+   * Timeout in milliseconds before cancelling RTI request - Default is 150 ms.
    */
   timeout?: number;
 

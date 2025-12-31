@@ -13,7 +13,7 @@ export interface CloudflareConfig extends Config {
     telemetry: boolean;
 
     /**
-     * Called when {@link https://cheq-ai.github.io/rti-cdn-integrations/interfaces/Config.html#challengeCodes | challengeCodes } are configured
+     * Callback function invoked when {@link Action.CHALLENGE | Action } output is returned
      * @param request
      * @param response
      */

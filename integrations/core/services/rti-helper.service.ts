@@ -66,7 +66,7 @@ export class RTIHelperService {
     if (action === Action.BLOCK) {
       return this.config.blockingStrategy ?? ActionStrategy.ACCESS_DENIED;
     } else if (action === Action.CHALLENGE) {
-      return this.config.chalangingStrategy ?? ActionStrategy.CAPTCHA;
+      return this.config.challengingStrategy ?? ActionStrategy.CAPTCHA;
     } else if (action === Action.REDIRECT) {
       return ActionStrategy.REDIRECT;
     }
