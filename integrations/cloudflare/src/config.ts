@@ -1,3 +1,4 @@
+import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Config } from '../../core/models/config.interface';
 import { Mode } from '../../core/models/mode.model';
 import { RTIResponse } from '../../core/models/rti-response.model';
@@ -20,17 +21,12 @@ export interface CloudflareConfig extends Config {
 }
 
 export const config: CloudflareConfig = {
-    mode: Mode.BLOCKING,
+    mode: Mode.MONITORING,
     apiKey: "REPLACE_ME",
     tagHash: "REPLACE_ME",
-    blockCodes: [7, 10, 11, 16, 18, 13],
-    redirectCodes: [2, 3],
-    redirectLocation: "https://www.cheq.ai/",
-    challengeCodes: [6],
     challenge: async (request: Request, response: RTIResponse) => {
         return new Response("<html>captcha</html>");
     },
     timeout: 500,
     telemetry: true,
-    debug: true,
 };

@@ -6,6 +6,7 @@ import { RTIHelperService } from "../../core/services/rti-helper.service";
 import { RTIResponse } from "../../core/models/rti-response.model";
 import { name, version } from "../package.json";
 import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
+import { ActionStrategy } from "../../core/models/action-strategy.model";
 
 const logger = new RTILoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
@@ -58,31 +59,40 @@ export default {
             
             const action = rtiHelperService.getAction(rtiResponse);
             if (config.debug) { console.log(`action: ${action}`); }
-            if (action === Action.BLOCK) {
-                return new Response(null, { status: 403 });
-            } else if (action === Action.REDIRECT) {
-                const headers = new Headers();
-                headers.append("location", config.redirectLocation!);
-                return new Response(null, { status: 302, headers });
-            } else if (action === Action.CHALLENGE && config.challenge) {
-                try {
-                    const challengeResult = await config.challenge(request, rtiResponse);
-                    return challengeResult;
-                } catch (e) {
-                    const err: Error = e as Error;
-                    console.error("challenge error", err);
-                    context.waitUntil(logger.error(`challenge error: ${err.message}`));
-                    const originResponse = await fetch(request);
-                    return originResponse;
+            if (action !== Action.ALLOW) {
+                const actionStrategy = rtiHelperService.getActionStrategy(action);
+                switch (actionStrategy) {
+                    case ActionStrategy.ACCESS_DENIED:
+                        return new Response(null, { status: 403 });
+                    case ActionStrategy.NOT_FOUND:
+                        return new Response(null, { status: 404 });
+                    case ActionStrategy.REDIRECT:
+                        const headers = new Headers();
+                        headers.append("location", config.redirectLocation || "https://www.cheq.ai/");
+                        return new Response(null, { status: 302, headers });
+                    case ActionStrategy.CAPTCHA:
+                        try {
+                            if (config.challenge) {
+                                const challengeResult = await config.challenge(request, rtiResponse);
+                                return challengeResult;
+                            }
+                            break;
+                        } catch (e) {
+                            const err: Error = e as Error;
+                            console.error("challenge error", err);
+                            context.waitUntil(logger.error(`challenge error: ${err.message}`));
+                            const originResponse = await fetch(request);
+                            return originResponse;
+                        }
+                    default:
+                        break;
                 }
             }
+
             // action is Action.ALLOW, pass headers to origin request
             const originRequest = new Request(request);
             setHeaders(originRequest.headers, rtiResponse);
-            const originResponse = await fetch(originRequest);
-
-            // set headers on viewer response
-            const newResponse = new Response(originResponse.body, originResponse);
+            const newResponse = await fetch(originRequest);
             return newResponse;
         } catch (e) {
             const err: Error = e as Error;

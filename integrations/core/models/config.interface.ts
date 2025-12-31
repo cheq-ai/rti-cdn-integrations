@@ -1,5 +1,7 @@
 import { RouteToEventType } from "./route-to-event-type.model";
 import { Mode } from "./mode.model";
+import { RTIResponse } from "./rti-response.model";
+import { ActionStrategy } from "./action-strategy.model";
 
 export interface Config {
   /**
@@ -20,24 +22,65 @@ export interface Config {
   tagHash: string;
 
   /**
-   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will be blocked.
+   * List of {@link RTIResponse.classification.code| threat type codes} that will be blocked.
    */
-  blockCodes: number[];
+  blockTTCodes?: number[];
 
   /**
-   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will be redirected.
+   * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be blocked.
    */
-  redirectCodes?: number[];
+  blockReasons?: number[];
 
   /**
-   * Location to redirect.
+   * List of {@link RTIResponse.classification.code| threat type codes} that will invoke integration challenge function if configured.
+   */
+  challengeTTCodes?: number[];
+  
+  /**
+   * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will invoke integration challenge function if configured.
+   */
+  challengeReasons?: number[];
+
+  /**
+   * List of {@link RTIResponse.classification.code| threat type codes} that will be redirected.
+   */
+  redirectTTCodes?: number[];
+
+  /**
+   * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be redirected.
+   */
+  redirectReasons?: number[];
+
+  /**
+   * Location to redirect - default is: 'https://www.cheq.ai/'.
    */
   redirectLocation?: string;
 
   /**
-   * List of {@link RTIResponse.threatTypeCode| threat type codes} that will invoke integration challenge function if configured.
+   * Define the action strategy for malicious traffic, the default is {@link ActionStrategy.ACCESS_DENIED| Access Denied}.
+   * 
+   * {@link ActionStrategy.ACCESS_DENIED| Access Denied} will return HTTP status 403.
+   *
+   * {@link ActionStrategy.NOT_FOUND| Not Found} will return HTTP status 404.
+   * 
+   * {@link ActionStrategy.REDIRECT| Redirect} will return HTTP status 302 and redirect to {@link Config.redirectLocation | Redirect Location}.
+   * 
+   * {@link ActionStrategy.CAPTCHA| Captch} will trigger captcha function if configured.
    */
-  challengeCodes?: number[];
+  blockingStrategy?: ActionStrategy;
+
+  /**
+   * Define the action strategy for suspicious traffic, the default is {@link ActionStrategy.CAPTCHA| Captch}.
+   * 
+   * {@link ActionStrategy.ACCESS_DENIED| Access Denied} will return HTTP status 403.
+   *
+   * {@link ActionStrategy.NOT_FOUND| Not Found} will return HTTP status 404.
+   * 
+   * {@link ActionStrategy.REDIRECT| Redirect} will return HTTP status 302 and redirect to {@link Config.redirectLocation | Redirect Location}.
+   * 
+   * {@link ActionStrategy.CAPTCHA| Captch} will trigger captcha function if configured.
+   */
+  chalangingStrategy?: ActionStrategy;
 
   /**
    * Paths that are ignored.
@@ -74,11 +117,6 @@ export interface Config {
    * ```
    */
   routeToEventType?: RouteToEventType[];
-
-  /**
-   * Trusted IP header to be used as client IP. Overwrites {@link RTIRequest.ip} if header value exists.
-   */
-  trustedIPHeader?: string;
 
   /**
    * Timeout in milliseconds before cancelling RTI request.

@@ -5,6 +5,7 @@ import { Action } from "../models/action.model";
 import { Mode } from "../models/mode.model";
 import { RTIParams } from "../models/rti-params.model";
 import { HeadersMap } from "../models/headers-map.model";
+import { ActionStrategy } from "../models/action-strategy.model";
 
 export class RTIHelperService {
   config: Config;
@@ -46,15 +47,30 @@ export class RTIHelperService {
    */
   getAction(rtiResponse: RTIResponse): Action {
     if (this.config.mode === Mode.BLOCKING) {
-      if (this.config.blockCodes.includes(rtiResponse.classification.code)) {
+      if (rtiResponse.decision.verdict === "malicious" || this.config.blockTTCodes?.includes(rtiResponse.classification.code) || this.config.blockReasons?.some(br => rtiResponse.cheqDetection.reasons.includes(br))) {
         return Action.BLOCK;
-      } else if (this.config.redirectCodes?.includes(rtiResponse.classification.code)) {
-        return Action.REDIRECT;
-      } else if (this.config.challengeCodes?.includes(rtiResponse.classification.code) && this.config.redirectLocation) {
+      } else if (rtiResponse.decision.verdict === "suspicious" || this.config.challengeTTCodes?.includes(rtiResponse.classification.code) || this.config.challengeReasons?.some(cr => rtiResponse.cheqDetection.reasons.includes(cr))) {
         return Action.CHALLENGE;
+      } else if (this.config.redirectTTCodes?.includes(rtiResponse.classification.code) || this.config.redirectReasons?.some(rr => rtiResponse.cheqDetection.reasons.includes(rr))) {
+        return Action.REDIRECT;
       }
     }
     return Action.ALLOW;
+  }
+
+  /**
+   * Returns the {@link ActionStrategy} based on configuration and {@link Action}
+   * @param action
+   */
+  getActionStrategy(action: Action): ActionStrategy | null {
+    if (action === Action.BLOCK) {
+      return this.config.blockingStrategy ?? ActionStrategy.ACCESS_DENIED;
+    } else if (action === Action.CHALLENGE) {
+      return this.config.chalangingStrategy ?? ActionStrategy.CAPTCHA;
+    } else if (action === Action.REDIRECT) {
+      return ActionStrategy.REDIRECT;
+    }
+    return null;
   }
 
   /**
@@ -100,8 +116,8 @@ export class RTIHelperService {
    */
   validateConfig(): string[] {
     const errors: string[] = [];
-    if ((this.config.redirectCodes && this.config.redirectCodes.length > 0 && !this.config.redirectLocation) ||
-        (this.config.redirectLocation && !this.config.redirectCodes)) {
+    if ((this.config.redirectReasons && this.config.redirectReasons.length > 0 && !this.config.redirectLocation) ||
+        (this.config.redirectLocation && !this.config.redirectReasons)) {
           errors.push("For redirecting as an Action you must define both redirectCodes and redirectLocation");
     }
     return errors;
