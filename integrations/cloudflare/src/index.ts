@@ -20,11 +20,14 @@ export default {
         try {
             // prevent runtime error responses, fail open to origin
             context.passThroughOnException();
+
+            // Filter out ignored paths and already validated challenges and validate challange if exists:
             const requestURL = new URL(request.url);
-            if (rtiHelperService.shouldIgnore(requestURL.pathname)) {
+            if (rtiHelperService.shouldIgnore(requestURL.pathname) || (config.validateChallenge && await config.validateChallenge(request))) {
                 const originResponse = await fetch(request);
                 return originResponse;
             }
+
             const startRTI = Date.now();
             const fetchedHeaders = getHeaders(headerNames, request.headers);
             const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
