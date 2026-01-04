@@ -20,7 +20,7 @@ export interface CloudflareConfig extends Config {
     challenge?: (request: Request, response: RTIResponse) => Promise<Response>;
 
     /**
-     * Callback function invoked when {@link Action.CHALLENGE | Action } output is returned
+     * Validate session of challenge function invoked at the beggining of the request to skip RTI check and allow the request to pass to origin
      * @param request
      * @param response
      */
