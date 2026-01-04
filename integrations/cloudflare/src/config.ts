@@ -22,7 +22,6 @@ export interface CloudflareConfig extends Config {
     /**
      * Validate session of challenge function invoked at the beggining of the request to skip RTI check and allow the request to pass to origin
      * @param request
-     * @param response
      */
     validateChallenge?: (request: Request) => Promise<boolean>;
 }
