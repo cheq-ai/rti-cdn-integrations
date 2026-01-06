@@ -311,7 +311,7 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
             const newResponse = new Response(null, {
                 status: 302,
                 headers: {
-                "Location": redirectUrl,
+                "Location": decodeURIComponent(redirectUrl),
                 "Set-Cookie": `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}`,
                 },
             });
