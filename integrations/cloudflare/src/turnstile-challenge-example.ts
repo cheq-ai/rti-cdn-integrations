@@ -279,18 +279,18 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
         return new Response(html, {
             status: 403,
             headers: {
-            'Content-Type': 'text/html;charset=UTF-8',
-            'Cache-Control': 'no-store, no-cache, must-revalidate',
+            "Content-Type": "text/html;charset=UTF-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
             },
         });
     } else {
-        const verifyResponse = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({
                 secret: turnstileSecret,
                 response: token,
-                remoteip: request.headers.get('x-real-ip')!,
+                remoteip: request.headers.get("x-real-ip")!,
             }).toString(),
         });
 
@@ -300,24 +300,24 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
             const expiresAt = Date.now() + (ttl * 1000);
             const data = `${expiresAt}:${response.ids.rayId}`;
             const encoder = new TextEncoder();
-            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+            const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
             const hashArray = Array.from(new Uint8Array(hashBuffer));
-            const signature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
+            const signature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, "0")).join("");
             
             const sessionToken = `${expiresAt}.${signature}`;
 
             // @ts-ignore
-            const redirectUrl = formData?.get("request_id")!;
+            const redirectUrl = formData?.get("original_url")!;
             const newResponse = new Response(null, {
                 status: 302,
                 headers: {
-                'Location': redirectUrl,
-                'Set-Cookie': `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}`,
+                "Location": redirectUrl,
+                "Set-Cookie": `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}`,
                 },
             });
             return newResponse;
         } else {
-            return new Response('Verification failed. Please try again.', { status: 403 });
+            return new Response("Verification failed. Please try again.", { status: 403 });
         }
     }
 };
@@ -326,12 +326,11 @@ const trunstileValidateChallengeExample = async (request: Request): Promise<bool
     // Validate session token (if the validation alreay happend)
     const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
     const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se"))?.split("=")[1]?.split("|");
-    const rayId = request.headers.get('x-cheq-ray-id') || cookieValue?.pop();
-    const sessionToken = request.headers.get('x-cheq-challenge') || cookieValue?.pop();
-    console.log(`Validating challenge: sessionToken=${sessionToken}, rayId=${rayId}`);
+    const rayId = request.headers.get("x-cheq-ray-id") || cookieValue?.pop();
+    const sessionToken = request.headers.get("x-cheq-challenge") || cookieValue?.pop();
     if (sessionToken && rayId) {
         try {
-            const [expiresAtStr, signature] = sessionToken.split('.');
+            const [expiresAtStr, signature] = sessionToken.split(".");
             if (!expiresAtStr || !signature) { return false; }
             
             const expiresAt = parseInt(expiresAtStr, 10);
@@ -341,9 +340,9 @@ const trunstileValidateChallengeExample = async (request: Request): Promise<bool
             // Verify signature
             const data = `${expiresAt}:${rayId}`;
             const encoder = new TextEncoder();
-            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+            const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
             const hashArray = Array.from(new Uint8Array(hashBuffer));
-            const expectedSignature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, '0')).join('');
+            const expectedSignature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, "0")).join("");
             
             return signature === expectedSignature;
         } catch {
