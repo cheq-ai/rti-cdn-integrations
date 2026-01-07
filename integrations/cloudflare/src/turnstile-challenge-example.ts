@@ -3,6 +3,7 @@ import { RTIResponse } from "../../core/models/rti-response.model";
 const turnstileChallengeExample = async (request: Request, response: RTIResponse): Promise<Response> => {
     const turnstileSiteKey = "REPLACE_ME";
     const turnstileSecret = "REPLACE_ME";
+    const ttl = 300; // 5 minutes
     let formData: FormData;
     if (request.headers.get("content-type") === "application/x-www-form-urlencoded") {
         formData = await request.formData();
@@ -296,7 +297,6 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
 
         const result = await verifyResponse.json() as { success: boolean };
         if (result.success) {
-            const ttl = 300; // 5 minutes
             const expiresAt = Date.now() + (ttl * 1000);
             const data = `${expiresAt}:${response.ids.rayId}`;
             const encoder = new TextEncoder();
