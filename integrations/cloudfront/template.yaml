@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Template for cheq-rti-integration-cloudfront
+Parameters:
+  TrustedIPHeader:
+    Description: Trusted IP Header
+    Default: ''
+    Type: String
+Conditions:
+  TrustedIPHeaderIncluded: !Not
+    - !Equals
+      - !Ref TrustedIPHeader
+      - ''
+Outputs:
+  OriginRequestVersionARN:
+    Description: Origin Request lambda version ARN.
+    Value: !Ref OriginRequest.Version
+  OriginRequestPolicy:
+    Description: Includes RTI, ja3 fingerprint, tls and host headers
+    Value: !Sub "${AWS::StackName}-origin-request-policy"
+  OriginRequestPolicyNoHost:
+    Description: Includes RTI, ja3 fingerprint and tls headers, no host header
+    Value: !Sub "${AWS::StackName}-origin-request-policy-no-host"
+  OriginRequestPolicyNoHostTrustedIP:
+    Condition: TrustedIPHeaderIncluded
+    Description: Includes RTI, ja3 fingerprint, tls and trusted ip headers, no host header
+    Value: !Sub "${AWS::StackName}-origin-request-policy-no-host-trusted-ip"
+  OriginRequestPolicyTrustedIP:
+    Condition: TrustedIPHeaderIncluded
+    Description: Includes RTI, ja3 fingerprint, tls, host and trusted ip headers
+    Value: !Sub "${AWS::StackName}-origin-request-policy-trusted-ip"
+  ViewerRequestARN:
+    Description: Viewer Request CloudFront function ARN.
+    Value: !GetAtt ViewerRequest.FunctionMetadata.FunctionARN
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-role"
+      Policies:
+        - PolicyName: cloudwatch-logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - arn:aws:logs:*:*:*
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+        Version: 2012-10-17
+  OriginRequest:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-origin-request"
+      AutoPublishAlias: live
+      CodeUri: src/
+      Handler: origin-request.handle
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Timeout: 5
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: false # Must be false since Lambda@Edge can not use environment variables
+        EntryPoints:
+          - origin-request.ts
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy"
+        Comment: Includes RTI, ja3 fingerprint, tls and host headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - x-cheq-rti-result
+            - accept
+            - accept-language
+            - host
+            - referer
+            - user-agent
+  OriginRequestPolicyNoHost:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-no-host"
+        Comment: Includes RTI, ja3 fingerprint and tls headers, no host header
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - x-cheq-rti-host
+            - x-cheq-rti-result
+            - accept
+            - accept-language
+            - referer
+            - user-agent
+  OriginRequestPolicyNoHostTrustedIP:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: TrustedIPHeaderIncluded
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-no-host-trusted-ip"
+        Comment: Includes RTI, ja3 fingerprint, tls and trusted ip headers, no host header
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - x-cheq-rti-host
+            - x-cheq-rti-result
+            - accept
+            - accept-language
+            - referer
+            - user-agent
+            - !Ref TrustedIPHeader
+  OriginRequestPolicyTrustedIP:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: TrustedIPHeaderIncluded
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-trusted-ip"
+        Comment: Includes RTI, ja3 fingerprint, tls, host and trusted ip headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - x-cheq-rti-result
+            - accept
+            - accept-language
+            - host
+            - referer
+            - user-agent
+            - !Ref TrustedIPHeader
+  ViewerRequest:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-viewer-request"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Sets x-cheq-rti-host header
+        Runtime: cloudfront-js-1.0
+      FunctionCode: |
+        function handler(event) {
+          event.request.headers['x-cheq-rti-host'] = event.request.headers.host;
+          return event.request;
+        }

@@ -29,7 +29,7 @@ export const handle = async (event: CloudFrontRequestEvent): Promise<CloudFrontR
         }
         const startRTI = Date.now();
         const fetchedHeaders = getHeaders(headerNames, cfRequest.headers);
-        const cookieHeaderMap = (cfRequest.headers["cookie"].map((kv) => kv.value).join(', ') || "").split(";").map(c => c.trim());
+        const cookieHeaderMap = (cfRequest.headers["cookie"]?.map((kv) => kv.value).join(', ') || "").split(";").map(c => c.trim());
         let payload: RTIRequest = {
             tagHash: config.tagHash,
             apiKey: config.apiKey,

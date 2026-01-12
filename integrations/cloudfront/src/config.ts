@@ -37,7 +37,8 @@ export interface CloudfrontConfig extends Config {
 
 export const config: CloudfrontConfig = {
     mode: Mode.MONITORING,
-    apiKey: 'REPLACE_ME',
-    tagHash: 'REPLACE_ME',
+    apiKey: "REPLACE_ME",
+    tagHash: "REPLACE_ME",
+    timeout: 500,
     telemetry: true,
 };

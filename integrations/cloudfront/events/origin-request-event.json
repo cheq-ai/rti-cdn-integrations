@@ -1,0 +1,80 @@
+{
+  "Records": [
+    {
+      "cf": {
+        "config": {
+          "distributionDomainName": "dduxi5f936qwr.cloudfront.net",
+          "distributionId": "E1N3QDQ7D6MHGQ",
+          "eventType": "origin-request",
+          "requestId": "4TyzHTaYWb1GX1qTfsHhEqV6HUDd_BzoBZnwfnvQc_1oF26ClkoUSEQ=="
+        },
+        "request": {
+          "clientIp": "90.139.141.35",
+          "headers": {
+            "x-forwarded-for": [
+              {
+                "key": "X-Forwarded-For",
+                "value": "90.139.141.35"
+              }
+            ],
+            "x-real-ip": [
+              {
+                "key": "X-Real-IP",
+                "value": "90.139.141.35"
+              }
+            ],
+            "user-agent": [
+              {
+                "key": "User-Agent",
+                "value": "Amazon CloudFront"
+              }
+            ],
+            "via": [
+              {
+                "key": "Via",
+                "value": "2.0 2afae0d44e2540f472c0635ab62c232b.cloudfront.net (CloudFront)"
+              }
+            ],
+            "host": [
+              {
+                "key": "Host",
+                "value": "tests-cdn.dev.cheq-platform.com"
+              }
+            ],
+            "cache-control": [
+              {
+                "key": "Cache-Control",
+                "value": "no-cache"
+              }
+            ],
+            "cloudfront-viewer-ja3-fingerprint": [
+              {
+                "key": "Cloudfront-Viewer-Ja3-Fingerprint",
+                "value": "5e8214b614c1d1b176573bed01f6dc8f"
+              }
+            ]
+          },
+          "method": "GET",
+          "origin": {
+            "custom": {
+              "customHeaders": {},
+              "domainName": "tests-cdn.dev.cheq-platform.com",
+              "keepaliveTimeout": 5,
+              "path": "",
+              "port": 443,
+              "protocol": "https",
+              "readTimeout": 30,
+              "sslProtocols": [
+                "TLSv1",
+                "TLSv1.1",
+                "TLSv1.2"
+              ]
+            }
+          },
+          "querystring": "",
+          "uri": "https://tests-cdn.dev.cheq-platform.com/"
+        }
+      }
+    }
+  ]
+}
