@@ -4,7 +4,8 @@
   "scripts": {
     "unit": "jest",
     "compile": "tsc",
-    "test": "tsc && vitest --reporter=verbose --watch false"
+    "test": "tsc && vitest --reporter=verbose --watch false",
+    "start": "sam build; sam local invoke OriginRequest -e events/origin-request-event.json"
   },
   "dependencies": {
     "esbuild": "^0.14.14"
