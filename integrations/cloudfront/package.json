@@ -3,29 +3,16 @@
   "version": "0.2.0",
   "scripts": {
     "unit": "jest",
-    "lint": "eslint '*.ts' --quiet --fix",
     "compile": "tsc",
-    "test": "npm run compile && npm run unit",
-    "docs": "typedoc"
+    "test": "tsc && vitest --reporter=verbose --watch false"
   },
   "dependencies": {
-    "cheq-rti-client-node": "git+ssh://git@github.com:cheq-ai/cheq-rti-client-node.git#0.2.0",
     "esbuild": "^0.14.14"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.92",
-    "@types/jest": "^29.2.0",
-    "@types/node": "^18.11.4",
-    "@typescript-eslint/eslint-plugin": "^5.10.2",
-    "@typescript-eslint/parser": "^5.10.2",
-    "esbuild-jest": "^0.5.0",
-    "eslint": "^8.8.0",
-    "eslint-config-prettier": "^8.3.0",
-    "eslint-plugin-prettier": "^4.0.0",
-    "jest": "^29.2.1",
     "prettier": "^2.5.1",
-    "ts-node": "^10.9.1",
-    "typedoc": "0.24.4",
-    "typescript": "^4.8.4"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
   }
 }
