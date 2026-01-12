@@ -6,9 +6,6 @@
     "compile": "tsc",
     "test": "tsc && vitest --reporter=verbose --watch false"
   },
-  "dependencies": {
-    "esbuild": "^0.14.14"
-  },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.92",
     "prettier": "^2.5.1",
