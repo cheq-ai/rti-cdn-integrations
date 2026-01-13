@@ -23,7 +23,7 @@ export const handle = async (event: CloudFrontRequestEvent): Promise<CloudFrontR
         console.log(`cfRequest: ${JSON.stringify(cfRequest)}`);
     }
     try {
-        const requestURL = new URL(cfRequest.uri);
+        const requestURL = new URL(getRequestUrl((cfRequest.headers["host"]?.map((kv) => kv.value) || "").join(', '), cfRequest.uri, cfRequest.querystring));
         if (rtiHelperService.shouldIgnore(requestURL.pathname) || (config.validateChallenge && await config.validateChallenge(cfRequest))) {
             return cfRequest;
         }
@@ -37,7 +37,7 @@ export const handle = async (event: CloudFrontRequestEvent): Promise<CloudFrontR
             channel: "cloudfront-cdn-integration",
             customId1: rtiHelperService.getEventType(requestURL.pathname, cfRequest.method),
             endUserParams: {
-                clientIp: cfRequest.headers["x-real-ip"].map((kv) => kv.value).join(', '),
+                clientIp: cfRequest.clientIp,
                 requestUrl: requestURL.href,
                 headerNames: Object.keys(fetchedHeaders).filter(x => fetchedHeaders[x]).join(","),
                 method: cfRequest.method,
@@ -75,7 +75,7 @@ export const handle = async (event: CloudFrontRequestEvent): Promise<CloudFrontR
                 case ActionStrategy.REDIRECT:
                     const headers = {};
                     // @ts-ignore
-                    headers.location = config.redirectLocation || "https://www.cheq.ai/";
+                    headers.location = [{ key: 'Location', value: config.redirectLocation || "https://www.cheq.ai/" }];
                     return {
                         status: '302',
                         headers,
@@ -108,6 +108,14 @@ export const handle = async (event: CloudFrontRequestEvent): Promise<CloudFrontR
     }
     return cfRequest;
 };
+
+function getRequestUrl(host: string, uri: string, queryString?: string): string {
+    let url = `https://${host}${uri}`;
+    if (queryString) {
+        url += `?${queryString}`;
+    }
+    return url;
+}
 
 function setHeaders(headers: CloudFrontHeaders, rtiResponse: RTIResponse) {
     const result = [

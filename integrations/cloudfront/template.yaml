@@ -29,9 +29,6 @@ Outputs:
     Condition: TrustedIPHeaderIncluded
     Description: Includes RTI, ja3 fingerprint, tls, host and trusted ip headers
     Value: !Sub "${AWS::StackName}-origin-request-policy-trusted-ip"
-  ViewerRequestARN:
-    Description: Viewer Request CloudFront function ARN.
-    Value: !GetAtt ViewerRequest.FunctionMetadata.FunctionARN
 Resources:
   LambdaRole:
     Type: AWS::IAM::Role
@@ -69,7 +66,7 @@ Resources:
       Runtime: nodejs18.x
       Architectures:
         - x86_64
-      Timeout: 5
+      Timeout: 30
       MemorySize: 128
       Role: !GetAtt LambdaRole.Arn
     Metadata:
@@ -116,7 +113,6 @@ Resources:
           Headers:
             - cloudfront-viewer-tls
             - cloudfront-viewer-ja3-fingerprint
-            - x-cheq-rti-host
             - x-cheq-rti-result
             - accept
             - accept-language
@@ -138,7 +134,6 @@ Resources:
           Headers:
             - cloudfront-viewer-tls
             - cloudfront-viewer-ja3-fingerprint
-            - x-cheq-rti-host
             - x-cheq-rti-result
             - accept
             - accept-language
@@ -168,16 +163,3 @@ Resources:
             - referer
             - user-agent
             - !Ref TrustedIPHeader
-  ViewerRequest:
-    Type: AWS::CloudFront::Function
-    Properties:
-      Name: !Sub "${AWS::StackName}-viewer-request"
-      AutoPublish: true
-      FunctionConfig:
-        Comment: Sets x-cheq-rti-host header
-        Runtime: cloudfront-js-1.0
-      FunctionCode: |
-        function handler(event) {
-          event.request.headers['x-cheq-rti-host'] = event.request.headers.host;
-          return event.request;
-        }
