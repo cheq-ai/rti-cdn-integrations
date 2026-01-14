@@ -72,7 +72,7 @@
             }
           },
           "querystring": "",
-          "uri": "https://tests-cdn.dev.cheq-platform.com/"
+          "uri": "/"
         }
       }
     }

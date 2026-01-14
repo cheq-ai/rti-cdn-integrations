@@ -3,6 +3,7 @@ import { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import { Config } from '../../core/models/config.interface';
 import { RTIResponse } from '../../core/models/rti-response.model';
 import { Mode } from '../../core/models/mode.model';
+import { trunstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
 
 /**
  * See {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html | Config}
@@ -39,6 +40,8 @@ export const config: CloudfrontConfig = {
     mode: Mode.MONITORING,
     apiKey: "REPLACE_ME",
     tagHash: "REPLACE_ME",
+    challenge: turnstileChallengeExample,
+    validateChallenge: trunstileValidateChallengeExample,
     timeout: 500,
     telemetry: true,
 };
