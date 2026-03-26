@@ -1,0 +1,43 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = []
+description = "google reCaptcha verifier handler"
+language = "javascript"
+manifest_version = 3
+name = "cheq-reCaptcha_verifier-compute"
+
+#service_id = "<YOUR_COMPUTE_SERVICE_ID>"
+#service_id = "6oxykGigBxTTWPlPMX1EJN" 
+
+service_id = "QGnaHKs8CemtFv1504iTss" #cheq-rti-compute
+
+[local_server]
+
+  # Config Store for local development only (`fastly compute serve`).
+  # This section is ignored when deployed — the real Config Store must be
+  # created in the Fastly console under Resources → Config Stores and
+  # linked to this service.
+  [local_server.config_stores]
+    [local_server.config_stores.cheq_rti_config]
+      format = "inline-toml"
+      [local_server.config_stores.cheq_rti_config.contents]
+        debugging_enabled = "true"
+
+
+  [local_server.backends]
+
+    [local_server.backends.recaptcha_backend]
+      url = "https://www.google.com"
+
+[setup]
+
+  [setup.backends]
+
+    [setup.backends.recaptcha_backend]
+      address = "www.google.com"
+      port = 443
+
+  [setup.config_stores]
+
+    [setup.config_stores.cheq_rti_config]
