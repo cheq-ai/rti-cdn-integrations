@@ -7,10 +7,9 @@ language = "javascript"
 manifest_version = 3
 name = "cheq-reCaptcha_verifier-compute"
 
-#service_id = "<YOUR_COMPUTE_SERVICE_ID>"
-#service_id = "6oxykGigBxTTWPlPMX1EJN" 
-
-service_id = "QGnaHKs8CemtFv1504iTss" #cheq-rti-compute
+service_id = "<YOUR_COMPUTE_SERVICE_ID>"
+#service_id = "KYW91Gkrih66QEn2oJIbOl" 
+#service_id = "QGnaHKs8CemtFv1504iTss" #cheq-rti-compute
 
 [local_server]
 

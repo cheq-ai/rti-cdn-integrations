@@ -8,7 +8,7 @@
 #   - restart 0: stash original request, route to RTI backend
 #   - restart 1: act on verdict (block / challenge / redirect / allow)
 #
-# IMPORTANT – set your origin backend name on the line marked TODO below.
+# The origin backend is referenced as F_origin_backend (created via CLI with --name origin_backend).
 #
 # Upload via Fastly CLI:
 #   fastly vcl snippet create \
@@ -27,7 +27,7 @@ if (req.restarts == 0) {
     call cheq_rti_session_check;
     if (req.http.X-Cheq-Session-Valid == "true") {
         set req.http.X-Cheq-Session-Bypass = "1";
-        set req.backend = F_origin_backend;  # Configure your origin backend in UI Fastly under "Origins" using the name 'origin_backend'.
+        set req.backend = F_origin_backend;  # Created via CLI with --name origin_backend (or in the Fastly UI under Origins).
         return(pass);
     }
 }

@@ -1,25 +1,3 @@
-# CHEQ Fastly Integration
-
-This directory contains a Fastly-ready CHEQ RTI integration. Two deployment
-models are supported:
-
-- Snippets: upload the files in `snippets/` to an existing Fastly service.
-- Custom VCL: include the `vcl/` modular sources or use the combined
-  `cheq-defend.vcl` for greenfield services.
-
-Quick start (snippets):
-
-1. Create required Edge Dictionaries in Fastly (see `DICTIONARY-CONFIG.md`).
-2. Upload snippets with the Fastly CLI or UI. See `snippets/README.md`.
-3. Activate the version and test.
-
-Files and layout: (already present in this repo)
-- `snippets/` — VCL snippets to upload into an existing service
-- `vcl/`      — modular VCL source files for custom VCL
-- `cheq-defend.vcl` — combined custom VCL example
-- `setup.sh`  — helper to upload snippets via CLI
-- `fastly.toml` — placeholder for CLI config
-- `DICTIONARY-CONFIG.md` — runtime key reference
 # CHEQ RTI – Fastly VCL Integration
 
 This integration intercepts every request at the Fastly edge, sends it to the **CHEQ Real-Time Intelligence (RTI)** service for bot and malicious traffic detection, and takes the appropriate action before the request ever reaches your origin server.
@@ -36,15 +14,15 @@ There are two ways to deploy this integration. Choose based on how your Fastly s
 
 Snippets inject VCL into specific lifecycle hooks automatically. No `include` statements or `#FASTLY` macros needed. Works alongside any existing VCL.
 
-Files: `vcl/snippets/` — see [vcl/snippets/README.md](vcl/snippets/README.md) for upload instructions.
+Files: `snippets/` — see [snippets/README.md](snippets/README.md) for upload instructions.
 
 ### Option B – Full Custom VCL
 
 **Use when:** You manage a full custom VCL service and want to `include` the CHEQ RTI subroutines directly alongside your own VCL logic.
 
 Files:
-- `vcl/cheq_rti.vcl` — all CHEQ RTI subroutine definitions
-- `vcl/example_main.vcl` — complete wiring example: backend declarations, `vcl_recv`, `vcl_pass`, `vcl_fetch`, `vcl_deliver`, `vcl_error` calling the CHEQ subroutines in the correct order, with `#FASTLY` macro markers
+- `cheq_rti.vcl` — all CHEQ RTI subroutine definitions
+- `example_main.vcl` — complete wiring example: backend declarations, `vcl_recv`, `vcl_pass`, `vcl_fetch`, `vcl_deliver`, `vcl_error` calling the CHEQ subroutines in the correct order, with `#FASTLY` macro markers
 
 Upload `cheq_rti.vcl` as a non-main include file and `example_main.vcl` (customised with your backends) as the main VCL. See [Setup – Custom VCL](#setup--custom-vcl) below.
 
@@ -120,17 +98,25 @@ Client request
 
   → vcl_pass (restart 0)
       X-Cheq-Param-* headers forwarded directly to RTI endpoint
-      (no JSON body — RTI reads the verdict from request headers)
+      (no JSON body — RTI reads the parameters from X-Cheq-Param-* request headers)
 
-  ← vcl_fetch (restart 0)
+  ← vcl_fetch (restart 0)           ← RTI responded with HTTP (normal path)
       Read verdict from RTI X-Cheq-Res-* response headers:
         malicious                  → action = "block"
         suspicious                 → action = "challenge"
         TT-code / Reasons override → action = "block" | "challenge" | "redirect"
+        RTI HTTP error (>= 400,    → action = "allow"  (fail-open, logged as error)
+          incl. 504 from backend)
         everything else            → action = "allow"
       Monitoring mode always sets action = "allow"
       Fire telemetry log (if enabled)
       → return(restart)
+
+  ← vcl_error (503, restart 0)      ← RTI connection failed / Fastly-level timeout
+      Backend unreachable — vcl_fetch was never called
+      Fail-open: restart without setting X-Cheq-Action
+      → return(restart)             (restart 1 treats unset action as "allow")
+      NOTE: Fastly-generated 504 is NOT handled here — only 503 is caught
 
 ── RESTART 1: act on verdict ─────────────────────────────────────────────────
 
@@ -169,7 +155,7 @@ Client request
       Deliver response to client
 ```
 
-**Fail-open:** If the RTI backend returns an error (HTTP >= 400), the integration logs the error, sets action to `allow`, and passes the request through to origin. Errors never block legitimate traffic.
+**Fail-open:** If the RTI backend returns an HTTP error (>= 400) or times out, the integration logs the error and passes the request through to origin. HTTP errors set action to `allow` explicitly; timeouts skip `vcl_fetch` entirely (via `vcl_error` 503) and restart with no action set, which also routes to origin. Errors never block legitimate traffic.
 
 ---
 
@@ -263,11 +249,17 @@ The primary runtime configuration dictionary. All keys are strings.
 | `api_key` | Your CHEQ API key (from the Paradome platform) |
 | `tag_hash` | Your CHEQ tag hash (from the Paradome platform) |
 
+#### Host header override (optional)
+
+| Key | Default | Description |
+|---|---|---|
+| `origin_host` | *(empty — disabled)* | When set, overrides the `Host` header sent to the origin on restart 1 and session-bypass requests. Required when your origin expects a specific hostname different from your Fastly domain. |
+
 #### RTI endpoint
 
 | Key | Default | Description |
 |---|---|---|
-| `api_hostname` | `rti-global.cheqzone.com` | RTI endpoint hostname. **Must match `.host` in `cheq_rti_backend`**. Dev: `obs.dev.cheqzone.com` |
+| `api_hostname` | `rti-global.cheqzone.com` | RTI endpoint hostname. **Must match `.host` in `cheq_rti_backend`**. Change to `obs.dev.cheqzone.com` for dev/testing only. |
 
 #### Action mode
 
@@ -320,7 +312,13 @@ A hardcoded regex also runs before the dictionary check:
 ```
 (?i)^/(favicon\.ico|robots\.txt|health|ping)
 ```
-Edit the regex in `cheq_rti.vcl` and redeploy to change it.
+This regex is defined in the `cheq_rti_recv` subroutine, marked with the comment `# (CONFIGURE THIS REGEX - URL PATHS TO IGNORE)`. To add or remove paths, extend the alternation group — for example, to also skip `sitemap.xml`:
+```
+(?i)^/(favicon\.ico|robots\.txt|health|ping|sitemap\.xml)
+```
+To disable the hardcoded regex entirely so all paths are evaluated by RTI, comment out the `if` block marked `# (CONFIGURE THIS REGEX - URL PATHS TO IGNORE)` in the VCL source. Then redeploy the changed file:
+- **Snippet deployment**: edit `snippets/init.vcl`, then upload and activate the snippet.
+- **Standalone VCL**: edit `cheq_rti.vcl`, then redeploy.
 
 ---
 
@@ -334,9 +332,24 @@ Override the action for specific RTI Classification-Code values, regardless of t
 
 Add integer code strings as keys (value always `1`). Changes take effect immediately — no redeployment needed. Fastly VCL regex must be compile-time literals, so exact-match table lookup is used instead of regex for these integer values.
 
+#### Reasons override (regex)
+
+To trigger an action based on the RTI **Reasons** field (a comma-separated list of integer reason codes, e.g. `5,10,15`) rather than Classification-Code, edit the literal regex patterns marked `# (CONFIGURE THIS REGEX - BLOCKING/CHALLENGE/REDIRECT REASONS)` in the `cheq_rti_backend_response` subroutine. There is one pattern per action (block, challenge, redirect). Example pattern to match any of reason codes 5, 10, or 15:
+```
+(^|,)(5|10|15)(,|$)
+```
+The boundary anchors (`^`, `$`, `,`) ensure `5` does not match `15` or `25`. To disable the Reasons override and revert to Classification-Code only, restore the default no-match pattern (this is a control that should never appear in the data):
+```
+^\x01$
+```
+This matches the SOH control character (`\x01`), which never appears in a real Reasons value, so the condition is effectively disabled. Because Fastly VCL regex must be compile-time literals, these patterns cannot be moved to a dictionary and must be edited in the VCL source then redeployed:
+- **Snippet deployment**: edit `snippets/init.vcl`, then upload and activate the snippet.
+- **Standalone VCL**: edit `cheq_rti.vcl`, then redeploy.
+
 ---
 
 ## Telemetry logging
+NOTE: THIS IS CURRENTLY IMPLEMENTED BUT WAS NEVER INTEGRATED VIA ONE OF THE VCL LOGGING OPTIONS SO IT CONSIDERED AS NOT WORKING!
 
 When `logging = true` in `general_config`, the integration sends RTI timing and verdict data to the CHEQ RTI Logger service after every request — mirroring `context.waitUntil(log(duration))` in the Cloudflare integration. This includes both normal requests and RTI errors.
 
@@ -417,7 +430,7 @@ The CAPTCHA verification service runs `compute/src/handler.js` as a Fastly Compu
    | Key | Value |
    |---|---|
    | `recaptcha_secret_key` | Your Google reCAPTCHA v2 **secret key** |
-   | `debugging_enabled` | `true` or `false` |
+   | `debugging_enabled` | `true` or `false` (default false) |
 
 ---
 
@@ -433,7 +446,7 @@ Before uploading VCL, create the following dictionaries in your Fastly VCL servi
 | `challenge_tt_codes` | Classification-Code values that force action = challenge; key = integer string, value = `1` |
 | `redirect_tt_codes` | Classification-Code values that force action = redirect; key = integer string, value = `1` |
 
-At minimum, populate `general_config` with `api_key` and `tag_hash`.
+At minimum, populate `general_config` with `api_key` and `tag_hash` and `origin_host`
 
 ---
 
@@ -575,7 +588,7 @@ fastly log-tail --service-id=<SERVICE_ID>
 
 ## Setup – Custom VCL (`cheq_rti.vcl` + `example_main.vcl`)
 
-Use this path only if you are managing a **full custom VCL service**. If you are using VCL Snippets, see [vcl/snippets/README.md](vcl/snippets/README.md) instead.
+Use this path only if you are managing a **full custom VCL service**. If you are using VCL Snippets, see [snippets/README.md](snippets/README.md) instead.
 
 ### Step 1 – Deploy the Compute@Edge CAPTCHA service
 

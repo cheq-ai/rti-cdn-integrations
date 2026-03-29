@@ -279,18 +279,20 @@ sub cheq_rti_session_generate {
 sub cheq_rti_recv {
 
     # ---- Configuration -------------------------------------------------------
-    # Update these values before deploying.
-    declare local var.cheq_api_key              STRING;
-    declare local var.cheq_tag_hash             STRING;
-    declare local var.cheq_mode                 STRING;  # "monitoring" | "blocking"
-    declare local var.cheq_redirect_loc         STRING;  # URL to redirect to when strategy is "redirect" (e.g. "https://www.cheq.ai/")
-    declare local var.cheq_block_strategy       STRING;  # The block strategy: "access_denied" | "not_found"  | "redirect" | "captcha"
-    declare local var.cheq_challenge_strategy   STRING;  # The challenge strategy: "access_denied" | "not_found"  | "redirect" | "captcha"
-    declare local var.cheq_logging              STRING;  # "true" | "false"
-    declare local var.cheq_debug                STRING;  # "true" | "false" – enable real-time debug logging
-    declare local var.cheq_api_hostname         STRING;  # The hostname portion of the CHEQ RTI API URL
-    declare local var.cheq_captcha_key          STRING;  # reCAPTCHA v2 site key – embedded in the challenge page and the verification URL path
-    declare local var.cheq_captcha_host         STRING;  # Hostname of captcha verification backend (must match cheq_captcha_backend .host)
+    # All values are read at runtime from the general_config Edge Dictionary.
+    declare local var.cheq_api_key              STRING;  # Mandatory – used for both RTI requests and session cookie signing
+    declare local var.cheq_tag_hash             STRING;  # Mandatory – used for RTI requests
+    # Mandatory parameter is 'origin_host' (used in pass.vcl) – is the customer origin hostname (e.g. www.example.com). This is needed to set the Host header of the RTI request and must match the .host value in the cheq_rti_backend declaration in your main VCL.
+
+    declare local var.cheq_captcha_host         STRING;  # Optional – Hostname of captcha verification backend (must match cheq_captcha_backend .host)
+    declare local var.cheq_captcha_key          STRING;  # Optional – reCAPTCHA v2 site key – embedded in the challenge page and the verification URL path
+    declare local var.cheq_mode                 STRING;  # Optional - "monitoring" | "blocking" (default blocking)
+    declare local var.cheq_redirect_loc         STRING;  # Optional - URL to redirect to when strategy is "redirect" (e.g. "https://www.cheq.ai/")
+    declare local var.cheq_block_strategy       STRING;  # Optional - The block strategy: "access_denied" | "not_found"  | "redirect" | "captcha"
+    declare local var.cheq_challenge_strategy   STRING;  # Optional - The challenge strategy: "access_denied" | "not_found"  | "redirect" | "captcha"
+    declare local var.cheq_logging              STRING;  # Optional - "true" | "false" (default "false") – currently not supported
+    declare local var.cheq_debug                STRING;  # Optional - "true" | "false" – enable real-time debug logging (default "false") 
+    declare local var.cheq_api_hostname         STRING;  # Optional – Hostname of the CHEQ RTI API (change this only for dev testing against a non-production RTI endpoint; must match cheq_rti_backend .host)
     #
     # NOTE on logging configuration
     # --------------------------------
@@ -377,7 +379,7 @@ sub cheq_rti_recv {
     #   call cheq_rti_session_check;
     #   if (req.http.X-Cheq-Session-Valid == "true") {
     #       set req.http.X-Cheq-Session-Bypass = "1";
-    #       set req.backend = origin_backend;
+    #       set req.backend = F_origin_backend;
     #       return(pass);
     #   }
     #
@@ -620,7 +622,7 @@ sub cheq_rti_recv {
 
 
         # Restore original request and route to the customer origin
-        set req.backend   = F_origin_backend;  # Here we will use the configured 'origin_backend' in fastly ui under Origins, which should point to the customer's origin server
+        set req.backend   = F_origin_backend;  # Backend created via CLI with --name origin_backend (or in the Fastly UI under Origins).
         set req.method    = req.http.X-Cheq-Orig-Method;
         set req.url       = req.http.X-Cheq-Orig-URL;
         set req.http.Host = req.http.X-Cheq-Orig-Host;
@@ -709,11 +711,9 @@ sub cheq_rti_backend_fetch {
 # ------------------------------------------------------------------------------
 # cheq_rti_backend_response
 # Call from vcl_fetch (Fastly) / vcl_backend_response (standard VCL).
-# Reads the RTI verdict headers and stores the action for restart 1. 
-# This is basically the RTI response processing but only the part of it that figures the action 
-# and stashes it for the restart or makes the decision to fail-open on RTI errors. 
-# The rest of the RTI response processing (stashing metadata for logging, debug logging, etc.) is also done here since this is the only place where the RTI response headers are accessible.
-# Fail-open: any error from RTI results in action "allow", logged as "error" level.
+# Reads the RTI verdict headers, determines the action, and stashes it for restart 1.
+# Also stashes metadata for logging since this is the only place RTI response headers
+# are accessible. Fail-open: any error from RTI results in action "allow", logged as "error".
 # ------------------------------------------------------------------------------
 sub cheq_rti_backend_response {
 
@@ -906,10 +906,8 @@ sub cheq_rti_synth {
     }
 
     if (obj.status == 503) {
-        # Check if the error is a backend read error (timeout)
-        # This is not eqvivalent to http status 503
-        # By default, Fastly returns a 503 Service Unavailable error if a backend fetch fails due to a timeout
-        # Fail-open: if the endpoint returned an HTTP error, log it and allow the request through.
+        # This 503 is Fastly's internal error for a backend timeout or connection failure —
+        # not an HTTP 503 returned by the backend. Fail-open: restart and allow the request through.
         if (req.http.X-Cheq-Config-Debug == "true") {
             log "syslog " + req.service_id + " CHEQ-DEBUG :: rti error status=Backend Timeout - Fail Open";
             set req.http.X-Cheq-RTI-Debug-Status = "Backend '" + req.backend + "' Timeout - Fail Open";

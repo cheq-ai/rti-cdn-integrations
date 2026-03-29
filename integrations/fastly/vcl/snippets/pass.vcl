@@ -7,8 +7,8 @@
 # RTI backend.  Delegates to cheq_rti_backend_fetch which sets the correct
 # backend-specific headers and strips internal tracking headers.
 #
-# A TODO comment is included for teams that need to override the Host header
-# on restart 1 / session-bypass requests.
+# A configurable Host header override is included, enabled by setting
+# `origin_host` in the `general_config` Edge Dictionary.
 #
 # Upload via Fastly CLI:
 #   fastly vcl snippet create \
