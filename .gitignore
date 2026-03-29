@@ -126,9 +126,6 @@ dist
 .vscode-test
 .vscode
 
-#TODO: remove when DONE
-*DataDome*/
-*FastlyDefendIntegration-main*/
 # yarn v3
 .pnp.*
 .yarn/*
