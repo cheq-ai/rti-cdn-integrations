@@ -124,6 +124,7 @@ dist
 
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test
+.vscode
 
 # yarn v3
 .pnp.*
@@ -140,3 +141,7 @@ vite.config.ts.timestamp-*
 
 # CloudFront Wrangler
 integrations/cloudflare/.wrangler
+
+# Fastly Compute build artifacts
+integrations/fastly/compute/bin/
+integrations/fastly/compute/pkg/
