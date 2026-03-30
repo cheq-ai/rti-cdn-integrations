@@ -36,6 +36,9 @@ service_id = "<YOUR_COMPUTE_SERVICE_ID>"
     [setup.backends.recaptcha_backend]
       address = "www.google.com"
       port = 443
+      use_ssl = true
+      ssl_cert_hostname = "www.google.com"
+      ssl_sni_hostname = "www.google.com"
 
   [setup.config_stores]
 
