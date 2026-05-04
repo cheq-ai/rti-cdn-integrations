@@ -10,11 +10,6 @@ import { trunstileValidateChallengeExample, turnstileChallengeExample } from './
  */
 export interface CloudfrontConfig extends Config {
     /**
-     * Enable telemetry logging
-     */
-    telemetry: boolean;
-
-    /**
      * Called when {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html#challengeCodes | challengeCodes } are configured
      * @param request
      * @param response
@@ -25,23 +20,31 @@ export interface CloudfrontConfig extends Config {
     ) => Promise<CloudFrontRequestResult | CloudFrontResponseResult>;
 
     /**
-     * Validate session of challenge function invoked at the beggining of the request to skip RTI check and allow the request to pass to origin
+     * Validate session of challenge function invoked at the beginning of the request to skip RTI check and allow the request to pass to origin
      * @param request
+     * @param isDebug
      */
-    validateChallenge?: (request: CloudFrontRequest) => Promise<boolean>;
+    validateChallenge?: (request: CloudFrontRequest, isDebug: boolean | undefined) => Promise<boolean>;
 
     /**
-     * Enables local debug logging
+     * The list of headers to keep in the request that will be sent to RTI. 
+     * This is optional and can be used to reduce the size of the request if there are many headers that are not needed. 
+     * If not provided (meaning empty array, null or undefined are not allowed), all headers will be kept.
      */
-    debug?: boolean;
+    keepHeadersNames: string[];
 }
 
 export const config: CloudfrontConfig = {
-    mode: Mode.MONITORING,
-    apiKey: "REPLACE_ME",
-    tagHash: "REPLACE_ME",
+    mode: Mode.BLOCKING,
+
+    apiKey: "REPLACE_ME", // Replace with your actual API key
+    tagHash: "REPLACE_ME", // Replace with your actual Tag Hash
+    
     challenge: turnstileChallengeExample,
     validateChallenge: trunstileValidateChallengeExample,
+    
     timeout: 500,
-    telemetry: true,
+    debug: false, // Set to true to enable debug logging, false for production
+    telemetry: false,
+    keepHeadersNames: [], // Optional: specify headers to keep in the request sent to RTI, otherwise all headers will be kept (in this case, pass empty array)
 };

@@ -137,4 +137,13 @@ export interface Config {
    * Enables local debug logging
    */
   debug?: boolean;
+
+  /**
+   * Enable telemetry logging. This will send logs regarding the RTI call duration to the RTI Logger service (via HTTP).
+   * The logs will be tagged with `rti_duration` and will include the duration of the RTI call in milliseconds. 
+   * This is useful for monitoring the performance of the RTI calls in production.
+   * 
+   * In Future, we may expand the telemetry functionality to include more log types and more detailed information about the RTI calls.
+   */
+  telemetry: boolean;
 }

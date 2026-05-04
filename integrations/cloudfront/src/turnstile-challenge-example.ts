@@ -2,8 +2,8 @@ import { CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult } 
 import { RTIResponse } from "../../core/models/rti-response.model";
 
 const turnstileChallengeExample = async (request: CloudFrontRequest, response: RTIResponse): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
-    const turnstileSiteKey = "REPLACE_ME";
-    const turnstileSecret = "REPLACE_ME";
+    const turnstileSiteKey = "0x4AAAAAACJwFq0WF3t3dfBi";
+    const turnstileSecret = "0x4AAAAAACJwFq3Meh-Zlqq4BkZysvuyf68";
     const ttl = 300; // 5 minutes
     let queryStringData = new URLSearchParams(request.querystring);
     // @ts-ignore
@@ -232,8 +232,9 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
                             Please complete the verification below to confirm you're human and continue to the website.
                         </p>
                         <form id="captcha-form" action="${request.uri}" method="GET">
-                            <input type="hidden" name="original_url" value="${encodeURIComponent(request.uri)}">
+                            <input type="hidden" name="original_url" value="${request.uri}">
                             <input type="hidden" name="request_id" value="${response.ids.rayId}">
+                            <input type="hidden" name="viewer_host" id="viewer_host" value="">
                             
                             <div class="captcha-box">
                             <div class="cf-turnstile" 
@@ -264,6 +265,8 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
                     </div>
 
                     <script>
+                        document.getElementById('viewer_host').value = window.location.host;
+
                         function onTurnstileSuccess(token) {
                         document.getElementById('submit-btn').disabled = false;
                         }
@@ -306,13 +309,14 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
             
             const sessionToken = `${expiresAt}.${signature}`;
 
-            // @ts-ignore
-            const redirectUrl = queryStringData?.get("original_url")!;
+            const host = queryStringData?.get("viewer_host") || request.headers["host"]?.[0]?.value || "";
+            const originalPath = queryStringData?.get("original_url") || request.uri;
             const headers = {};
             // @ts-ignore
-            headers.location = [{ key: 'Location', value: "https://www.cheq.ai/" }];
+            headers.location = [{ key: 'Location', value: `https://${host}${originalPath}` }];
             // @ts-ignore
             headers["set-cookie"] = [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}` }];
+            
             return {
                 status: '302',
                 headers,
@@ -326,20 +330,48 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
     }
 };
 
-const trunstileValidateChallengeExample = async (request: CloudFrontRequest): Promise<boolean> => {
-    // Validate session token (if the validation alreay happend)
+const trunstileValidateChallengeExample = async (request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
+    // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)
     const cookieHeaderMap = (request.headers["cookie"]?.[0]?.value || "").split(";").map(c => c.trim());
-    const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se"))?.split("=")[1]?.split("|");
-    const rayId = request.headers["x-cheq-ray-id"]?.[0]?.value || cookieValue?.pop();
-    const sessionToken = request.headers["x-cheq-challenge"]?.[0]?.value || cookieValue?.pop();
-    if (sessionToken && rayId) {
+    const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se="))?.split("=")[1]?.split("|");
+    const [cookieToken, cookieRayId] = cookieValue ?? [];
+    const rayId = request.headers["x-cheq-ray-id"]?.[0]?.value || cookieRayId;
+    const sessionToken = request.headers["x-cheq-challenge"]?.[0]?.value || cookieToken;
+
+    const shouldValidateChallenge = sessionToken && rayId;
+    if (isDebug) {
+        console.log(`[validateChallenge] cookie header: ${request.headers["cookie"]?.[0]?.value ?? "NOT PRESENT"}`);
+        console.log(`[validateChallenge] sessionToken: ${sessionToken ?? "NOT FOUND"}, rayId: ${rayId ?? "NOT FOUND"}, shouldValidateChallenge: ${shouldValidateChallenge ?? "NOTHING_TO_VALIDATE_CALL_RTI"}`);
+    }
+
+    if (shouldValidateChallenge) {
         try {
             const [expiresAtStr, signature] = sessionToken.split(".");
-            if (!expiresAtStr || !signature) { return false; }
             
+            if (!expiresAtStr || !signature) { 
+                if (isDebug) {
+                    console.log("[validateChallenge] invalid sessionToken format, returning 'false'");
+                }
+                
+                return false; 
+            }
+
             const expiresAt = parseInt(expiresAtStr, 10);
-            if (isNaN(expiresAt)) { return false; }
-            if (Date.now() > expiresAt) { return false; }
+            if (isNaN(expiresAt)) { 
+                if (isDebug) {
+                    console.log("[validateChallenge] expiresAt is NaN, returning 'false'");
+                }
+
+                return false; 
+            }
+
+            if (Date.now() > expiresAt) {
+                if (isDebug) {
+                    console.log(`[validateChallenge] session token expired at ${expiresAt}, current time is ${Date.now()}, returning 'false'`);
+                }
+
+                return false; 
+            }
             
             // Verify signature
             const data = `${expiresAt}:${rayId}`;
@@ -348,8 +380,16 @@ const trunstileValidateChallengeExample = async (request: CloudFrontRequest): Pr
             const hashArray = Array.from(new Uint8Array(hashBuffer));
             const expectedSignature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, "0")).join("");
             
-            return signature === expectedSignature;
-        } catch {
+            const match = signature === expectedSignature;
+            
+            if (isDebug) {
+                console.log(`[validateChallenge] signature match: ${match}`);
+            }
+
+            return match;
+        } catch (e) {
+            const err: Error = e as Error;
+            console.error(`[validateChallenge] error validating challenge (continue running returning 'false'): ${err.message}`);
             return false;
         }
     }

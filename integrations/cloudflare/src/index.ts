@@ -21,7 +21,7 @@ export default {
             // prevent runtime error responses, fail open to origin
             context.passThroughOnException();
 
-            // Filter out ignored paths and already validated challenges and validate challange if exists:
+            // Filter out ignored paths and already validated challenges and validate challenge if exists
             const requestURL = new URL(request.url);
             if (rtiHelperService.shouldIgnore(requestURL.pathname) || (config.validateChallenge && await config.validateChallenge(request))) {
                 const originResponse = await fetch(request);

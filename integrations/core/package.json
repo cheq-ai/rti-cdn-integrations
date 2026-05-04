@@ -1,0 +1,11 @@
+{
+  "name": "rti-cdn-core",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "vitest --reporter=verbose --watch false"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.16"
+  }
+}

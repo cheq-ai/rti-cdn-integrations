@@ -2,17 +2,21 @@ import { IRTILogger } from "../models/rti-logger.interface";
 import { Config } from "../models/config.interface";
 
 export class RTILoggerService implements IRTILogger {
-  application: string;
-  config: Config;
+  private readonly application: string;
+  private readonly config: Config;
+  private readonly url: string;
+  private readonly isDebugMode: boolean;
 
   constructor(application: string, config: Config) {
     this.application = application;
     this.config = config;
+    this.url = this.config.rtiLoggerURI || 'https://rtilogger.production.cheq-platform.com';  
+    this.isDebugMode = this.config.debug || false;
   }
 
   async log(level: 'audit' | 'error' | 'info' | 'warn', message: string, action?: string): Promise<void> {
     try {
-      const options = {
+      const request = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -26,10 +30,16 @@ export class RTILoggerService implements IRTILogger {
           tagHash: this.config.tagHash,
         }),
       };
-      return fetch(this.config.rtiLoggerURI || 'https://rtilogger.production.cheq-platform.com', options).then();
+      
+      return fetch(this.url, request)
+      .then(response => {
+        if (this.isDebugMode) {
+          console.info(`rti logger response: ${response.status} (${response.statusText}) for log level: ${level}, message: ${message}, action: ${action}`);
+        } 
+      })
+      .catch(e => console.error(`rti logger api error (continue running): ${e}`));
     } catch (e) {
-      const err: Error = e as Error;
-      console.error(`${this.application} request error: ${err.message}`);
+      console.error(`rti logger error (continue running): ${e}`);
     }
   }
 

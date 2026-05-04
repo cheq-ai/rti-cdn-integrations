@@ -30,7 +30,7 @@ export interface RTIRequest {
   /**
    * Indicates whether the header names were received in a deterministic order
    */
-  isHeaderNamesOrdered: boolean;
+  isHeaderNamesOrdered?: boolean;
 
   /**
    * Logical channel or source identifier
@@ -63,14 +63,25 @@ export interface RTIRequest {
   customId4?: string;
 
   /**
-   * Device unique identifier cookie (optional)
+   * Device unique identifier cookie (optional - but better be passed if available)
+   * Shown as _cq_duid cookie on the client side.
+   * Available in API version 4.0 and above.
    */
   duidCookie?: string;
 
   /**
-   * Page view identifier cookie (optional)
-   */
+   * Page view identifier cookie (optional - but better be passed if available)
+   * Shown as _cq_pvid cookie on the client side.
+   * Available in API version 4.0 and above.
+   */ 
   pvidCookie?: string;
+
+  /**
+   * Session cookie (optional - but better be passed if available)
+   * Shown as _cq_s cookie on the client side.
+   * Available in API version 4.1 and above.
+   */
+  sCookie?: string;
 }
 
 /**
