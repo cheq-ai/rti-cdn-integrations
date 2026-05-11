@@ -23,36 +23,42 @@ export interface Config {
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will be blocked.
+   * Know as malicious traffic
    */
   blockTTCodes?: number[];
 
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be blocked.
+   * Know as malicious traffic
    */
   blockReasons?: number[];
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will invoke integration challenge function if configured.
+   * Know as suspicious traffic
    */
   challengeTTCodes?: number[];
   
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will invoke integration challenge function if configured.
+   * Know as suspicious traffic
    */
   challengeReasons?: number[];
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will be redirected.
+   * When the traffic is considered benign but you prefer to redirect rather allow it.
    */
   redirectTTCodes?: number[];
 
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be redirected.
+   * When the traffic is considered benign but you prefer to redirect rather allow it.
    */
   redirectReasons?: number[];
 
   /**
-   * Location to redirect - default is: 'https://www.cheq.ai/'.
+   * Location to redirect when decision is made to redirect the traffic - default is: 'https://www.cheq.ai/'.
    */
   redirectLocation?: string;
 

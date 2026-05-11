@@ -4,6 +4,7 @@ import { Config } from '../../core/models/config.interface';
 import { RTIResponse } from '../../core/models/rti-response.model';
 import { Mode } from '../../core/models/mode.model';
 import { trunstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
+import { ActionStrategy } from '../../core/models/action-strategy.model';
 
 /**
  * See {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html | Config}
@@ -35,14 +36,51 @@ export interface CloudfrontConfig extends Config {
 }
 
 export const config: CloudfrontConfig = {
-    mode: Mode.BLOCKING,
+    mode: Mode.MONITORING, // Start with MONITORING to observe before enforcing with BLOCKING
 
     apiKey: "REPLACE_ME", // Replace with your actual API key
     tagHash: "REPLACE_ME", // Replace with your actual Tag Hash
     
+    // By default we use ActionStrategy.ACCESS_DENIED but you can set it to REDIRECT or CAPTCHA as well, but make sure to implement the relevant functions and configurations for each strategy
+    //blockingStrategy: ActionStrategy.ACCESS_DENIED, 
+    
+    // By default we use ActionStrategy.CAPTCHA but you can set it to REDIRECT or ACCESS_DENIED as well, but make sure to implement the relevant functions and configurations for each strategy
+    //challengingStrategy: ActionStrategy.CAPTCHA
+
+    // The redirect url when decision was made to redirect the traffic
+    //redirectLocation: 'https://www.cheq.ai/',
+
     challenge: turnstileChallengeExample,
     validateChallenge: trunstileValidateChallengeExample,
-    
+
+    // Example for ignored paths
+    ignorePaths: [
+        // Static assets — no user interaction, no value in RTI evaluation
+        '\\.css$', '\\.js$', '\\.mjs$', '\\.map$',
+        '\\.png$', '\\.jpg$', '\\.jpeg$', '\\.gif$', '\\.webp$', '\\.svg$', '\\.ico$',
+        '\\.woff$', '\\.woff2$', '\\.ttf$', '\\.eot$',
+        '\\.mp4$', '\\.webm$', '\\.mp3$',
+        '\\.pdf$', '\\.zip$',
+
+        // Well-known browser/crawl requests
+        '^/favicon\\.ico$',
+        '^/robots\\.txt$',
+        '^/sitemap.*\\.xml$',
+        '^/ads\\.txt$',
+
+        // Health checks and monitoring (AWS ALB, Route53, uptime services)
+        '^/health$',
+        '^/healthcheck$',
+        '^/ping$',
+        '^/status$',
+
+        // Internal / infrastructure paths
+        '^/_next/',        // Next.js static files and HMR
+        '^/__webpack',     // Webpack HMR
+        '^/static/',       // Generic static directory
+        '^/assets/',       // Generic assets directory
+    ],
+        
     timeout: 500,
     debug: false, // Set to true to enable debug logging, false for production
     telemetry: false,
