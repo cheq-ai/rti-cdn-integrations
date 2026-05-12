@@ -126,6 +126,7 @@ dist
 
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test
+.vscode
 
 # yarn v3
 .pnp.*
@@ -145,3 +146,7 @@ integrations/cloudflare/.wrangler
 
 # CloudFront SAM:
 .aws-sam
+
+# Fastly Compute build artifacts
+integrations/fastly/compute/bin/
+integrations/fastly/compute/pkg/
