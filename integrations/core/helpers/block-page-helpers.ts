@@ -1,17 +1,34 @@
+import { Ids } from "../models/rti-response.model";
+
 /**
  * Generates an HTML block page to return to the client when a request is denied.
  *
  * @param status - HTTP status code to display (e.g. "403", "404"). Must be non-empty.
  * @param title - Human-readable status title (e.g. "Access Denied"). Must be non-empty.
- * @param rtiId - RTI reference ID (ray ID) used for tracking and support. Must be non-empty.
+ * @param rtiIds - RTI Ids object used for tracking and support.
  * @param additionalCdnId - Optional CDN-specific request ID (e.g. CloudFront x-amz-cf-id).
  *                          When provided, rendered as a secondary reference box on the page.
  * @returns Full HTML page as a string.
- * @throws {Error} If any of the mandatory params (status, title, rtiId) are empty.
  */
-export function generateDefaultBlockPage(status: string, title: string, rtiId: string, additionalCdnId?: string | null): string {
-    if (!status || !title || !rtiId) {
-        throw new Error(`generateDefaultBlockPage: missing required params (status=${status}, title=${title}, rtiId=${rtiId})`);
+export function generateDefaultBlockPage(status: string, title: string, rtiIds: Ids, additionalCdnId?: string | null): string {
+    if (!status || !title) {
+        status = '500';
+        title = 'Internal Server Error';
+    }
+
+    let rtiIdsDisplay: string;
+    let rtiIdsDisplayHeader: string = 'Reference ID';
+
+    if (!rtiIds) {
+        rtiIdsDisplay = `no ids available`;
+    } else {
+        if (rtiIds.pageViewId) {
+            rtiIdsDisplayHeader = rtiIdsDisplayHeader + 's';
+            rtiIdsDisplay = `rayId: ${rtiIds.rayId}<br>pageViewId: ${rtiIds.pageViewId}`;
+        }
+        else {
+            rtiIdsDisplay = rtiIds.rayId;
+        }
     }
 
     return `<!DOCTYPE html>
@@ -64,11 +81,11 @@ export function generateDefaultBlockPage(status: string, title: string, rtiId: s
         <h1>${title}</h1>
         <p>Access to this resource has been denied by security policy.</p>
         <div class="ref-box">
-            <div class="ref-label">Reference ID</div>
-            <div class="ref-id">${rtiId}</div>
+            <div class="ref-label">${rtiIdsDisplayHeader}</div>
+            <div class="ref-id">${rtiIdsDisplay}</div>
         </div>
         ${additionalCdnId ? `<div class="ref-box">  <!-- The specific CDN unique request Id (may not be present for some CDNs) -->
-            <div class="ref-label">Additional Platform ID</div> 
+            <div class="ref-label">Additional Platform ID</div>
             <div class="ref-id">${additionalCdnId}</div>
         </div>` : ''}
     </div>

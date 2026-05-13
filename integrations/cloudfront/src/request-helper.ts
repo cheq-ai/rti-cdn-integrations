@@ -8,7 +8,7 @@ import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model"
 import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
-import { RTIResponse } from '../../core/models/rti-response.model';
+import { Ids, RTIResponse } from '../../core/models/rti-response.model';
 import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers';
 
 export enum RequestType {
@@ -112,18 +112,19 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                     return {
                         status: '403',
                         headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
-                        body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids.rayId, getCfRequestId(event)),
+                        body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.NOT_FOUND:
                     return {
                         status: '404',
                         headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
-                        body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids.rayId, getCfRequestId(event)),
+                        body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.REDIRECT:
                     const headers: CloudFrontHeaders = {
                         'x-cheq-cf-request-id': [{ key: 'x-cheq-cf-request-id', value: getCfRequestId(event) }],
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
+                        'x-cheq-page-view-id': [{ key: 'x-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'Location', value: config.redirectLocation || "https://www.cheq.ai/" }],
                     };
                     return {
