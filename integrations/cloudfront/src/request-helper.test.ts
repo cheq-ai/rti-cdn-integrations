@@ -259,6 +259,33 @@ describe('request-helper handle', () => {
         expect(result.headers.location[0].value).toBe('https://www.cheq.ai/');
     });
 
+    it('includes x-cheq-id and x-cheq-cf-request-id headers on REDIRECT', async () => {
+        mocks.getAction.mockReturnValue(Action.REDIRECT);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
+        const event = buildEvent();
+        const result = await handle(event, RequestType.ORIGIN_REQUEST) as any;
+        expect(result.headers['x-cheq-id'][0].value).toBe('ray-123');
+        expect(result.headers['x-cheq-cf-request-id'][0].value).toBe('req-123');
+    });
+
+    it('includes x-cheq-page-view-id with pageViewId value when present on REDIRECT', async () => {
+        mocks.getAction.mockReturnValue(Action.REDIRECT);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
+        mocks.callRTI.mockResolvedValue({ ...buildRTIResponse(), ids: { rayId: 'ray-123', pageViewId: 'pv-xyz' } });
+        const event = buildEvent();
+        const result = await handle(event, RequestType.ORIGIN_REQUEST) as any;
+        expect(result.headers['x-cheq-page-view-id'][0].value).toBe('pv-xyz');
+    });
+
+    it('includes x-cheq-page-view-id with empty string when pageViewId is absent on REDIRECT', async () => {
+        mocks.getAction.mockReturnValue(Action.REDIRECT);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
+        mocks.callRTI.mockResolvedValue({ ...buildRTIResponse(), ids: { rayId: 'ray-123', pageViewId: null } });
+        const event = buildEvent();
+        const result = await handle(event, RequestType.ORIGIN_REQUEST) as any;
+        expect(result.headers['x-cheq-page-view-id'][0].value).toBe('');
+    });
+
     // --- CAPTCHA ---
 
     it('calls challenge and returns its result when CAPTCHA and challenge is configured', async () => {
@@ -433,6 +460,7 @@ describe('request-helper handle', () => {
         await handle(event, RequestType.ORIGIN_REQUEST);
         expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('unknown_request_id'));
     });
+
 
     // --- Debug logging ---
 

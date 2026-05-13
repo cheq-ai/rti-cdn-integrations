@@ -246,6 +246,10 @@ describe('RTIHelperService', () => {
     test('returns undefined when header is missing and no default provided', () => {
       expect(svc.getHeaderByName(headers, 'missing')).toBeUndefined();
     });
+
+    test('returns undefined when called without name argument (uses default empty string)', () => {
+      expect(svc.getHeaderByName(headers)).toBeUndefined();
+    });
   });
 
   describe('validateConfig', () => {
