@@ -1,0 +1,19 @@
+{
+  "name": "cheq-rti-integration-cloudfront",
+  "version": "0.2.0",
+  "scripts": {
+    "unit": "jest",
+    "compile": "tsc",
+    "test": "tsc && vitest --reporter=verbose --watch false",
+    "start": "sam build; sam local invoke OriginRequest -e events/origin-request-event.json"
+  },
+  "dependencies": {
+    "esbuild": "^0.14.14"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.92",
+    "prettier": "^2.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "Records": [
+    {
+      "cf": {
+        "config": {
+          "distributionDomainName": "dduxi5f936qwr.cloudfront.net",
+          "distributionId": "E1N3QDQ7D6MHGQ",
+          "eventType": "viewer-request",
+          "requestId": "4TyzHTaYWb1GX1qTfsHhEqV6HUDd_BzoBZnwfnvQc_1oF26ClkoUSEQ=="
+        },
+        "request": {
+          "clientIp": "90.139.141.35",
+          "headers": {
+            "host": [
+              {
+                "key": "Host",
+                "value": "tests-cdn.dev.cheq-platform.com"
+              }
+            ],
+            "user-agent": [
+              {
+                "key": "User-Agent",
+                "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+              }
+            ],
+            "accept": [
+              {
+                "key": "Accept",
+                "value": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+              }
+            ],
+            "accept-language": [
+              {
+                "key": "Accept-Language",
+                "value": "en-US,en;q=0.9"
+              }
+            ],
+            "referer": [
+              {
+                "key": "Referer",
+                "value": "https://tests-cdn.dev.cheq-platform.com/"
+              }
+            ],
+            "x-forwarded-for": [
+              {
+                "key": "X-Forwarded-For",
+                "value": "90.139.141.35"
+              }
+            ],
+            "cache-control": [
+              {
+                "key": "Cache-Control",
+                "value": "no-cache"
+              }
+            ],
+            "cloudfront-viewer-ja3-fingerprint": [
+              {
+                "key": "Cloudfront-Viewer-Ja3-Fingerprint",
+                "value": "5e8214b614c1d1b176573bed01f6dc8f"
+              }
+            ],
+            "cloudfront-viewer-country": [
+              {
+                "key": "CloudFront-Viewer-Country",
+                "value": "US"
+              }
+            ]
+          },
+          "method": "GET",
+          "querystring": "",
+          "uri": "/"
+        }
+      }
+    }
+  ]
+}

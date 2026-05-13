@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Template for cheq-rti-integration-cloudfront
+Parameters:
+  TrustedIPHeader:
+    Description: Trusted IP Header
+    Default: ''
+    Type: String
+  ExistingRoleArn:
+    Description: ARN of an existing IAM role to use for the Lambda. If empty, a new role will be created.
+    Default: ''
+    Type: String
+Conditions:
+  TrustedIPHeaderIncluded: !Not
+    - !Equals
+      - !Ref TrustedIPHeader
+      - ''
+  CreateRole: !Equals
+    - !Ref ExistingRoleArn
+    - ''
+Outputs:
+  OriginRequestVersionARN:
+    Description: Origin Request lambda version ARN. Use with origin-request CloudFront event trigger.
+    Value: !Ref OriginRequest.Version
+  ViewerRequestVersionARN:
+    Description: Viewer Request lambda version ARN. Use with viewer-request CloudFront event trigger.
+    Value: !Ref ViewerRequest.Version
+  OriginRequestPolicy:
+    Description: Includes RTI, ja3/ja4 fingerprint, tls and host headers
+    Value: !Sub "${AWS::StackName}-origin-request-policy"
+  OriginRequestPolicyNoHost:
+    Description: Includes RTI, ja3/ja4 fingerprint and tls headers, no host header
+    Value: !Sub "${AWS::StackName}-origin-request-policy-no-host"
+  OriginRequestPolicyNoHostTrustedIP:
+    Condition: TrustedIPHeaderIncluded
+    Description: Includes RTI, ja3/ja4 fingerprint, tls and trusted ip headers, no host header
+    Value: !Sub "${AWS::StackName}-origin-request-policy-no-host-trusted-ip"
+  OriginRequestPolicyTrustedIP:
+    Condition: TrustedIPHeaderIncluded
+    Description: Includes RTI, ja3/ja4 fingerprint, tls, host and trusted ip headers
+    Value: !Sub "${AWS::StackName}-origin-request-policy-trusted-ip"
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-role"
+      Policies:
+        - PolicyName: cloudwatch-logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - arn:aws:logs:*:*:*
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+        Version: 2012-10-17
+  OriginRequest:
+    Type: AWS::Serverless::Function
+    #DeletionPolicy: Retain  # Consider whether to retain or delete the Lambda function on stack deletion. Retaining can prevent accidental loss of the function and its versions.
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-origin-request"
+      AutoPublishAlias: live
+      CodeUri: src/
+      Handler: origin-request.handle
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 128
+      Role: !If [CreateRole, !GetAtt LambdaRole.Arn, !Ref ExistingRoleArn]
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true # Disabled for local debugging (set to false) - set to true for production
+        Target: "es2020"
+        Sourcemap: false # Set to true for local debugging only. Must be false for Lambda@Edge deployment — sourcemaps significantly increase bundle size and Lambda@Edge has a strict 1 MB package size limit.
+        EntryPoints:
+          - origin-request.ts
+  # Solution B: Viewer-Request Lambda
+  # Attach to the viewer-request CloudFront event trigger.
+  # Gets ALL viewer headers automatically — no origin request policy needed for Lambda to read headers.
+  # Runs on every request before cache lookup. Hard timeout: 5 seconds.
+  ViewerRequest:
+    Type: AWS::Serverless::Function
+    #DeletionPolicy: Retain  # Consider whether to retain or delete the Lambda function on stack deletion. Retaining can prevent accidental loss of the function and its versions.
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-viewer-request"
+      AutoPublishAlias: live
+      CodeUri: src/
+      Handler: viewer-request.handle
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      Timeout: 5
+      MemorySize: 128
+      Role: !If [CreateRole, !GetAtt LambdaRole.Arn, !Ref ExistingRoleArn]
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: false
+        EntryPoints:
+          - viewer-request.ts
+  # Use when the origin requires the Host header (e.g. virtual-hosted S3, custom domain origins).
+  # Forwards all cookies, query strings, and a full set of viewer/request headers including host.
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy"
+        Comment: Includes RTI, ja3/ja4 fingerprint, tls and host headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - cloudfront-viewer-ja4-fingerprint
+            - accept
+            - accept-language
+            - host
+            - referer
+            - user-agent
+            - x-forwarded-for
+            - true-client-ip
+  # Use when the origin must NOT receive the Host header (e.g. S3 REST endpoint, origins that use
+  # their own domain). Omitting host prevents CloudFront from sending the viewer's hostname to
+  # the origin, which would cause request failures on origins that don't recognize it.
+  OriginRequestPolicyNoHost:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-no-host"
+        Comment: Includes RTI, ja3/ja4 fingerprint and tls headers, no host header
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - cloudfront-viewer-ja4-fingerprint
+            - accept
+            - accept-language
+            - referer
+            - user-agent
+            - x-forwarded-for
+            - true-client-ip
+  # Same as NoHost but also forwards the custom header specified by the TrustedIPHeader parameter.
+  # Only created when TrustedIPHeader is provided. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
+  OriginRequestPolicyNoHostTrustedIP:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: TrustedIPHeaderIncluded
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-no-host-trusted-ip"
+        Comment: Includes RTI, ja3/ja4 fingerprint, tls and trusted ip headers, no host header
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - cloudfront-viewer-ja4-fingerprint
+            - accept
+            - accept-language
+            - referer
+            - user-agent
+            - !Ref TrustedIPHeader
+            - x-forwarded-for
+            - true-client-ip
+  # Same as the default policy (with host) but also forwards the custom header specified by the TrustedIPHeader parameter.
+  # Only created when TrustedIPHeader is provided. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
+  OriginRequestPolicyTrustedIP:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: TrustedIPHeaderIncluded
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-trusted-ip"
+        Comment: Includes RTI, ja3/ja4 fingerprint, tls, host and trusted ip headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - cloudfront-viewer-tls
+            - cloudfront-viewer-ja3-fingerprint
+            - cloudfront-viewer-ja4-fingerprint
+            - accept
+            - accept-language
+            - host
+            - referer
+            - user-agent
+            - !Ref TrustedIPHeader
+            - x-forwarded-for
+            - true-client-ip
+  # Forwards all cookies, query strings, and all viewer/request headers to the origin. 
+  # Use for maximum flexibility when testing or if the origin needs a wide range of headers and you don't want to manage updates to the header whitelist over time. 
+  # Note that this will forward the Host header by default, which may not be suitable for all origins (e.g. S3 REST endpoints).
+  OriginRequestPolicyAllHeadersAllowed:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-all-headers-allowed"
+        Comment: Includes RTI, ja3/ja4 fingerprint, tls headers, host and trusted ip headers
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewerAndWhitelistCloudFront
+          Headers:
+          - cloudfront-viewer-tls
+          - cloudfront-viewer-ja3-fingerprint
+          - cloudfront-viewer-ja4-fingerprint
+          - cloudfront-viewer-country
+          - cloudfront-viewer-city
+          - cloudfront-is-mobile-viewer
+          - cloudfront-is-tablet-viewer
+          - cloudfront-is-smarttv-viewer
+          - CloudFront-Viewer-Header-Order
+          - CloudFront-Viewer-Header-Count

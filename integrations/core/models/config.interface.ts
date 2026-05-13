@@ -23,36 +23,42 @@ export interface Config {
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will be blocked.
+   * Know as malicious traffic
    */
   blockTTCodes?: number[];
 
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be blocked.
+   * Know as malicious traffic
    */
   blockReasons?: number[];
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will invoke integration challenge function if configured.
+   * Know as suspicious traffic
    */
   challengeTTCodes?: number[];
   
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will invoke integration challenge function if configured.
+   * Know as suspicious traffic
    */
   challengeReasons?: number[];
 
   /**
    * List of {@link RTIResponse.classification.code| threat type codes} that will be redirected.
+   * When the traffic is considered benign but you prefer to redirect rather allow it.
    */
   redirectTTCodes?: number[];
 
   /**
    * List of {@link RTIResponse.cheqDetection.reasons| reason codes} that will be redirected.
+   * When the traffic is considered benign but you prefer to redirect rather allow it.
    */
   redirectReasons?: number[];
 
   /**
-   * Location to redirect - default is: 'https://www.cheq.ai/'.
+   * Location to redirect when decision is made to redirect the traffic - default is: 'https://www.cheq.ai/'.
    */
   redirectLocation?: string;
 
@@ -137,4 +143,13 @@ export interface Config {
    * Enables local debug logging
    */
   debug?: boolean;
+
+  /**
+   * Enable telemetry logging. This will send logs regarding the RTI call duration to the RTI Logger service (via HTTP).
+   * The logs will be tagged with `rti_duration` and will include the duration of the RTI call in milliseconds. 
+   * This is useful for monitoring the performance of the RTI calls in production.
+   * 
+   * In Future, we may expand the telemetry functionality to include more log types and more detailed information about the RTI calls.
+   */
+  telemetry: boolean;
 }
