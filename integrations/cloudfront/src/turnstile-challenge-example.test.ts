@@ -1,14 +1,19 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
 // @ts-ignore — node:crypto is not in the tsconfig types but is available at runtime in Node 20
 import { webcrypto } from 'node:crypto';
-import { trunstileValidateChallengeExample } from './turnstile-challenge-example';
+import { trunstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
 import type { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
+import type { RTIResponse } from '../../core/models/rti-response.model';
 
 // crypto.subtle is available in the Lambda runtime but not in Node's test environment by default.
 beforeAll(() => {
     if (!globalThis.crypto) {
         Object.defineProperty(globalThis, 'crypto', { value: webcrypto, writable: false });
     }
+});
+
+afterEach(() => {
+    vi.restoreAllMocks();
 });
 
 // Compute a valid _cq_se session token the same way turnstile-challenge-example.ts does.
@@ -132,5 +137,141 @@ describe('trunstileValidateChallengeExample', () => {
             buildRequest(undefined, rayId, token)
         );
         expect(result).toBe(true);
+    });
+
+    // --- Debug logging branches ---
+
+    it('logs debug info when isDebug=true and no session present', async () => {
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await trunstileValidateChallengeExample(buildRequest(), true);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[validateChallenge]'));
+    });
+
+    it('logs token/rayId info when isDebug=true with a valid token', async () => {
+        const rayId = 'ray-debug';
+        const { token } = await buildValidToken(rayId);
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('signature match'));
+    });
+
+    it('logs debug info when isDebug=true and token is expired', async () => {
+        const rayId = 'ray-debug';
+        const { token } = await buildValidToken(rayId, -1000);
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('expired'));
+    });
+
+    it('logs debug info when isDebug=true and token has no separator', async () => {
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await trunstileValidateChallengeExample(buildRequest('_cq_se=1234567890|ray-abc'), true);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('invalid sessionToken format'));
+    });
+
+    it('logs debug info when isDebug=true and expiresAt is NaN', async () => {
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await trunstileValidateChallengeExample(buildRequest('_cq_se=notanumber.abcdef|ray-abc'), true);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('NaN'));
+    });
+
+    // --- Catch block ---
+
+    it('returns false and logs error when crypto.subtle.digest throws', async () => {
+        const rayId = 'ray-abc123';
+        const { token } = await buildValidToken(rayId);
+        const digestSpy = vi.spyOn(globalThis.crypto.subtle, 'digest').mockRejectedValueOnce(new Error('digest failed'));
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const result = await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
+        expect(result).toBe(false);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('digest failed'));
+        digestSpy.mockRestore();
+    });
+});
+
+function buildTurnstileRequest(querystring = '', hostHeader?: string): CloudFrontRequest {
+    const headers: Record<string, { key: string; value: string }[]> = {};
+    if (hostHeader) {
+        headers['host'] = [{ key: 'Host', value: hostHeader }];
+    }
+    return {
+        clientIp: '1.2.3.4',
+        method: 'GET',
+        uri: '/page',
+        querystring,
+        headers,
+    } as unknown as CloudFrontRequest;
+}
+
+function buildRTIResponse(rayId = 'ray-123'): RTIResponse {
+    return {
+        ids: { rayId, pageViewId: null, duid: null, uniqueVisitId: null },
+        decision: { verdict: 'suspicious' },
+        classification: { code: 0 },
+        cheqDetection: { reasons: [] },
+        metadata: { version: '1.0' },
+    } as unknown as RTIResponse;
+}
+
+describe('turnstileChallengeExample', () => {
+
+    // --- No token: serve challenge page ---
+
+    it('returns 403 with HTML challenge page when no cf-turnstile-response token present', async () => {
+        const result = await turnstileChallengeExample(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('cf-turnstile');
+        expect(result.headers['content-type'][0].value).toContain('text/html');
+        expect(result.headers['cache-control'][0].value).toContain('no-store');
+    });
+
+    it('embeds rayId in challenge page HTML', async () => {
+        const result = await turnstileChallengeExample(buildTurnstileRequest(), buildRTIResponse('ray-embed-test')) as any;
+        expect(result.body).toContain('ray-embed-test');
+    });
+
+    // --- Token present: verify with Turnstile ---
+
+    it('returns 302 with session cookie when Turnstile verification succeeds', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            json: async () => ({ success: true }),
+        }));
+        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'viewer_host': 'example.com', 'original_url': '/target' }).toString();
+        const result = await turnstileChallengeExample(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+        expect(result.status).toBe('302');
+        expect((result.headers as any).location[0].value).toContain('https://example.com/target');
+        expect((result.headers as any)['set-cookie'][0].value).toContain('_cq_se=');
+        vi.unstubAllGlobals();
+    });
+
+    it('falls back to host header when viewer_host query param is absent', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            json: async () => ({ success: true }),
+        }));
+        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token' }).toString();
+        const result = await turnstileChallengeExample(buildTurnstileRequest(qs, 'fallback.com'), buildRTIResponse()) as any;
+        expect((result.headers as any).location[0].value).toContain('fallback.com');
+        vi.unstubAllGlobals();
+    });
+
+    it('uses empty host when neither viewer_host param nor host header is present', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            json: async () => ({ success: true }),
+        }));
+        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token' }).toString();
+        const result = await turnstileChallengeExample(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+        expect((result.headers as any).location[0].value).toMatch(/^https:\/\//);
+        vi.unstubAllGlobals();
+    });
+
+    it('returns 403 with error message when Turnstile verification fails', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            json: async () => ({ success: false }),
+        }));
+        const qs = new URLSearchParams({ 'cf-turnstile-response': 'bad-token' }).toString();
+        const result = await turnstileChallengeExample(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('Verification failed');
+        vi.unstubAllGlobals();
     });
 });
