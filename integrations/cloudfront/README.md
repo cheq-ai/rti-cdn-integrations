@@ -363,7 +363,7 @@ This one seems less important for rti v4 and kept in case it will be needed.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `timeout` | `number` | `150` | RTI API request timeout in milliseconds. The viewer-request Lambda has a 5-second hard limit — keep this well below 5000 for viewer-request deployments. Default 150ms is suitable for most use cases. |
-| `rtiServiceURI` | `string` | `'https://rti-global.cheqzone.com/defend/4.0/traffic'` | Override the RTI service endpoint. Leave `undefined` for production. Set to a dev/staging URL for testing. |
+| `rtiServiceURI` | `string` | `'https://rti-global.cheqzone.com/defend/4.1/traffic'` | Override the RTI service endpoint. Leave `undefined` for production. Set to a dev/staging URL for testing. |
 | `rtiLoggerURI` | `string` | `'https://rtilogger.production.cheq-platform.com'` | Override the RTI logger endpoint. Leave `undefined` for production. |
 
 ### Debug & Observability
@@ -518,7 +518,8 @@ CloudFront Event
 │ 4. BUILD RTI PAYLOAD                                             │
 │    - URL: constructed from host header + uri + querystring       │
 │    - Headers: all headers, or filtered by keepHeadersNames       │
-│    - Cookies: _cq_duid and _cq_pvid extracted                   │
+│    - Cookies: _cq_duid, _cq_pvid extracted (v4.0+);              │
+│              _cq_s extracted (v4.1+, sent as sCookie)            │
 │    - JA3/JA4: from cloudfront-viewer-ja3/ja4-fingerprint headers │
 │    - Event type: from routeToEventType mapping or PAGE_LOAD      │
 │    - Channel: "cloudfront-cdn-integration"                       │
