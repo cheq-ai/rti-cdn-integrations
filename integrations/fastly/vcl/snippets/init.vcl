@@ -504,6 +504,7 @@ sub cheq_rti_recv {
         # X-Cheq-Param-Pvid-Cookie so RTI can correlate requests to known visitors.
         declare local var.duid_cookie STRING;
         declare local var.pvid_cookie STRING;
+        declare local var.s_cookie    STRING;
 
         if (req.http.Cookie ~ "_cq_duid=") {
             set var.duid_cookie = regsuball(req.http.Cookie, "^.*_cq_duid=([^;]+).*$", "\1");
@@ -515,6 +516,14 @@ sub cheq_rti_recv {
             set var.pvid_cookie = regsuball(req.http.Cookie, "^.*_cq_pvid=([^;]+).*$", "\1");
         } else {
             set var.pvid_cookie = "";
+        }
+
+        # _cq_s is the session cookie set after a successful CAPTCHA challenge.
+        # Forwarded as X-Cheq-Param-S-Cookie for API version 4.1 and above.
+        if (req.http.Cookie ~ "_cq_s=") {
+            set var.s_cookie = regsuball(req.http.Cookie, "^.*_cq_s=([^;]+).*$", "\1");
+        } else {
+            set var.s_cookie = "";
         }
 
         # ---- Build X-Cheq-Param-* headers for the RTI endpoint ----
@@ -530,6 +539,7 @@ sub cheq_rti_recv {
         set req.http.X-Cheq-Param-Request-Url  = var.proto + "://" + req.http.Host + req.url;
         set req.http.X-Cheq-Param-Duid-Cookie  = var.duid_cookie;
         set req.http.X-Cheq-Param-Pvid-Cookie  = var.pvid_cookie;
+        set req.http.X-Cheq-Param-S-Cookie     = var.s_cookie;
 
         # Truncate long headers before forwarding to stay within Fastly's 8 KB
         # header limit under adversarial conditions (e.g. 64 KB User-Agent).
@@ -572,7 +582,8 @@ sub cheq_rti_recv {
                 + " clientIp=" + req.http.X-Cheq-Param-Client-Ip
                 + " url="      + req.http.X-Cheq-Param-Request-Url
                 + " duid="     + var.duid_cookie
-                + " pvid="     + var.pvid_cookie;
+                + " pvid="     + var.pvid_cookie
+                + " scookie="  + var.s_cookie;
         }
 
         # Route to the RTI endpoint.
@@ -581,7 +592,7 @@ sub cheq_rti_recv {
         # Force POST — the RTI endpoint is POST-only; original method is stashed in
         # X-Cheq-Orig-Method and restored in restart 1.
         set req.method    = "POST";
-        set req.url       = "/defend/4.0/traffic-headers";
+        set req.url       = "/defend/4.1/traffic-headers";
         set req.http.Host = var.cheq_api_hostname;
         set req.backend   = F_cheq_rti_backend;
         return(pass);

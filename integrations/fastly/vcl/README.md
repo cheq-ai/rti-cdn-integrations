@@ -94,6 +94,8 @@ Client request
   → vcl_recv (restart 0)
       Stash original request (method, URL, host)
       Build X-Cheq-Param-* request headers from client data
+      (_cq_duid → X-Cheq-Param-Duid-Cookie, _cq_pvid → X-Cheq-Param-Pvid-Cookie,
+       _cq_s → X-Cheq-Param-S-Cookie [v4.1+])
       Switch backend to CHEQ RTI, convert request to POST
 
   → vcl_pass (restart 0)
@@ -383,7 +385,7 @@ When `debug = true` in `general_config`, the integration writes messages to Fast
 
 | Point | Message |
 |---|---|
-| After building the RTI request | `CHEQ-DEBUG :: request clientIp=<ip> url=<url> duid=<duid> pvid=<pvid>` |
+| After building the RTI request | `CHEQ-DEBUG :: request clientIp=<ip> url=<url> duid=<duid> pvid=<pvid> scookie=<scookie>` |
 | After receiving the RTI response | `CHEQ-DEBUG :: rti response status=<n> X-Cheq-Res-Verdict=<v> X-Cheq-Res-Classification-Code=<c>` |
 | After determining the action | `CHEQ-DEBUG :: action=<allow\|block\|challenge\|redirect>` |
 
@@ -575,7 +577,7 @@ curl -sI https://your-fastly-domain.com | grep x-cheq-rti-result
 
 A successful response includes:
 ```
-x-cheq-rti-result: version=4.0;verdict=benign;threat-type-code=0
+x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0
 ```
 
 To stream debug logs live (requires `debug = true` in `general_config`):
@@ -709,7 +711,7 @@ curl -sI https://your-fastly-domain.com | grep x-cheq-rti-result
 
 Expected:
 ```
-x-cheq-rti-result: version=4.0;verdict=benign;threat-type-code=0
+x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0
 ```
 
 Stream debug logs live (requires `debug = true` in `general_config`):
