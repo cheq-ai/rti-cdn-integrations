@@ -27,7 +27,7 @@ describe("RTIService", () => {
       await svc.callRTI({} as any);
 
       const [url] = ((globalThis as any).fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-      expect(url).toBe('https://rti-global.cheqzone.com/defend/4.0/traffic');
+      expect(url).toBe('https://rti-global.cheqzone.com/defend/4.1/traffic');
     });
 
     test('uses timeout from config when provided', async () => {
