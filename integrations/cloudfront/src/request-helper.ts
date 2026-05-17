@@ -191,7 +191,6 @@ function setHeaders(headers: CloudFrontHeaders, rtiResponse: RTIResponse) {
         `verdict=${rtiResponse.decision.verdict}`,
         `threat-type-code=${rtiResponse.classification.code}`,
         `ids=${JSON.stringify(rtiResponse.ids)}`,
-        `reasons=${rtiResponse.cheqDetection.reasons.join(',')}`,
     ].join(";");
 
     headers["x-cheq-rti-result"] = [{ key: 'x-cheq-rti-result', value: result }];

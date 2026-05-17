@@ -163,6 +163,35 @@ describe('request-helper handle', () => {
         expect(result).toBe(event.Records[0].cf.request);
     });
 
+    // --- x-cheq-rti-result header ---
+
+    it('sets x-cheq-rti-result on the request forwarded to origin on ALLOW', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const header = event.Records[0].cf.request.headers['x-cheq-rti-result'];
+        expect(header).toBeDefined();
+        expect(header[0].key).toBe('x-cheq-rti-result');
+        expect(header[0].value).toContain('version=1.0');
+    });
+
+    it('x-cheq-rti-result contains version, verdict, threat-type-code, and ids', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const value = event.Records[0].cf.request.headers['x-cheq-rti-result'][0].value;
+        expect(value).toContain('version=1.0');
+        expect(value).toContain('verdict=valid');
+        expect(value).toContain('threat-type-code=0');
+        expect(value).toContain('ids=');
+        expect(value).not.toContain('reasons=');
+    });
+
+    it('x-cheq-rti-result ids field includes rayId', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const value = event.Records[0].cf.request.headers['x-cheq-rti-result'][0].value;
+        expect(value).toContain('ray-123');
+    });
+
     // --- Header collection ---
 
     // ja3/ja4 fingerprint keys are always set on the headers object (undefined when not in request),
