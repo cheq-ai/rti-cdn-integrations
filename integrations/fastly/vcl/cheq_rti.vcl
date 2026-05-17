@@ -911,20 +911,42 @@ sub cheq_rti_synth {
     unset req.http.X-Cheq-Log-Level;
     unset req.http.X-Cheq-Log-Message;
 
+    # Extract pageViewId from the stashed RTI result string
+    # Format: ...ids={"rayId":"...","pageViewId":"..."}
+    declare local var.cheq_pvid STRING;
+    if (req.http.X-Cheq-Rti-Result-Stash ~ {"pageViewId":"([^"]+)"}) {
+        set var.cheq_pvid = re.group.1;
+    } else {
+        set var.cheq_pvid = "";
+    }
+
+    declare local var.cheq_ref_ids STRING;
+    if (req.http.X-Cheq-Ray-Id && var.cheq_pvid) {
+        set var.cheq_ref_ids = " (Reference IDs: rayId: " + req.http.X-Cheq-Ray-Id + ", pageViewId: " + var.cheq_pvid + ")";
+    } else if (req.http.X-Cheq-Ray-Id) {
+        set var.cheq_ref_ids = " (Reference ID: " + req.http.X-Cheq-Ray-Id + ")";
+    } else {
+        set var.cheq_ref_ids = "";
+    }
+
     if (obj.status == 403) {
         set obj.http.Content-Type = "text/plain; charset=utf-8";
-        synthetic {"Access Denied"} + if(req.http.X-Cheq-Ray-Id, {" (Reference ID: "} + req.http.X-Cheq-Ray-Id + {")"},  "");
+        set obj.http.x-cheq-id = req.http.X-Cheq-Ray-Id;
+        synthetic {"Access Denied"} + var.cheq_ref_ids;
         return(deliver);
     }
 
     if (obj.status == 404) {
         set obj.http.Content-Type = "text/plain; charset=utf-8";
-        synthetic {"Not Found"} + if(req.http.X-Cheq-Ray-Id, {" (Reference ID: "} + req.http.X-Cheq-Ray-Id + {")"},  "");
+        set obj.http.x-cheq-id = req.http.X-Cheq-Ray-Id;
+        synthetic {"Not Found"} + var.cheq_ref_ids;
         return(deliver);
     }
 
     if (obj.status == 302) {
         set obj.http.Location = req.http.X-Cheq-Config-Redirect-Loc;
+        set obj.http.x-cheq-id = req.http.X-Cheq-Ray-Id;
+        set obj.http.x-cheq-page-view-id = var.cheq_pvid;
         synthetic {""};
         return(deliver);
     }
