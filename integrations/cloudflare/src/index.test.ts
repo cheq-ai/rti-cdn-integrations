@@ -207,6 +207,15 @@ describe('cloudflare worker', () => {
         expect(result.headers.get('x-cheq-page-view-id')).toBe('');
     });
 
+    it('defaults redirect location to cheq.ai when redirectLocation is not configured', async () => {
+        (config as any).redirectLocation = undefined;
+        mocks.getAction.mockReturnValue(Action.REDIRECT);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
+        const result = await worker.fetch(buildRequest(), {}, buildContext());
+        expect(result.status).toBe(302);
+        expect(result.headers.get('location')).toBe('https://www.cheq.ai/');
+    });
+
     // --- CAPTCHA ---
 
     it('calls challenge and returns its result when CAPTCHA and challenge is configured', async () => {
