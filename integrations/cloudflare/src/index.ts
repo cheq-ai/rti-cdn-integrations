@@ -25,6 +25,10 @@ export default {
             // Filter out ignored paths and already validated challenges and validate challenge if exists
             const requestURL = new URL(request.url);
             if (rtiHelperService.shouldIgnore(requestURL.pathname) || (config.validateChallenge && await config.validateChallenge(request))) {
+                // OPTION 1 - LOCAL/DEMO: proxy ignored/validated requests to your origin (pair with OPTION 1 below).
+                //const originResponse = await fetch("http://your-demo-site.com" + requestURL.pathname + requestURL.search);
+
+                // OPTION 2 - PRODUCTION: pass through as-is (pair with OPTION 2 below).
                 const originResponse = await fetch(request);
                 return originResponse;
             }
@@ -109,11 +113,13 @@ export default {
 
             // OPTION 1 - LOCAL/DEMO: proxy to a specific origin (e.g. S3 static site).
             //   Worker URL becomes the public entry point. Uncomment and set your origin URL.
+            //   Pair with OPTION 1 above (ignored/validated paths) so all traffic routes to the same origin.
             //const originUrl = "http://your-demo-site.com" + requestURL.pathname + requestURL.search;
             //const originRequest = new Request(originUrl, request);
 
             // OPTION 2 - PRODUCTION: attach Worker to your domain via a route in wrangler.toml.
             //   The request already targets your origin — just pass it through as-is.
+            //   Pair with OPTION 2 above (ignored/validated paths) so all traffic passes through consistently.
             const originRequest = new Request(request);
 
             // Set RTI result headers for the origin to consume. These headers won't be visible to the client, but can be logged in CloudWatch or used by the origin application.
