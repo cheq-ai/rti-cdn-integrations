@@ -163,6 +163,35 @@ describe('request-helper handle', () => {
         expect(result).toBe(event.Records[0].cf.request);
     });
 
+    // --- x-cheq-rti-result header ---
+
+    it('sets x-cheq-rti-result on the request forwarded to origin on ALLOW', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const header = event.Records[0].cf.request.headers['x-cheq-rti-result'];
+        expect(header).toBeDefined();
+        expect(header[0].key).toBe('x-cheq-rti-result');
+        expect(header[0].value).toContain('version=1.0');
+    });
+
+    it('x-cheq-rti-result contains version, verdict, threat-type-code, and ids', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const value = event.Records[0].cf.request.headers['x-cheq-rti-result'][0].value;
+        expect(value).toContain('version=1.0');
+        expect(value).toContain('verdict=valid');
+        expect(value).toContain('threat-type-code=0');
+        expect(value).toContain('ids=');
+        expect(value).not.toContain('reasons=');
+    });
+
+    it('x-cheq-rti-result ids field includes rayId', async () => {
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const value = event.Records[0].cf.request.headers['x-cheq-rti-result'][0].value;
+        expect(value).toContain('ray-123');
+    });
+
     // --- Header collection ---
 
     // ja3/ja4 fingerprint keys are always set on the headers object (undefined when not in request),
@@ -199,6 +228,25 @@ describe('request-helper handle', () => {
         expect(headers).not.toHaveProperty('user-agent');
     });
 
+    it('omits header from payload when keepHeadersNames lists a header not present in the request', async () => {
+        (config as any).keepHeadersNames = ['host', 'x-not-present'];
+        const event = buildEvent();
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers).not.toHaveProperty('x-not-present');
+        expect(payload.endUserParams.headers).toHaveProperty('host');
+    });
+
+    it('includes cheq_ja3 and cheq_ja4 fingerprints when cloudfront viewer fingerprint headers are present', async () => {
+        const event = buildEvent();
+        event.Records[0].cf.request.headers['cloudfront-viewer-ja3-fingerprint'] = [{ key: 'cloudfront-viewer-ja3-fingerprint', value: 'abc123ja3' }];
+        event.Records[0].cf.request.headers['cloudfront-viewer-ja4-fingerprint'] = [{ key: 'cloudfront-viewer-ja4-fingerprint', value: 'def456ja4' }];
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBe('abc123ja3');
+        expect(payload.endUserParams.headers.cheq_ja4).toBe('def456ja4');
+    });
+
     // --- URL construction (getRequestUrl via payload) ---
 
     it('builds request URL from host header and uri', async () => {
@@ -206,6 +254,15 @@ describe('request-helper handle', () => {
         await handle(event, RequestType.ORIGIN_REQUEST);
         const payload = mocks.callRTI.mock.calls[0][0];
         expect(payload.endUserParams.requestUrl).toBe('https://example.com/my-page');
+    });
+
+    it('fails open to cfRequest when host header is absent (invalid URL)', async () => {
+        expectError = true;
+        const event = buildEvent('/my-page', 'example.com');
+        delete event.Records[0].cf.request.headers['host'];
+        const result = await handle(event, RequestType.ORIGIN_REQUEST);
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalled();
     });
 
     it('appends querystring to URL when present', async () => {
@@ -251,6 +308,16 @@ describe('request-helper handle', () => {
     });
 
     it('returns 302 with redirect location when action strategy is REDIRECT', async () => {
+        mocks.getAction.mockReturnValue(Action.REDIRECT);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
+        const event = buildEvent();
+        const result = await handle(event, RequestType.ORIGIN_REQUEST) as any;
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe('https://www.cheq.ai/');
+    });
+
+    it('defaults redirect location to cheq.ai when redirectLocation is not configured', async () => {
+        (config as any).redirectLocation = undefined;
         mocks.getAction.mockReturnValue(Action.REDIRECT);
         mocks.getActionStrategy.mockReturnValue(ActionStrategy.REDIRECT);
         const event = buildEvent();
@@ -461,6 +528,15 @@ describe('request-helper handle', () => {
         expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('unknown_request_id'));
     });
 
+    it('returns "on_error_request_id" fallback when getCfRequestId throws accessing cf.config', async () => {
+        expectError = true;
+        mocks.callRTI.mockRejectedValue(new Error('RTI failure'));
+        const event = buildEvent();
+        Object.defineProperty(event.Records[0].cf, 'config', { get() { throw new Error('config access error'); } });
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('on_error_request_id'));
+    });
+
 
     // --- Debug logging ---
 
@@ -508,6 +584,17 @@ describe('request-helper handle', () => {
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         await handle(buildEvent(), RequestType.ORIGIN_REQUEST);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('none (should not happen)'));
+        consoleSpy.mockRestore();
+    });
+
+    it('logs raw action value when debug enabled and action has no named enum entry', async () => {
+        (config as any).debug = true;
+        const unknownAction = 999 as Action;
+        mocks.getAction.mockReturnValue(unknownAction);
+        mocks.getActionStrategy.mockReturnValue(null);
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await handle(buildEvent(), RequestType.ORIGIN_REQUEST);
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('999'));
         consoleSpy.mockRestore();
     });
 });

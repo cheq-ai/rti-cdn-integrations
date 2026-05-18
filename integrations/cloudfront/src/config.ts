@@ -35,6 +35,7 @@ export interface CloudfrontConfig extends Config {
     keepHeadersNames: string[];
 }
 
+// Example for maintaining developer debug configuration can be found in cheq repo under: cheq-testing-website/src/frontend/pages/cdn/cloudfront/README.md
 export const config: CloudfrontConfig = {
     mode: Mode.MONITORING, // Start with MONITORING to observe before enforcing with BLOCKING
 

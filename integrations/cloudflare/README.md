@@ -17,8 +17,15 @@ Built with [Cloudflare Wrangler](https://developers.cloudflare.com/workers/wrang
 
 ### Prerequisites:
 
-Modify the [configuration](https://github.com/cheq-ai/rti-cdn-integrations/blob/main/integrations/cloudflare/src/config.ts)
+- You need Node.js v20+ (required by wrangler)
+
+- Modify the [configuration](https://github.com/cheq-ai/rti-cdn-integrations/blob/main/integrations/cloudflare/src/config.ts)
 at `src/config.ts` to set your `apiKey`, `tagHash` and the other settings of the integration.
+
+### Login to Cloudflare (one-time)
+```bash
+npx wrangler login
+```
 
 ### Verify config
 
@@ -38,7 +45,9 @@ npm i; npm run deploy
 
 ### Example Deploy Output
 ```
-Current Deployment ID: 2874786b-81d1-4f73-973e-8ec5a8305b6c
+Old v4 Deployment ID: 2874786b-81d1-4f73-973e-8ec5a8305b6c (cheq-rti-v4-integration-cloudflare)
+
+New v4.1 Deployment ID (Code modified so the origin is the S3 static site and the rti response header returned to caller - both not relevant for prod): f582e7d2-56e9-439c-95c2-251a65562292 (cheq-rti-v4_1-integration-cloudflare)
 ```
 
 ### Cloudflare Configuration

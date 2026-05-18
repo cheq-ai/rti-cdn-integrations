@@ -135,7 +135,7 @@ export interface Config {
   rtiLoggerURI?: string;
 
   /**
-   * Override the RTI Service URI - default is: 'https://rti-global.cheqzone.com/defend/4.0/traffic'.
+   * Override the RTI Service URI - default is: 'https://rti-global.cheqzone.com/defend/4.1/traffic'.
    */
   rtiServiceURI?: string;
 

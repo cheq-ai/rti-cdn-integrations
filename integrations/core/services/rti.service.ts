@@ -11,7 +11,7 @@ export class RTIService implements IRTIService {
     constructor(config: Config) {
         this.config = config;
         this.rtiTimeout = this.config.timeout ?? 150;
-        this.url = this.config.rtiServiceURI || "https://rti-global.cheqzone.com/defend/4.0/traffic";
+        this.url = this.config.rtiServiceURI || "https://rti-global.cheqzone.com/defend/4.1/traffic";
     }
         
     public async callRTI(payload: RTIRequest): Promise<RTIResponse> {

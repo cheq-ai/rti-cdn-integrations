@@ -57,7 +57,7 @@ backend cheq_rti_backend {
     .probe = {
         # POST to the real RTI endpoint so the probe validates the actual path.
         # The header 'x-cheq-param-probe' is used by the endpoint to identify probe requests 
-        .request = "POST /defend/4.0/traffic-headers HTTP/1.1"
+        .request = "POST /defend/4.1/traffic-headers HTTP/1.1"
                    "x-cheq-param-probe: true"
                    "Connection: close";
         .expected_response = 200;
