@@ -8,11 +8,6 @@ import { turnstileChallengeExample, trunstileValidateChallengeExample } from './
  */
 export interface CloudflareConfig extends Config {
     /**
-     * Enable telemetry logging
-     */
-    telemetry: boolean;
-
-    /**
      * Callback function invoked when {@link Action.CHALLENGE | Action } output is returned
      * @param request
      * @param response
