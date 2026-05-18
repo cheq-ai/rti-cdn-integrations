@@ -116,6 +116,7 @@ export default {
             //   The request already targets your origin — just pass it through as-is.
             const originRequest = new Request(request);
 
+            // Set RTI result headers for the origin to consume. These headers won't be visible to the client, but can be logged in CloudWatch or used by the origin application.
             setHeaders(originRequest.headers, rtiResponse);
             const newResponse = await fetch(originRequest);
 
@@ -125,7 +126,7 @@ export default {
             //mutableResponse.headers.set("x-cheq-rti-result", originRequest.headers.get("x-cheq-rti-result") || "");
             //return mutableResponse;
 
-            // OPTION 2 - PRODUCTION: return origin response as-is (header stays on the request, visible in CloudWatch/logs only).
+            // OPTION 2 - PRODUCTION: return origin response as-is (header stays on the request, visible in CloudWatch/logs only, not the client).
             return newResponse;
         } catch (e) {
             const err: Error = e as Error;
