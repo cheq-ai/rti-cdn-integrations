@@ -918,14 +918,12 @@ sub cheq_rti_synth {
 
     if (obj.status == 403) {
         set obj.http.Content-Type = "text/plain; charset=utf-8";
-        set obj.http.x-cheq-id = req.http.X-Cheq-Ray-Id;
         synthetic {"Access Denied"} + var.cheq_ref_ids;
         return(deliver);
     }
 
     if (obj.status == 404) {
         set obj.http.Content-Type = "text/plain; charset=utf-8";
-        set obj.http.x-cheq-id = req.http.X-Cheq-Ray-Id;
         synthetic {"Not Found"} + var.cheq_ref_ids;
         return(deliver);
     }
