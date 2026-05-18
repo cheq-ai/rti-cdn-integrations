@@ -81,10 +81,10 @@ export default {
                         );
                     case ActionStrategy.REDIRECT:
                         const redirectHeaders = new Headers();
-                        redirectHeaders.set("location", config.redirectLocation || "https://www.cheq.ai/");
+                        redirectHeaders.set("x-cheq-cf-request-id", request.headers.get("cf-ray") || '');
                         redirectHeaders.set("x-cheq-id", rtiResponse.ids.rayId);
                         redirectHeaders.set("x-cheq-page-view-id", rtiResponse.ids.pageViewId ?? '');
-                        redirectHeaders.set("x-cheq-cf-request-id", request.headers.get("cf-ray") || '');
+                        redirectHeaders.set("location", config.redirectLocation || "https://www.cheq.ai/");
                         return new Response(null, { status: 302, headers: redirectHeaders });
                     case ActionStrategy.CAPTCHA:
                         try {
