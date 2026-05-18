@@ -124,8 +124,8 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                     const headers: CloudFrontHeaders = {
                         'x-cheq-cf-request-id': [{ key: 'x-cheq-cf-request-id', value: getCfRequestId(event) }],
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
-                        'x-cheq-page-view-id': [{ key: 'x-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
-                        location: [{ key: 'Location', value: config.redirectLocation || "https://www.cheq.ai/" }],
+                        'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
+                        location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
                     };
                     return {
                         status: '302',
@@ -190,7 +190,7 @@ function setHeaders(headers: CloudFrontHeaders, rtiResponse: RTIResponse) {
         `version=${rtiResponse.metadata.version}`,
         `verdict=${rtiResponse.decision.verdict}`,
         `threat-type-code=${rtiResponse.classification.code}`,
-        `ids=${JSON.stringify(rtiResponse.ids)}`,
+        `ids=${JSON.stringify(rtiResponse.ids)}`
     ].join(";");
 
     headers["x-cheq-rti-result"] = [{ key: 'x-cheq-rti-result', value: result }];

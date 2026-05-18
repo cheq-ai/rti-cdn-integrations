@@ -150,7 +150,7 @@ function setHeaders(headers: Headers, rtiResponse: RTIResponse) {
         `version=${rtiResponse.metadata.version}`,
         `verdict=${rtiResponse.decision.verdict}`,
         `threat-type-code=${rtiResponse.classification.code}`,
-        `ids=${JSON.stringify(rtiResponse.ids)}`,
+        `ids=${JSON.stringify(rtiResponse.ids)}`
     ].join(";");
     headers.set("x-cheq-rti-result", result);
 }
