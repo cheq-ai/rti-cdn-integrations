@@ -109,7 +109,7 @@ export default {
 
             // OPTION 1 - LOCAL/DEMO: proxy to a specific origin (e.g. S3 static site).
             //   Worker URL becomes the public entry point. Uncomment and set your origin URL.
-            //const originUrl = "http://cloudflare-rti-demo-static-site.s3-website-us-east-1.amazonaws.com" + requestURL.pathname + requestURL.search;
+            //const originUrl = "http://your-demo-site.com" + requestURL.pathname + requestURL.search;
             //const originRequest = new Request(originUrl, request);
 
             // OPTION 2 - PRODUCTION: attach Worker to your domain via a route in wrangler.toml.

@@ -21,6 +21,7 @@ export interface CloudflareConfig extends Config {
     validateChallenge?: (request: Request) => Promise<boolean>;
 }
 
+// Example for maintaining developer debug configuration can be found in cheq repo under: cheq-testing-website/src/frontend/pages/cdn/cloudflare/README.md
 export const config: CloudflareConfig = {
     mode: Mode.MONITORING, // Start with MONITORING to observe before enforcing with BLOCKING
 

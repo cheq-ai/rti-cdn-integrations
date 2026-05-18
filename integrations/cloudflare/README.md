@@ -45,8 +45,9 @@ npm i; npm run deploy
 
 ### Example Deploy Output
 ```
-Old Deployment ID: 2874786b-81d1-4f73-973e-8ec5a8305b6c
-New 4.1 Deployment ID (Contains extra code to route to S3 static page and returns the rti header): a64c906d-cf25-4d32-8f7c-8fcd6c193b6f
+Old v4 Deployment ID: 2874786b-81d1-4f73-973e-8ec5a8305b6c (cheq-rti-v4-integration-cloudflare)
+
+New v4.1 Deployment ID (Code modified so the origin is the S3 static site and the rti response header returned to caller - both not relevant for prod): f582e7d2-56e9-439c-95c2-251a65562292 (cheq-rti-v4_1-integration-cloudflare)
 ```
 
 ### Cloudflare Configuration
