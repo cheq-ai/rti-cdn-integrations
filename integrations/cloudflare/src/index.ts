@@ -38,7 +38,7 @@ export default {
                 isHeaderNamesOrdered: true,
                 channel: "cloudflare-cdn-integration",
                 customId1: rtiHelperService.getEventType(requestURL.pathname, request.method),
-                customId2: request.headers.get("cf-ray") || undefined,
+                customId2: request.headers.get("cf-ray") || undefined, // set the cloudflare request id for monitoring
                 endUserParams: {
                     clientIp: request.headers.get("x-real-ip")!,
                     requestUrl: requestURL.href,

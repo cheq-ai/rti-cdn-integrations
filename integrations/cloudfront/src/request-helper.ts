@@ -54,7 +54,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             // isHeaderNamesOrdered is unknown so kept empty
             channel: "cloudfront-cdn-integration",
             customId1: rtiHelperService.getEventType(requestURL.pathname, cfRequest.method),
-            customId2: getCfRequestId(event), // set the cloudfront request id for easy of monitoring in click house
+            customId2: getCfRequestId(event), // set the cloudfront request id for monitoring
             endUserParams: {
                 clientIp: cfRequest.clientIp,
                 requestUrl: requestURL.href,
