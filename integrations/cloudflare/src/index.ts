@@ -35,7 +35,7 @@ export default {
 
             const startRTI = Date.now();
             const fetchedHeaders = getHeaders(headerNames, request.headers);
-            const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
+            const { duidCookie, pvidCookie, sCookie } = rtiHelperService.parseCookies(request.headers.get("cookie") || "");
             let payload: RTIRequest = {
                 tagHash: config.tagHash,
                 apiKey: config.apiKey,
@@ -50,9 +50,9 @@ export default {
                     method: request.method,
                     headers: fetchedHeaders,
                 },
-                duidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_duid="))?.split("=")[1],
-                pvidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_pvid="))?.split("=")[1],
-                sCookie: cookieHeaderMap.find(c => c.startsWith("_cq_s="))?.split("=")[1], // Relevant for API version 4.1 and above
+                duidCookie: duidCookie, // Relevant for API version 4.0 and above
+                pvidCookie: pvidCookie, // Relevant for API version 4.0 and above
+                sCookie: sCookie,       // Relevant for API version 4.1 and above
             };
             
             // @ts-ignore: This specific line is known to be safe

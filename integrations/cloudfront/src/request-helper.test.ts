@@ -40,6 +40,14 @@ vi.mock('../../core/services/rti-helper.service', () => ({
             getActionStrategy: mocks.getActionStrategy,
             getEventType: mocks.getEventType,
             validateConfig: vi.fn().mockReturnValue([]),
+            parseCookies: (cookieHeader: string) => {
+                const cookies = cookieHeader.split(';').map((c: string) => c.trim());
+                return {
+                    duidCookie: cookies.find((c: string) => c.startsWith('_cq_duid='))?.substring('_cq_duid='.length) || undefined,
+                    pvidCookie: cookies.find((c: string) => c.startsWith('_cq_pvid='))?.substring('_cq_pvid='.length) || undefined,
+                    sCookie:    cookies.find((c: string) => c.startsWith('_cq_s='))?.substring('_cq_s='.length)    || undefined,
+                };
+            },
         };
     }),
 }));
@@ -439,12 +447,33 @@ describe('request-helper handle', () => {
     });
 
     it('extracts all three cookies together: _cq_duid, _cq_pvid, _cq_s', async () => {
-        const event = buildEvent('/page', 'example.com', '1.2.3.4', '', '_cq_duid=device-abc; _cq_pvid=pv-xyz; _cq_s=scookie-value');
+        const event = buildEvent('/page', 'example.com', '1.2.3.4', '', '_cq_duid=4.16a154e6ae45bc91bf9a49b365beb989; _cq_pvid=4.247bcdf08360a9de9dee2196c1a36631; _cq_s=scookie-value');
         await handle(event, RequestType.ORIGIN_REQUEST);
         const payload = mocks.callRTI.mock.calls[0][0];
-        expect(payload.duidCookie).toBe('device-abc');
-        expect(payload.pvidCookie).toBe('pv-xyz');
+        expect(payload.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
+        expect(payload.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
         expect(payload.sCookie).toBe('scookie-value');
+    });
+
+    it('extracts base64-padded _cq_s intact when mixed with other unrelated cookies', async () => {
+        const b64Value = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
+        const event = buildEvent('/page', 'example.com', '1.2.3.4', '', `session=abc123; _cq_s=${b64Value}; other=ignored`);
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.sCookie).toBe(b64Value);
+        expect(payload.duidCookie).toBeUndefined();
+        expect(payload.pvidCookie).toBeUndefined();
+    });
+
+    it('extracts _cq_duid, _cq_pvid and base64-padded _cq_s when mixed with other unrelated cookies', async () => {
+        const b64Value = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
+        const cookies = `session=abc123; _cq_duid=4.16a154e6ae45bc91bf9a49b365beb989; theme=dark; _cq_pvid=4.247bcdf08360a9de9dee2196c1a36631; _cq_s=${b64Value}; other=ignored`;
+        const event = buildEvent('/page', 'example.com', '1.2.3.4', '', cookies);
+        await handle(event, RequestType.ORIGIN_REQUEST);
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
+        expect(payload.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
+        expect(payload.sCookie).toBe(b64Value);
     });
 
     it('leaves sCookie undefined when _cq_s is not present', async () => {

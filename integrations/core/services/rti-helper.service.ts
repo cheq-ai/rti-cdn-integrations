@@ -74,6 +74,23 @@ export class RTIHelperService {
   }
 
   /**
+   * Parses the Cookie header string and extracts the three CHEQ RTI cookies.
+   * Uses substring (not split) so base64-padded values like _cq_s are preserved intact.
+   * @param cookieHeader raw Cookie header value
+   */
+  parseCookies(cookieHeader: string): { duidCookie?: string; pvidCookie?: string; sCookie?: string } {
+    const cookies = cookieHeader.split(";").map(c => c.trim());
+    
+    // duidCookie and pvidCookie are v4.0 cookies, sCookie is a v4.1 cookie
+    return {
+      duidCookie: cookies.find(c => c.startsWith("_cq_duid="))?.substring("_cq_duid=".length) || undefined,
+      pvidCookie: cookies.find(c => c.startsWith("_cq_pvid="))?.substring("_cq_pvid=".length) || undefined,
+      sCookie:    cookies.find(c => c.startsWith("_cq_s="))?.substring("_cq_s=".length)    || undefined,
+    };
+
+  }
+
+  /**
    * Returns CHEQ cookie value
    * @param cookie
    */
