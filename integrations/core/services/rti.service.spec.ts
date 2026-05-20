@@ -105,5 +105,20 @@ describe("RTIService", () => {
       const svc = new RTIService({ timeout: 1000, rtiServiceURI: 'https://example.com' } as any);
       await expect(svc.callRTI({} as any)).rejects.toThrow(/request error: network failure/);
     });
+
+    test('wraps abort/timeout error with "request error:" prefix', async () => {
+      (globalThis as any).fetch = vi.fn().mockRejectedValue(new DOMException('The operation was aborted.', 'AbortError'));
+
+      const svc = new RTIService({ timeout: 1, rtiServiceURI: 'https://example.com' } as any);
+      await expect(svc.callRTI({} as any)).rejects.toThrow(/request error:.*aborted/i);
+    });
+
+    test('wraps malformed JSON response with "request error:" prefix', async () => {
+      const fakeResponse: any = { status: 200, json: async () => { throw new SyntaxError('Unexpected token'); } };
+      (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
+
+      const svc = new RTIService({ rtiServiceURI: 'https://example.com' } as any);
+      await expect(svc.callRTI({} as any)).rejects.toThrow(/request error: Unexpected token/);
+    });
   });
 });

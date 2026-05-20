@@ -91,11 +91,13 @@ describe('RTIHelperService', () => {
       cheqDetection: { reasons },
     } as any);
 
+    // MONITORING mode always allows
     test('returns ALLOW in MONITORING mode regardless of verdict or code', () => {
       const svc = new RTIHelperService({ mode: Mode.MONITORING, blockTTCodes: [100] } as any);
       expect(svc.getAction(resp(100, 'malicious'))).toBe(Action.ALLOW);
     });
 
+    // BLOCKING mode — no match → ALLOW
     test('returns ALLOW in BLOCKING mode for benign verdict with no matching codes', () => {
       const svc = new RTIHelperService({ mode: Mode.BLOCKING } as any);
       expect(svc.getAction(resp(1, 'benign'))).toBe(Action.ALLOW);
@@ -104,55 +106,42 @@ describe('RTIHelperService', () => {
     test('returns ALLOW in BLOCKING mode when all TTCodes and reasons are configured but none match', () => {
       const svc = new RTIHelperService({
         mode: Mode.BLOCKING,
-        blockTTCodes: [100],
-        blockReasons: ['block-reason'],
-        challengeTTCodes: [200],
-        challengeReasons: ['challenge-reason'],
-        redirectTTCodes: [300],
-        redirectReasons: ['redirect-reason'],
+        blockTTCodes: [100], blockReasons: ['block-reason'],
+        challengeTTCodes: [200], challengeReasons: ['challenge-reason'],
+        redirectTTCodes: [300], redirectReasons: ['redirect-reason'],
       } as any);
       expect(svc.getAction(resp(1, 'benign', ['other-reason']))).toBe(Action.ALLOW);
     });
 
-    test('returns BLOCK for malicious verdict', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING } as any);
-      expect(svc.getAction(resp(1, 'malicious'))).toBe(Action.BLOCK);
+    // BLOCK triggers
+    test.each([
+      ['malicious verdict',    { code: 1,   verdict: 'malicious', reasons: [] },      {}],
+      ['matching blockTTCode', { code: 100, verdict: 'benign',    reasons: [] },      { blockTTCodes: [100] }],
+      ['matching blockReason', { code: 1,   verdict: 'benign',    reasons: ['rx'] },  { blockReasons: ['rx'] }],
+    ])('returns BLOCK for %s', (_label, { code, verdict, reasons }, extra) => {
+      const svc = new RTIHelperService({ mode: Mode.BLOCKING, ...extra } as any);
+      expect(svc.getAction(resp(code, verdict, reasons))).toBe(Action.BLOCK);
     });
 
-    test('returns BLOCK for matching blockTTCode', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, blockTTCodes: [100] } as any);
-      expect(svc.getAction(resp(100, 'benign'))).toBe(Action.BLOCK);
+    // CHALLENGE triggers
+    test.each([
+      ['suspicious verdict',      { code: 1,   verdict: 'suspicious', reasons: [] },      {}],
+      ['matching challengeTTCode',{ code: 200, verdict: 'benign',      reasons: [] },      { challengeTTCodes: [200] }],
+      ['matching challengeReason',{ code: 1,   verdict: 'benign',      reasons: ['ry'] },  { challengeReasons: ['ry'] }],
+    ])('returns CHALLENGE for %s', (_label, { code, verdict, reasons }, extra) => {
+      const svc = new RTIHelperService({ mode: Mode.BLOCKING, ...extra } as any);
+      expect(svc.getAction(resp(code, verdict, reasons))).toBe(Action.CHALLENGE);
     });
 
-    test('returns BLOCK for matching blockReason', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, blockReasons: ['reason-x'] } as any);
-      expect(svc.getAction(resp(1, 'benign', ['reason-x']))).toBe(Action.BLOCK);
+    // REDIRECT triggers
+    test.each([
+      ['matching redirectTTCode', { code: 300, verdict: 'benign', reasons: [] },      { redirectTTCodes: [300] }],
+      ['matching redirectReason', { code: 1,   verdict: 'benign', reasons: ['rz'] },  { redirectReasons: ['rz'] }],
+    ])('returns REDIRECT for %s', (_label, { code, verdict, reasons }, extra) => {
+      const svc = new RTIHelperService({ mode: Mode.BLOCKING, ...extra } as any);
+      expect(svc.getAction(resp(code, verdict, reasons))).toBe(Action.REDIRECT);
     });
 
-    test('returns CHALLENGE for suspicious verdict', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING } as any);
-      expect(svc.getAction(resp(1, 'suspicious'))).toBe(Action.CHALLENGE);
-    });
-
-    test('returns CHALLENGE for matching challengeTTCode', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, challengeTTCodes: [200] } as any);
-      expect(svc.getAction(resp(200, 'benign'))).toBe(Action.CHALLENGE);
-    });
-
-    test('returns CHALLENGE for matching challengeReason', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, challengeReasons: ['reason-y'] } as any);
-      expect(svc.getAction(resp(1, 'benign', ['reason-y']))).toBe(Action.CHALLENGE);
-    });
-
-    test('returns REDIRECT for matching redirectTTCode', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, redirectTTCodes: [300] } as any);
-      expect(svc.getAction(resp(300, 'benign'))).toBe(Action.REDIRECT);
-    });
-
-    test('returns REDIRECT for matching redirectReason', () => {
-      const svc = new RTIHelperService({ mode: Mode.BLOCKING, redirectReasons: ['reason-z'] } as any);
-      expect(svc.getAction(resp(1, 'benign', ['reason-z']))).toBe(Action.REDIRECT);
-    });
   });
 
   describe('getActionStrategy', () => {
@@ -385,10 +374,50 @@ describe('RTIHelperService', () => {
       expect(svc.parseCookies('_cq_duid=').duidCookie).toBeUndefined();
     });
 
+    // --- Empty segments (double semicolons) ---
+
+    test('handles empty segments from double semicolons gracefully', () => {
+      const result = svc.parseCookies('_cq_duid=d-abc;; _cq_s=s-val');
+      expect(result.duidCookie).toBe('d-abc');
+      expect(result.sCookie).toBe('s-val');
+    });
+
     // --- Duplicate cookie names ---
 
     test('returns first match when _cq_s appears twice', () => {
       expect(svc.parseCookies('_cq_s=first; _cq_s=second').sCookie).toBe('first');
+    });
+  });
+
+  describe('getCookieValue', () => {
+    const svc = new RTIHelperService({} as any);
+
+    test('returns value for matching cookie', () => {
+      expect(svc.getCookieValue(['_cq_duid=abc123'], '_cq_duid=')).toBe('abc123');
+    });
+
+    test('returns undefined when cookie not found', () => {
+      expect(svc.getCookieValue(['other=val'], '_cq_duid=')).toBeUndefined();
+    });
+
+    test('returns undefined for empty array', () => {
+      expect(svc.getCookieValue([], '_cq_s=')).toBeUndefined();
+    });
+
+    test('returns undefined when value is empty', () => {
+      expect(svc.getCookieValue(['_cq_s='], '_cq_s=')).toBeUndefined();
+    });
+
+    test('preserves = characters in value (base64)', () => {
+      expect(svc.getCookieValue(['_cq_s=abc=='], '_cq_s=')).toBe('abc==');
+    });
+
+    test('does not match prefix overlap (_cq_se vs _cq_s)', () => {
+      expect(svc.getCookieValue(['_cq_se=token'], '_cq_s=')).toBeUndefined();
+    });
+
+    test('returns first match when duplicates exist', () => {
+      expect(svc.getCookieValue(['_cq_s=first', '_cq_s=second'], '_cq_s=')).toBe('first');
     });
   });
 });

@@ -79,15 +79,20 @@ export class RTIHelperService {
    * @param cookieHeader raw Cookie header value
    */
   parseCookies(cookieHeader: string): { duidCookie?: string; pvidCookie?: string; sCookie?: string } {
+    // NOTE: does not normalize spaces around '=' (e.g. "name = value") — RFC 6265 forbids it so compliant servers won't send it
     const cookies = cookieHeader.split(";").map(c => c.trim());
     
     // duidCookie and pvidCookie are v4.0 cookies, sCookie is a v4.1 cookie
     return {
-      duidCookie: cookies.find(c => c.startsWith("_cq_duid="))?.substring("_cq_duid=".length) || undefined,
-      pvidCookie: cookies.find(c => c.startsWith("_cq_pvid="))?.substring("_cq_pvid=".length) || undefined,
-      sCookie:    cookies.find(c => c.startsWith("_cq_s="))?.substring("_cq_s=".length)    || undefined,
+      duidCookie: this.getCookieValue(cookies, "_cq_duid="),
+      pvidCookie: this.getCookieValue(cookies, "_cq_pvid="),
+      sCookie:    this.getCookieValue(cookies, "_cq_s="),
     };
+  }
 
+  getCookieValue(cookies: string[], nameWithEqualSign: string): string | undefined {
+    // NOTE: does not strip surrounding quotes from values (e.g. name="value") — our cookies never use quoted values
+    return cookies.find(c => c.startsWith(nameWithEqualSign))?.substring(nameWithEqualSign.length) || undefined;
   }
 
   /**

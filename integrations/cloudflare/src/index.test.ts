@@ -1,3 +1,4 @@
+// cspell:ignore cheq duid pvid unstub
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -339,7 +340,7 @@ describe('cloudflare worker', () => {
         vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         await worker.fetch(buildRequest(), {}, buildContext());
-        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('requset payload'));
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('request payload'));
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('rtiResponse'));
         consoleSpy.mockRestore();
     });
@@ -351,6 +352,51 @@ describe('cloudflare worker', () => {
         await worker.fetch(buildRequest(), {}, buildContext());
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('action:'));
         consoleSpy.mockRestore();
+    });
+
+    // --- JA3 hash ---
+
+    it('passes ja3Hash from cf.botManagement as cheq_ja3 in RTI payload headers', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const req = Object.assign(buildRequest(), { cf: { botManagement: { ja3Hash: 'abc123ja3' } } });
+        await worker.fetch(req as any, {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBe('abc123ja3');
+    });
+
+    it('sets cheq_ja3 to undefined when cf.botManagement is absent', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        await worker.fetch(buildRequest(), {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBeUndefined();
+    });
+
+    // --- passThroughOnException ---
+
+    it('calls context.passThroughOnException on every request', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const ctx = buildContext();
+        await worker.fetch(buildRequest(), {}, ctx);
+        expect(ctx.passThroughOnException).toHaveBeenCalledOnce();
+    });
+
+    // --- getHeaders filtering ---
+
+    it('only sends configured headerNames in RTI payload', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        await worker.fetch(buildRequest('/page', { xRealIp: '9.9.9.9' }), {}, buildContext());
+        const headers = mocks.callRTI.mock.calls[0][0].endUserParams.headers;
+        // headerNames list includes 'x-real-ip' and 'user-agent' but NOT arbitrary headers
+        expect(Object.keys(headers)).toEqual(expect.arrayContaining(['user-agent', 'host', 'x-real-ip']));
+        expect(Object.keys(headers)).not.toContain('x-unknown-custom-header');
+    });
+
+    // --- API key not leaked ---
+
+    it('does not expose apiKey in x-cheq-rti-result response header', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('origin')));
+        const response = await worker.fetch(buildRequest(), {}, buildContext());
+        expect(response.headers.get('x-cheq-rti-result')).not.toContain('api-key');
     });
 
     // --- Error handling ---
