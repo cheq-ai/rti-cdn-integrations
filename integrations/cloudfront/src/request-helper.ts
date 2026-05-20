@@ -47,7 +47,8 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         const startRTI = Date.now();
 
         const fetchedHeaders = getHeaders(config.keepHeadersNames, cfRequest.headers);
-        const cookieHeaderMap = (cfRequest.headers["cookie"]?.map((kv) => kv.value).join(', ') || "").split(";").map(c => c.trim());
+        const cookieHeader = cfRequest.headers["cookie"]?.map((kv) => kv.value).join(', ') || "";
+        const { duidCookie, pvidCookie, sCookie } = rtiHelperService.parseCookies(cookieHeader);
         let payload: RTIRequest = {
             tagHash: config.tagHash,
             apiKey: config.apiKey,
@@ -62,9 +63,9 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                 method: cfRequest.method,
                 headers: fetchedHeaders,
             },
-            duidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_duid="))?.split("=")[1], // Relevant for API version 4.0 and above
-            pvidCookie: cookieHeaderMap.find(c => c.startsWith("_cq_pvid="))?.split("=")[1], // Relevant for API version 4.0 and above
-            sCookie: cookieHeaderMap.find(c => c.startsWith("_cq_s="))?.split("=")[1] // Relevant for API version 4.1 and above
+            duidCookie: duidCookie, // Relevant for API version 4.0 and above
+            pvidCookie: pvidCookie, // Relevant for API version 4.0 and above
+            sCookie: sCookie,       // Relevant for API version 4.1 and above
         };
 
         // Add JA3 and JA4 fingerprints if available. 

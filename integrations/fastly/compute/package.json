@@ -6,11 +6,13 @@
   "scripts": {
     "build": "fastly compute build",
     "deploy": "fastly compute deploy",
-    "test": "jest"
+    "test": "vitest --reporter=verbose --watch false",
+    "coverage": "vitest run --coverage --coverage.provider=istanbul"
   },
   "devDependencies": {
     "@fastly/js-compute": "^3.0.0",
-    "jest": "^29.0.0"
+    "@vitest/coverage-istanbul": "^4.1.6",
+    "vitest": "^4.0.16"
   },
   "engines": {
     "node": ">=18"

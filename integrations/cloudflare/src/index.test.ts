@@ -1,3 +1,4 @@
+// cspell:ignore cheq duid pvid unstub
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -38,6 +39,14 @@ vi.mock('../../core/services/rti-helper.service', () => ({
             getActionStrategy: mocks.getActionStrategy,
             getEventType: mocks.getEventType,
             validateConfig: mocks.validateConfig,
+            parseCookies: (cookieHeader: string) => {
+                const cookies = cookieHeader.split(';').map((c: string) => c.trim());
+                return {
+                    duidCookie: cookies.find((c: string) => c.startsWith('_cq_duid='))?.substring('_cq_duid='.length) || undefined,
+                    pvidCookie: cookies.find((c: string) => c.startsWith('_cq_pvid='))?.substring('_cq_pvid='.length) || undefined,
+                    sCookie:    cookies.find((c: string) => c.startsWith('_cq_s='))?.substring('_cq_s='.length)    || undefined,
+                };
+            },
         };
     }),
 }));
@@ -267,6 +276,28 @@ describe('cloudflare worker', () => {
         expect(payload.sCookie).toBe('s-token');
     });
 
+    it('extracts base64-padded _cq_s intact when mixed with other unrelated cookies', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const b64Value = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
+        const cookies = `session=abc123; _cq_s=${b64Value}; other=ignored`;
+        await worker.fetch(buildRequest('/page', { cookies }), {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.sCookie).toBe(b64Value);
+        expect(payload.duidCookie).toBeUndefined();
+        expect(payload.pvidCookie).toBeUndefined();
+    });
+
+    it('extracts _cq_duid, _cq_pvid and base64-padded _cq_s when mixed with other unrelated cookies', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const b64Value = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
+        const cookies = `session=abc123; _cq_duid=4.16a154e6ae45bc91bf9a49b365beb989; theme=dark; _cq_pvid=4.247bcdf08360a9de9dee2196c1a36631; _cq_s=${b64Value}; other=ignored`;
+        await worker.fetch(buildRequest('/page', { cookies }), {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
+        expect(payload.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
+        expect(payload.sCookie).toBe(b64Value);
+    });
+
     it('leaves cookie fields undefined when cookies are absent', async () => {
         vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
         await worker.fetch(buildRequest(), {}, buildContext());
@@ -309,7 +340,7 @@ describe('cloudflare worker', () => {
         vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         await worker.fetch(buildRequest(), {}, buildContext());
-        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('requset payload'));
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('request payload'));
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('rtiResponse'));
         consoleSpy.mockRestore();
     });
@@ -321,6 +352,51 @@ describe('cloudflare worker', () => {
         await worker.fetch(buildRequest(), {}, buildContext());
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('action:'));
         consoleSpy.mockRestore();
+    });
+
+    // --- JA3 hash ---
+
+    it('passes ja3Hash from cf.botManagement as cheq_ja3 in RTI payload headers', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const req = Object.assign(buildRequest(), { cf: { botManagement: { ja3Hash: 'abc123ja3' } } });
+        await worker.fetch(req as any, {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBe('abc123ja3');
+    });
+
+    it('sets cheq_ja3 to undefined when cf.botManagement is absent', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        await worker.fetch(buildRequest(), {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBeUndefined();
+    });
+
+    // --- passThroughOnException ---
+
+    it('calls context.passThroughOnException on every request', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const ctx = buildContext();
+        await worker.fetch(buildRequest(), {}, ctx);
+        expect(ctx.passThroughOnException).toHaveBeenCalledOnce();
+    });
+
+    // --- getHeaders filtering ---
+
+    it('only sends configured headerNames in RTI payload', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        await worker.fetch(buildRequest('/page', { xRealIp: '9.9.9.9' }), {}, buildContext());
+        const headers = mocks.callRTI.mock.calls[0][0].endUserParams.headers;
+        // headerNames list includes 'x-real-ip' and 'user-agent' but NOT arbitrary headers
+        expect(Object.keys(headers)).toEqual(expect.arrayContaining(['user-agent', 'host', 'x-real-ip']));
+        expect(Object.keys(headers)).not.toContain('x-unknown-custom-header');
+    });
+
+    // --- API key not leaked ---
+
+    it('does not expose apiKey in x-cheq-rti-result response header', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('origin')));
+        const response = await worker.fetch(buildRequest(), {}, buildContext());
+        expect(response.headers.get('x-cheq-rti-result')).not.toContain('api-key');
     });
 
     // --- Error handling ---
