@@ -2,8 +2,8 @@ import { CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult } 
 import { RTIResponse } from "../../core/models/rti-response.model";
 
 const turnstileChallengeExample = async (request: CloudFrontRequest, response: RTIResponse): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
-    const turnstileSiteKey = "0x4AAAAAACJwFq0WF3t3dfBi";
-    const turnstileSecret = "0x4AAAAAACJwFq3Meh-Zlqq4BkZysvuyf68";
+    const turnstileSiteKey = "REPLACE_ME";
+    const turnstileSecret = "REPLACE_ME";
     const ttl = 300; // 5 minutes
     let queryStringData = new URLSearchParams(request.querystring);
     // @ts-ignore
