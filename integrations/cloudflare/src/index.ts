@@ -57,7 +57,7 @@ export default {
             
             // @ts-ignore: This specific line is known to be safe
             payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement?.ja3Hash;
-            if (config.debug) { console.log(`requset payload: ${JSON.stringify(payload)}`); }
+            if (config.debug) { console.log(`request payload: ${JSON.stringify(payload)}`); }
 
             const rtiResponse = await rtiService.callRTI(payload);
             if (config.debug) { console.log(`rtiResponse: ${JSON.stringify(rtiResponse)}`); }
