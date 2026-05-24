@@ -393,10 +393,14 @@ describe('cloudflare worker', () => {
 
     // --- API key not leaked ---
 
-    it('does not expose apiKey in x-cheq-rti-result response header', async () => {
-        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('origin')));
-        const response = await worker.fetch(buildRequest(), {}, buildContext());
-        expect(response.headers.get('x-cheq-rti-result')).not.toContain('api-key');
+    it('does not expose apiKey in x-cheq-rti-result request header', async () => {
+        let capturedRequest: Request | undefined;
+        vi.stubGlobal('fetch', vi.fn().mockImplementation((req: Request) => {
+            capturedRequest = req;
+            return Promise.resolve(new Response('origin'));
+        }));
+        await worker.fetch(buildRequest(), {}, buildContext());
+        expect(capturedRequest?.headers.get('x-cheq-rti-result')).not.toContain('api-key');
     });
 
     // --- Error handling ---

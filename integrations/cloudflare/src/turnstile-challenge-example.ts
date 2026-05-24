@@ -312,7 +312,7 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
                 status: 302,
                 headers: {
                 "Location": decodeURIComponent(redirectUrl),
-                "Set-Cookie": `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}`,
+                "Set-Cookie": `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}`,
                 },
             });
             return newResponse;
@@ -325,7 +325,8 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
 const trunstileValidateChallengeExample = async (request: Request): Promise<boolean> => {
     // Validate session token (if the validation alreay happend)
     const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
-    const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se"))?.split("=")[1]?.split("|");
+    const rawCookie = cookieHeaderMap.find(c => c.startsWith("_cq_se="));
+    const cookieValue = rawCookie ? rawCookie.substring("_cq_se=".length).split("|") : undefined;
     const rayId = request.headers.get("x-cheq-ray-id") || cookieValue?.pop();
     const sessionToken = request.headers.get("x-cheq-challenge") || cookieValue?.pop();
     if (sessionToken && rayId) {
