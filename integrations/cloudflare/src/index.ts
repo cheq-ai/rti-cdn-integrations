@@ -85,7 +85,7 @@ export default {
                         );
                     case ActionStrategy.REDIRECT:
                         const redirectHeaders = new Headers();
-                        redirectHeaders.set("x-cheq-cf-request-id", request.headers.get("cf-ray") || '');
+                        redirectHeaders.set("x-cheq-cdn-request-id", request.headers.get("cf-ray") || '');
                         redirectHeaders.set("x-cheq-id", rtiResponse.ids.rayId);
                         redirectHeaders.set("x-cheq-page-view-id", rtiResponse.ids.pageViewId ?? '');
                         redirectHeaders.set("location", config.redirectLocation || "https://www.cheq.ai/");
@@ -153,13 +153,7 @@ function getHeaders(headerNames: string[], headers: Headers): RequestHeaders {
 }
 
 function setHeaders(headers: Headers, rtiResponse: RTIResponse) {
-    const result = [
-        `version=${rtiResponse.metadata.version}`,
-        `verdict=${rtiResponse.decision.verdict}`,
-        `threat-type-code=${rtiResponse.classification.code}`,
-        `ids=${JSON.stringify(rtiResponse.ids)}`
-    ].join(";");
-    headers.set("x-cheq-rti-result", result);
+    headers.set("x-cheq-rti-result", rtiHelperService.buildRtiResultHeader(rtiResponse));
 }
 
 function log(duration: number) {

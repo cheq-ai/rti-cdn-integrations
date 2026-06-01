@@ -1,3 +1,4 @@
+// cspell:ignore nums CHEQ duid pvid
 import { Config } from "../models/config.interface";
 import { EventType } from "../models/event-type.model";
 import { RTIResponse } from "../models/rti-response.model";
@@ -74,11 +75,23 @@ export class RTIHelperService {
   }
 
   /**
-   * Parses the Cookie header string and extracts the three CHEQ RTI cookies.
-   * Uses substring (not split) so base64-padded values like _cq_s are preserved intact.
-   * @param cookieHeader raw Cookie header value
+   * Parses a raw Cookie header string and extracts the three CHEQ RTI cookies.
+   * Uses substring (not split) so base64-padded values with `=` are preserved intact.
+   *
+   * Edge cases:
+   * - Empty string or no matching cookies → all three fields are `undefined`
+   * - Cookie present but with an empty value (e.g. `_cq_s=`) → field is `undefined`
+   * - `_cq_se` (challenge session cookie) does NOT match `_cq_s` — prefix is exact
+   * - Duplicate cookie names → first occurrence wins
+   *
+   * @param cookieHeader raw Cookie header value (e.g. `"_cq_duid=abc; _cq_s=xyz=="`)
+   * @returns object with `duidCookie`, `pvidCookie`, `sCookie` — each `undefined` when absent
    */
   parseCookies(cookieHeader: string): { duidCookie?: string; pvidCookie?: string; sCookie?: string } {
+    if (!cookieHeader) {
+      return {};
+    }
+
     // NOTE: does not normalize spaces around '=' (e.g. "name = value") — RFC 6265 forbids it so compliant servers won't send it
     const cookies = cookieHeader.split(";").map(c => c.trim());
     
@@ -90,6 +103,21 @@ export class RTIHelperService {
     };
   }
 
+  /**
+   * Extracts a cookie value from a pre-split cookie array by exact prefix match.
+   * The `nameWithEqualSign` parameter must include the trailing `=` (e.g. `"_cq_s="`),
+   * which prevents false-positive matches on similarly-named cookies (e.g. `_cq_se`).
+   *
+   * Edge cases:
+   * - Cookie not found → `undefined`
+   * - Cookie present but with an empty value (e.g. `_cq_s=`) → `undefined` (falsy)
+   * - Values containing `=` (e.g. base64 padding) → preserved intact via `substring`
+   * - Duplicate names → first occurrence wins
+   *
+   * @param cookies pre-split and trimmed cookie tokens (e.g. from `cookieHeader.split(";").map(c => c.trim())`)
+   * @param nameWithEqualSign cookie name including `=` (e.g. `"_cq_duid="`)
+   * @returns the cookie value, or `undefined` when absent or empty
+   */
   getCookieValue(cookies: string[], nameWithEqualSign: string): string | undefined {
     // NOTE: does not strip surrounding quotes from values (e.g. name="value") — our cookies never use quoted values
     return cookies.find(c => c.startsWith(nameWithEqualSign))?.substring(nameWithEqualSign.length) || undefined;
@@ -130,6 +158,48 @@ export class RTIHelperService {
    */
   getHeaderByName(headers: HeadersMap, name = '', defaultValue: string | number | undefined = undefined) {
     return headers[name.toLowerCase()] || headers[this.capitalize(name, '-')] || defaultValue;
+  }
+
+  /**
+   * Parses a comma-separated string of integers into a number array.
+   * Non-numeric entries and empty segments are silently skipped.
+   * Returns undefined when the input is absent or yields no valid numbers.
+   * @param val comma-separated string (e.g. "4,5,6")
+   */
+  static parseNumberList(val: string | undefined): number[] | undefined {
+    if (!val) {
+      return undefined;
+    }
+    const nums = val.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+    return nums.length > 0 ? nums : undefined;
+  }
+
+  /**
+   * Parses a comma-separated string into a string array.
+   * Empty and whitespace-only segments are filtered out.
+   * Returns undefined when the input is absent, blank, or yields no non-empty strings.
+   * @param val comma-separated string (e.g. "/health,/ping")
+   */
+  static parseStringList(val: string | undefined): string[] | undefined {
+    if (!val) {
+      return undefined;
+    }
+    const items = val.split(',').map(s => s.trim()).filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+
+  /**
+   * Builds the `x-cheq-rti-result` header value from an RTI response.
+   * Format: `version=X;verdict=Y;threat-type-code=Z;ids={...}`
+   * @param rtiResponse the RTI response object
+   */
+  buildRtiResultHeader(rtiResponse: RTIResponse): string {
+    return [
+      `version=${rtiResponse.metadata.version}`,
+      `verdict=${rtiResponse.decision.verdict}`,
+      `threat-type-code=${rtiResponse.classification.code}`,
+      `ids=${JSON.stringify(rtiResponse.ids)}`,
+    ].join(';');
   }
 
   /**

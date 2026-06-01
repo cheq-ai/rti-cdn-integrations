@@ -1,3 +1,4 @@
+// cspell:ignore cheq
 import { CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
 import { config } from './config';
 import { RTILoggerService } from "../../core/services/rti-logger.service";
@@ -123,7 +124,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                     };
                 case ActionStrategy.REDIRECT:
                     const headers: CloudFrontHeaders = {
-                        'x-cheq-cf-request-id': [{ key: 'x-cheq-cf-request-id', value: getCfRequestId(event) }],
+                        'x-cheq-cdn-request-id': [{ key: 'x-cheq-cdn-request-id', value: getCfRequestId(event) }],
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
                         'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
@@ -187,14 +188,7 @@ function setHeaders(headers: CloudFrontHeaders, rtiResponse: RTIResponse) {
     // This can be used by the origin for debugging, logging, or making decisions based on the RTI result.
     // Note: The only way to see this header in the browser is to have the origin echo it back in the response headers, so basically we will never see this header in the browser, only in CloudWatch.
 
-    const result = [
-        `version=${rtiResponse.metadata.version}`,
-        `verdict=${rtiResponse.decision.verdict}`,
-        `threat-type-code=${rtiResponse.classification.code}`,
-        `ids=${JSON.stringify(rtiResponse.ids)}`
-    ].join(";");
-
-    headers["x-cheq-rti-result"] = [{ key: 'x-cheq-rti-result', value: result }];
+    headers["x-cheq-rti-result"] = [{ key: 'x-cheq-rti-result', value: rtiHelperService.buildRtiResultHeader(rtiResponse) }];
 }
 
 function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): RequestHeaders {

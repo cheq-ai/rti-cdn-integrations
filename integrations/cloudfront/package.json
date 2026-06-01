@@ -2,7 +2,6 @@
   "name": "cheq-rti-integration-cloudfront",
   "version": "0.2.0",
   "scripts": {
-    "unit": "jest",
     "compile": "tsc",
     "test": "tsc && vitest --reporter=verbose --watch false",
     "coverage": "vitest run --coverage --coverage.provider=istanbul",
