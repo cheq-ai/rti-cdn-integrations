@@ -440,7 +440,7 @@ export const config: CloudfrontConfig = {
 
   // --- Challenge (CAPTCHA) ---
   challenge: turnstileChallengeExample,
-  validateChallenge: trunstileValidateChallengeExample,
+  validateChallenge: turnstileValidateChallengeExample,
 
   // --- Origin-request header filtering ---
   // [] or undefined = forward all available headers to RTI (recommended)

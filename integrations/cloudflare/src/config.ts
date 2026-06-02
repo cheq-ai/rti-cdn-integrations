@@ -2,7 +2,7 @@ import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Config } from '../../core/models/config.interface';
 import { Mode } from '../../core/models/mode.model';
 import { RTIResponse } from '../../core/models/rti-response.model';
-import { turnstileChallengeExample, trunstileValidateChallengeExample } from './turnstile-challenge-example';
+import { turnstileChallengeExample, turnstileValidateChallengeExample } from './turnstile-challenge-example';
 /**
  * See {@link https://cheq-ai.github.io/rti-cdn-integrations/interfaces/Config.html | Config}
  */
@@ -38,7 +38,7 @@ export const config: CloudflareConfig = {
     //redirectLocation: 'https://www.cheq.ai/',
 
     challenge: turnstileChallengeExample,
-    validateChallenge: trunstileValidateChallengeExample,
+    validateChallenge: turnstileValidateChallengeExample,
 
     // Example for ignored paths
     ignorePaths: [

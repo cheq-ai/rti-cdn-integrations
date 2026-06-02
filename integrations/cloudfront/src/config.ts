@@ -3,7 +3,7 @@ import { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import { Config } from '../../core/models/config.interface';
 import { RTIResponse } from '../../core/models/rti-response.model';
 import { Mode } from '../../core/models/mode.model';
-import { trunstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
+import { turnstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
 
 /**
@@ -52,7 +52,7 @@ export const config: CloudfrontConfig = {
     //redirectLocation: 'https://www.cheq.ai/',
 
     challenge: turnstileChallengeExample,
-    validateChallenge: trunstileValidateChallengeExample,
+    validateChallenge: turnstileValidateChallengeExample,
 
     // Example for ignored paths
     ignorePaths: [

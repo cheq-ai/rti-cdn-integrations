@@ -322,7 +322,7 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
     }
 };
 
-const trunstileValidateChallengeExample = async (request: Request): Promise<boolean> => {
+const turnstileValidateChallengeExample = async (request: Request): Promise<boolean> => {
     // Validate session token (if the validation alreay happend)
     const cookieHeaderMap = (request.headers.get("cookie") || "").split(";").map(c => c.trim());
     const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se"))?.split("=")[1]?.split("|");
@@ -353,4 +353,4 @@ const trunstileValidateChallengeExample = async (request: Request): Promise<bool
     return false;
 }
 
-export { turnstileChallengeExample, trunstileValidateChallengeExample };
+export { turnstileChallengeExample, turnstileValidateChallengeExample };
