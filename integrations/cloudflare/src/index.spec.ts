@@ -415,6 +415,15 @@ describe('cloudflare worker', () => {
         expect(response.headers.get('location')).toBe('https://www.cheq.ai/');
     });
 
+    // --- API key not leaked ---
+
+    it('does not expose apiKey in x-cheq-rti-result response header', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('origin')));
+        const response = await worker.fetch(buildWorkerRequest(), {}, buildContext());
+        const header = response.headers.get('x-cheq-rti-result') ?? '';
+        expect(header).not.toContain('api-key');
+    });
+
     // --- Telemetry: waitUntil ---
 
     it('calls context.waitUntil with logger when telemetry is enabled', async () => {
