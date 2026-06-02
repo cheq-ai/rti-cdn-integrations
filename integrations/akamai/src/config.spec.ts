@@ -80,6 +80,8 @@ describe('static config', () => {
             '^/status$',
             '^/static/',
             '^/assets/',
+            '^/_next/',
+            '^/__webpack',
         ]);
     });
 });
