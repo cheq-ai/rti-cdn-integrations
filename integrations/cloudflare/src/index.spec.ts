@@ -340,6 +340,19 @@ describe('cloudflare worker', () => {
         expect(payload.endUserParams.headers.cheq_ja3).toBeUndefined();
     });
 
+    it('sets cheq_ja3 to undefined when ja3Hash is an empty string', async () => {
+        // Arrange
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+        const req = Object.assign(buildWorkerRequest(), { cf: { botManagement: { ja3Hash: '' } } });
+
+        // Act
+        await worker.fetch(req as any, {}, buildContext());
+        const payload = mocks.callRTI.mock.calls[0][0];
+
+        // Assert
+        expect(payload.endUserParams.headers.cheq_ja3).toBeUndefined();
+    });
+
     // --- clientIp from x-real-ip ---
 
     it('sets clientIp to null when x-real-ip header is absent', async () => {

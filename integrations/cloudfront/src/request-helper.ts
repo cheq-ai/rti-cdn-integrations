@@ -74,9 +74,9 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         // so they will only be available in origin request stage and not in viewer request stage.
         
         // @ts-ignore: This specific line is known to be safe
-        payload.endUserParams.headers.cheq_ja3 = cfRequest.headers["cloudfront-viewer-ja3-fingerprint"]?.map((kv) => kv.value).join(', ');
+        payload.endUserParams.headers.cheq_ja3 = cfRequest.headers["cloudfront-viewer-ja3-fingerprint"]?.map((kv) => kv.value).join(', ') || undefined;
         // @ts-ignore: This specific line is known to be safe
-        payload.endUserParams.headers.cheq_ja4 = cfRequest.headers["cloudfront-viewer-ja4-fingerprint"]?.map((kv) => kv.value).join(', ');
+        payload.endUserParams.headers.cheq_ja4 = cfRequest.headers["cloudfront-viewer-ja4-fingerprint"]?.map((kv) => kv.value).join(', ') || undefined;
 
         if (isDebugEnabled) {
             console.log(`RTI Request payload: ${JSON.stringify(payload)}`);

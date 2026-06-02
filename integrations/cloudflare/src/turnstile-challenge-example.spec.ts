@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
 // @ts-ignore
 import { webcrypto } from 'node:crypto';
-import { turnstileChallengeExample, trunstileValidateChallengeExample } from './turnstile-challenge-example';
+import { turnstileChallengeExample, turnstileValidateChallengeExample } from './turnstile-challenge-example';
 import type { RTIResponse } from '../../core/models/rti-response.model';
 
 beforeAll(() => {
@@ -134,18 +134,18 @@ describe('turnstileChallengeExample', () => {
     });
 });
 
-// ─── trunstileValidateChallengeExample ───────────────────────────────────────
+// ─── turnstileValidateChallengeExample ───────────────────────────────────────
 
-describe('trunstileValidateChallengeExample', () => {
+describe('turnstileValidateChallengeExample', () => {
 
     it('returns false when no cookie header present', async () => {
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest())).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest())).toBe(false);
     });
 
     it('returns false when cookie has no _cq_se', async () => {
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: '_cq_duid=abc; _cq_pvid=xyz' }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: '_cq_duid=abc; _cq_pvid=xyz' }))).toBe(false);
     });
 
     it('returns true for a valid unexpired token with correct signature', async () => {
@@ -154,7 +154,7 @@ describe('trunstileValidateChallengeExample', () => {
         const { token } = await buildValidToken(rayId);
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(true);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(true);
     });
 
     it('returns false when token is expired', async () => {
@@ -163,17 +163,17 @@ describe('trunstileValidateChallengeExample', () => {
         const { token } = await buildValidToken(rayId, -1000);
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(false);
     });
 
     it('returns false when token has no "." separator (missing signature)', async () => {
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: '_cq_se=1234567890|ray-abc' }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: '_cq_se=1234567890|ray-abc' }))).toBe(false);
     });
 
     it('returns false when expiresAt is NaN', async () => {
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: '_cq_se=notanumber.abcdef|ray-abc' }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: '_cq_se=notanumber.abcdef|ray-abc' }))).toBe(false);
     });
 
     it('returns false when signature does not match', async () => {
@@ -181,7 +181,7 @@ describe('trunstileValidateChallengeExample', () => {
         const expiresAt = Date.now() + 60_000;
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${expiresAt}.wrongsig1234|ray-abc` }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${expiresAt}.wrongsig1234|ray-abc` }))).toBe(false);
     });
 
     it('returns true when both token and rayId come from headers (no cookie)', async () => {
@@ -190,7 +190,7 @@ describe('trunstileValidateChallengeExample', () => {
         const { token } = await buildValidToken(rayId);
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ xCheqRayId: rayId, xCheqChallenge: token }))).toBe(true);
+        expect(await turnstileValidateChallengeExample(buildRequest({ xCheqRayId: rayId, xCheqChallenge: token }))).toBe(true);
     });
 
     it('returns true when session token comes from x-cheq-challenge header alongside cookie rayId', async () => {
@@ -200,7 +200,7 @@ describe('trunstileValidateChallengeExample', () => {
         // cookie has _cq_se with no token portion — rayId from cookie, token from header
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=|${rayId}`, xCheqChallenge: token }))).toBe(true);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=|${rayId}`, xCheqChallenge: token }))).toBe(true);
     });
 
     it('returns false and catches error when crypto.subtle.digest throws', async () => {
@@ -210,6 +210,6 @@ describe('trunstileValidateChallengeExample', () => {
         vi.spyOn((globalThis as any).crypto.subtle, 'digest').mockRejectedValueOnce(new Error('digest error'));
 
         // Act & Assert
-        expect(await trunstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(false);
+        expect(await turnstileValidateChallengeExample(buildRequest({ cookies: `_cq_se=${token}|${rayId}` }))).toBe(false);
     });
 });

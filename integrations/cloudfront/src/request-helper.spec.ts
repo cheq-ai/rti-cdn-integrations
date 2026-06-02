@@ -406,6 +406,32 @@ describe('request-helper handle', () => {
         expect(payload.endUserParams.headers.cheq_ja4).toBe('def456ja4');
     });
 
+    it('sets cheq_ja3 to undefined when cloudfront-viewer-ja3-fingerprint value is an empty string', async () => {
+        // Arrange
+        const event = buildEvent();
+        event.Records[0].cf.request.headers['cloudfront-viewer-ja3-fingerprint'] = [{ key: 'cloudfront-viewer-ja3-fingerprint', value: '' }];
+
+        // Act
+        await handle(event, RequestType.ORIGIN_REQUEST);
+
+        // Assert
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja3).toBeUndefined();
+    });
+
+    it('sets cheq_ja4 to undefined when cloudfront-viewer-ja4-fingerprint value is an empty string', async () => {
+        // Arrange
+        const event = buildEvent();
+        event.Records[0].cf.request.headers['cloudfront-viewer-ja4-fingerprint'] = [{ key: 'cloudfront-viewer-ja4-fingerprint', value: '' }];
+
+        // Act
+        await handle(event, RequestType.ORIGIN_REQUEST);
+
+        // Assert
+        const payload = mocks.callRTI.mock.calls[0][0];
+        expect(payload.endUserParams.headers.cheq_ja4).toBeUndefined();
+    });
+
     // --- URL construction ---
 
     it('builds request URL from host header and uri', async () => {
