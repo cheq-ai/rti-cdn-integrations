@@ -1,3 +1,7 @@
+// Standard RTI caller using the Fetch API — suitable for runtimes that support it
+// (Cloudflare Workers, CloudFront@Edge, Node.js, browsers).
+// Akamai EdgeWorkers do NOT have fetch() — see integrations/akamai/src/rti-service.ts
+// for the Akamai-specific implementation that uses httpRequest instead.
 import { IRTIService } from "../models/rti-service.interface";
 import { RTIRequest } from "../models/rti-request.model";
 import { RTIResponse } from "../models/rti-response.model";

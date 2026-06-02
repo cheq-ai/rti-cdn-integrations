@@ -12,9 +12,11 @@ import { generateDefaultBlockPage } from "../../core/helpers/block-page-helpers"
 const logger = new RTILoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIService(config);
-const headerNames = ["user-agent", "host", "x-forwarded-for", "via", "referer", "accept",
-                        "accept-encoding", "accept-language", "accept-charset", "origin", "x-requested-with",
-                        "connection", "pragma", "cache-control", "content-type", "from", "x-real-ip", "true-client-ip"];
+const headerNames = [
+    "user-agent", "host", "x-forwarded-for", "via", "referer", "accept",
+    "accept-encoding", "accept-language", "accept-charset", "origin", "x-requested-with",
+    "connection", "pragma", "cache-control", "content-type", "from", "x-real-ip", "true-client-ip"
+];
 
 export default {
     async fetch(request: Request, env: unknown, context: ExecutionContext) {
@@ -56,20 +58,31 @@ export default {
             };
             
             // @ts-ignore: This specific line is known to be safe
-            payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement?.ja3Hash;
-            if (config.debug) { console.log(`request payload: ${JSON.stringify(payload)}`); }
+            payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement?.ja3Hash || undefined;
+
+            if (config.debug) { 
+                console.log(`request payload: ${JSON.stringify(payload)}`); 
+            }
 
             const rtiResponse = await rtiService.callRTI(payload);
-            if (config.debug) { console.log(`rtiResponse: ${JSON.stringify(rtiResponse)}`); }
+            
+            if (config.debug) { 
+                console.log(`rtiResponse: ${JSON.stringify(rtiResponse)}`); 
+            }
 
             const endRTI = Date.now();
             const duration = endRTI - startRTI;
+            
             if (config.telemetry) {
                 context.waitUntil(log(duration));
             }
 
             const action = rtiHelperService.getAction(rtiResponse);
-            if (config.debug) { console.log(`action: ${action}`); }
+            
+            if (config.debug) { 
+                console.log(`action: ${action}`); 
+            }
+            
             if (action !== Action.ALLOW) {
                 const actionStrategy = rtiHelperService.getActionStrategy(action);
                 switch (actionStrategy) {
@@ -85,7 +98,7 @@ export default {
                         );
                     case ActionStrategy.REDIRECT:
                         const redirectHeaders = new Headers();
-                        redirectHeaders.set("x-cheq-cf-request-id", request.headers.get("cf-ray") || '');
+                        redirectHeaders.set("x-cheq-cdn-request-id", request.headers.get("cf-ray") || '');
                         redirectHeaders.set("x-cheq-id", rtiResponse.ids.rayId);
                         redirectHeaders.set("x-cheq-page-view-id", rtiResponse.ids.pageViewId ?? '');
                         redirectHeaders.set("location", config.redirectLocation || "https://www.cheq.ai/");
@@ -153,13 +166,7 @@ function getHeaders(headerNames: string[], headers: Headers): RequestHeaders {
 }
 
 function setHeaders(headers: Headers, rtiResponse: RTIResponse) {
-    const result = [
-        `version=${rtiResponse.metadata.version}`,
-        `verdict=${rtiResponse.decision.verdict}`,
-        `threat-type-code=${rtiResponse.classification.code}`,
-        `ids=${JSON.stringify(rtiResponse.ids)}`
-    ].join(";");
-    headers.set("x-cheq-rti-result", result);
+    headers.set("x-cheq-rti-result", rtiHelperService.buildRtiResultHeader(rtiResponse));
 }
 
 function log(duration: number) {

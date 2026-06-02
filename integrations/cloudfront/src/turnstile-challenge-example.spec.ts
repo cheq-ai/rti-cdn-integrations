@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, vi, afterEach } from 'vitest';
 // @ts-ignore — node:crypto is not in the tsconfig types but is available at runtime in Node 20
 import { webcrypto } from 'node:crypto';
-import { trunstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
+import { turnstileValidateChallengeExample, turnstileChallengeExample } from './turnstile-challenge-example';
 import type { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import type { RTIResponse } from '../../core/models/rti-response.model';
 
@@ -47,17 +47,17 @@ function buildRequest(cookieValue?: string, rayIdHeader?: string, challengeHeade
     } as unknown as CloudFrontRequest;
 }
 
-describe('trunstileValidateChallengeExample', () => {
+describe('turnstileValidateChallengeExample', () => {
 
     // --- No session present ---
 
     it('returns false when no cookie header is present', async () => {
-        const result = await trunstileValidateChallengeExample(buildRequest());
+        const result = await turnstileValidateChallengeExample(buildRequest());
         expect(result).toBe(false);
     });
 
     it('returns false when cookie header has no _cq_se cookie', async () => {
-        const result = await trunstileValidateChallengeExample(buildRequest('_cq_duid=device-abc; _cq_pvid=pv-xyz'));
+        const result = await turnstileValidateChallengeExample(buildRequest('_cq_duid=device-abc; _cq_pvid=pv-xyz'));
         expect(result).toBe(false);
     });
 
@@ -66,14 +66,14 @@ describe('trunstileValidateChallengeExample', () => {
     it('returns true for a valid unexpired token with correct signature', async () => {
         const rayId = 'ray-abc123';
         const { token } = await buildValidToken(rayId);
-        const result = await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
+        const result = await turnstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
         expect(result).toBe(true);
     });
 
     it('returns true when _cq_se is alongside other cookies', async () => {
         const rayId = 'ray-abc123';
         const { token } = await buildValidToken(rayId);
-        const result = await trunstileValidateChallengeExample(
+        const result = await turnstileValidateChallengeExample(
             buildRequest(`_cq_duid=device-abc; _cq_se=${token}|${rayId}; _cq_pvid=pv-xyz`)
         );
         expect(result).toBe(true);
@@ -84,25 +84,25 @@ describe('trunstileValidateChallengeExample', () => {
     it('returns false when token is expired', async () => {
         const rayId = 'ray-abc123';
         const { token } = await buildValidToken(rayId, -1000); // expired 1 second ago
-        const result = await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
+        const result = await turnstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
         expect(result).toBe(false);
     });
 
     // --- Malformed token ---
 
     it('returns false when token has no "." separator (missing signature)', async () => {
-        const result = await trunstileValidateChallengeExample(buildRequest('_cq_se=1234567890|ray-abc'));
+        const result = await turnstileValidateChallengeExample(buildRequest('_cq_se=1234567890|ray-abc'));
         expect(result).toBe(false);
     });
 
     it('returns false when expiresAt part is not a number (NaN)', async () => {
-        const result = await trunstileValidateChallengeExample(buildRequest('_cq_se=notanumber.abcdef|ray-abc'));
+        const result = await turnstileValidateChallengeExample(buildRequest('_cq_se=notanumber.abcdef|ray-abc'));
         expect(result).toBe(false);
     });
 
     it('returns false when signature does not match', async () => {
         const expiresAt = Date.now() + 60_000;
-        const result = await trunstileValidateChallengeExample(
+        const result = await turnstileValidateChallengeExample(
             buildRequest(`_cq_se=${expiresAt}.wrongsignature1234|ray-abc`)
         );
         expect(result).toBe(false);
@@ -114,7 +114,7 @@ describe('trunstileValidateChallengeExample', () => {
         const rayId = 'ray-from-header';
         const { token } = await buildValidToken(rayId);
         // cookie contains only the token portion; rayId comes from the header
-        const result = await trunstileValidateChallengeExample(
+        const result = await turnstileValidateChallengeExample(
             buildRequest(`_cq_se=${token}|`, rayId)
         );
         expect(result).toBe(true);
@@ -124,7 +124,7 @@ describe('trunstileValidateChallengeExample', () => {
         const rayId = 'ray-abc123';
         const { token } = await buildValidToken(rayId);
         // cookie has only the rayId portion, token supplied via header
-        const result = await trunstileValidateChallengeExample(
+        const result = await turnstileValidateChallengeExample(
             buildRequest(`_cq_se=|${rayId}`, undefined, token)
         );
         expect(result).toBe(true);
@@ -133,7 +133,7 @@ describe('trunstileValidateChallengeExample', () => {
     it('returns true when both token and rayId come from headers (no _cq_se cookie)', async () => {
         const rayId = 'ray-abc123';
         const { token } = await buildValidToken(rayId);
-        const result = await trunstileValidateChallengeExample(
+        const result = await turnstileValidateChallengeExample(
             buildRequest(undefined, rayId, token)
         );
         expect(result).toBe(true);
@@ -143,7 +143,7 @@ describe('trunstileValidateChallengeExample', () => {
 
     it('logs debug info when isDebug=true and no session present', async () => {
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        await trunstileValidateChallengeExample(buildRequest(), true);
+        await turnstileValidateChallengeExample(buildRequest(), true);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('[validateChallenge]'));
     });
 
@@ -151,7 +151,7 @@ describe('trunstileValidateChallengeExample', () => {
         const rayId = 'ray-debug';
         const { token } = await buildValidToken(rayId);
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
+        await turnstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('signature match'));
     });
 
@@ -159,19 +159,19 @@ describe('trunstileValidateChallengeExample', () => {
         const rayId = 'ray-debug';
         const { token } = await buildValidToken(rayId, -1000);
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
+        await turnstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`), true);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('expired'));
     });
 
     it('logs debug info when isDebug=true and token has no separator', async () => {
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        await trunstileValidateChallengeExample(buildRequest('_cq_se=1234567890|ray-abc'), true);
+        await turnstileValidateChallengeExample(buildRequest('_cq_se=1234567890|ray-abc'), true);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('invalid sessionToken format'));
     });
 
     it('logs debug info when isDebug=true and expiresAt is NaN', async () => {
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-        await trunstileValidateChallengeExample(buildRequest('_cq_se=notanumber.abcdef|ray-abc'), true);
+        await turnstileValidateChallengeExample(buildRequest('_cq_se=notanumber.abcdef|ray-abc'), true);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('NaN'));
     });
 
@@ -182,7 +182,7 @@ describe('trunstileValidateChallengeExample', () => {
         const { token } = await buildValidToken(rayId);
         const digestSpy = vi.spyOn(globalThis.crypto.subtle, 'digest').mockRejectedValueOnce(new Error('digest failed'));
         const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-        const result = await trunstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
+        const result = await turnstileValidateChallengeExample(buildRequest(`_cq_se=${token}|${rayId}`));
         expect(result).toBe(false);
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('digest failed'));
         digestSpy.mockRestore();

@@ -330,7 +330,7 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
     }
 };
 
-const trunstileValidateChallengeExample = async (request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
+const turnstileValidateChallengeExample = async (request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
     // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)
     const cookieHeaderMap = (request.headers["cookie"]?.[0]?.value || "").split(";").map(c => c.trim());
     const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se="))?.split("=")[1]?.split("|");
@@ -397,4 +397,4 @@ const trunstileValidateChallengeExample = async (request: CloudFrontRequest, isD
     return false;
 }
 
-export { turnstileChallengeExample, trunstileValidateChallengeExample };
+export { turnstileChallengeExample, turnstileValidateChallengeExample };
