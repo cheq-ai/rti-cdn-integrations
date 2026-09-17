@@ -6,12 +6,15 @@ const mocks = vi.hoisted(() => ({
     logLog: vi.fn(),
     parseNumberList: vi.fn(),
     parseStringList: vi.fn(),
-    turnstileChallengeExample: vi.fn(),
-    turnstileValidateChallengeExample: vi.fn(),
+    cheqChallenge: vi.fn(),
+    validateCheqChallenge: vi.fn(),
+    createCheqChallenge: vi.fn(),
+    createRecaptchaChallenge: vi.fn(() => vi.fn()),
+    createRecaptchaSessionValidator: vi.fn(),
 }));
 
 vi.mock('log', () => ({
-    log: { log: mocks.logLog },
+    logger: { log: mocks.logLog },
 }));
 
 vi.mock('../../core/services/rti-helper.service', () => ({
@@ -21,9 +24,17 @@ vi.mock('../../core/services/rti-helper.service', () => ({
     },
 }));
 
-vi.mock('./turnstile-challenge-example', () => ({
-    turnstileChallengeExample: mocks.turnstileChallengeExample,
-    turnstileValidateChallengeExample: mocks.turnstileValidateChallengeExample,
+vi.mock('./cheq-challenge', () => ({
+    createCheqChallenge: mocks.createCheqChallenge,
+}));
+
+// Mocked so this spec never loads the real module, which imports Akamai's built-in
+// 'http-request' - not resolvable under vitest.
+vi.mock('./recaptcha-v2-challenge', () => ({
+    createRecaptchaChallenge: mocks.createRecaptchaChallenge,
+    createRecaptchaSessionValidator: mocks.createRecaptchaSessionValidator,
+    RECAPTCHA_V2_TEST_SITE_KEY: '6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI',
+    RECAPTCHA_V2_TEST_SECRET: '6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe',
 }));
 
 import { config, buildDynamicConfig } from './config';
@@ -62,8 +73,8 @@ describe('static config', () => {
         expect(config.blockingStrategy).toBeUndefined();
         expect(config.challengingStrategy).toBeUndefined();
         expect(config.redirectLocation).toBeUndefined();
-        expect(config.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(config.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(config.challenge).toBeUndefined();
+        expect(config.validateChallenge).toBeUndefined();
         expect(config.ignorePaths).toEqual([
             '\\.css$', '\\.js$', '\\.mjs$', '\\.map$',
             '\\.png$', '\\.jpg$', '\\.jpeg$', '\\.gif$', '\\.webp$', '\\.svg$', '\\.ico$',
@@ -80,6 +91,9 @@ describe('static config', () => {
             '^/status$',
             '^/static/',
             '^/assets/',
+            '^/defend/',
+            '^/recaptcha/',
+            '^/akamai/',
             '^/_next/',
             '^/__webpack',
         ]);
@@ -125,8 +139,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults to empty strings when PMUSER variables are absent', () => {
@@ -157,8 +171,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('parses BLOCKING mode', () => {
@@ -189,8 +203,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults to MONITORING for invalid mode string', () => {
@@ -221,8 +235,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults to MONITORING when mode variable is absent', () => {
@@ -253,8 +267,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('parses valid timeout', () => {
@@ -285,8 +299,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults timeout to 300 when variable is absent', () => {
@@ -317,8 +331,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults timeout to 300 when value is "0"', () => {
@@ -349,8 +363,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults timeout to 300 when value is negative', () => {
@@ -381,8 +395,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('defaults timeout to 300 when value is non-numeric', () => {
@@ -413,8 +427,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('sets debug true when PMUSER_CHEQ_DEBUG is "true"', () => {
@@ -445,8 +459,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('sets debug false when PMUSER_CHEQ_DEBUG is absent', () => {
@@ -477,8 +491,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('sets telemetry true when PMUSER_CHEQ_TELEMETRY is "true"', () => {
@@ -509,8 +523,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('resolves blockingStrategy from PMUSER_CHEQ_BLOCK_STRATEGY', () => {
@@ -541,8 +555,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('leaves blockingStrategy undefined when variable is absent', () => {
@@ -573,8 +587,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('resolves challengingStrategy from PMUSER_CHEQ_CHALLENGE_STRATEGY', () => {
@@ -605,8 +619,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('calls parseNumberList for all TT code and reason PMUSER variables', () => {
@@ -650,8 +664,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('calls parseStringList for ignorePaths', () => {
@@ -683,8 +697,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('sets redirectLocation from PMUSER variable', () => {
@@ -715,8 +729,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectReasons).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('leaves redirectLocation undefined when variable is absent', () => {
@@ -747,20 +761,230 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectReasons).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
-    it('wires in turnstile callbacks', () => {
+
+    // --- challenge provider resolution (10b) ---
+
+    const SECRET = { 'PMUSER_CHEQ_CHALLENGE_SECRET': 'a-real-signing-secret' };
+    const GOOGLE = {
+        'PMUSER_CHEQ_RECAPTCHA_SITE_KEY': 'site-key',
+        'PMUSER_CHEQ_RECAPTCHA_SECRET': 'google-secret',
+        'PMUSER_CHEQ_RECAPTCHA_HOST': 'verify.example.com',
+    };
+
+    it.each([
+        ['browser', 'browser'],
+        ['recaptcha-v3', 'recaptcha-v3'],
+        ['v3', 'recaptcha-v3'],
+        ['recaptcha-v2', 'recaptcha-v2'],
+        ['recaptcha', 'recaptcha-v2'],
+        ['nonsense', 'recaptcha-v2'],
+        [undefined, 'recaptcha-v2'],
+    ] as const)('normalizes provider %s to %s', (raw, expected) => {
+        const req = buildRequest(raw === undefined ? {} : { 'PMUSER_CHEQ_CHALLENGE_PROVIDER': raw });
+        expect(buildDynamicConfig(req).challengeProvider).toBe(expected);
+    });
+
+    it('wires the browser provider without Google keys, since it needs none', () => {
+        mocks.createCheqChallenge.mockReturnValue({
+            challenge: mocks.cheqChallenge,
+            validateChallenge: mocks.validateCheqChallenge,
+        });
+        const req = buildRequest({ ...SECRET, 'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'browser' });
+        const result = buildDynamicConfig(req);
+        // The signing secret is bound into the provider here, not looked up inside it.
+        expect(mocks.createCheqChallenge).toHaveBeenCalledWith('a-real-signing-secret');
+        expect(result.challenge).toBe(mocks.cheqChallenge);
+        expect(result.validateChallenge).toBe(mocks.validateCheqChallenge);
+        expect(result.googleRecaptchaConfigured).toBe(false); // not Google, but a challenge IS available
+    });
+
+    it('wires reCAPTCHA when Google keys, a verify host and a signing secret are all present', () => {
+        const req = buildRequest({ ...SECRET, ...GOOGLE });
+        const result = buildDynamicConfig(req);
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(expect.objectContaining({
+            version: 'v2', siteKey: 'site-key', secret: 'google-secret', verifyHost: 'verify.example.com',
+            // Google's siteverify key and the _cq_se signing key are distinct values
+            sessionSecret: 'a-real-signing-secret',
+        }));
+        expect(mocks.createRecaptchaSessionValidator).toHaveBeenCalledWith('a-real-signing-secret');
+        expect(result.googleRecaptchaConfigured).toBe(true);
+    });
+
+    // v2 and v3 differ only by this one field at the wiring layer, and the keys are NOT
+    // interchangeable - wiring a v3 site key as v2 fails every verification at runtime, with
+    // nothing at config time to say why.
+    it('wires reCAPTCHA v3 with version v3 and the configured score threshold', () => {
+        const req = buildRequest({
+            ...SECRET, ...GOOGLE,
+            'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'recaptcha-v3',
+            'PMUSER_CHEQ_RECAPTCHA_MIN_SCORE': '0.7',
+        });
+        const result = buildDynamicConfig(req);
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(expect.objectContaining({
+            version: 'v3',
+            siteKey: 'site-key',
+            secret: 'google-secret',
+            verifyHost: 'verify.example.com',
+            scoreThreshold: 0.7,
+            sessionSecret: 'a-real-signing-secret',
+        }));
+        expect(result.googleRecaptchaConfigured).toBe(true);
+    });
+
+    it('falls back to RTI_HOST for the reCAPTCHA verify host', () => {
+        const req = buildRequest({
+            ...SECRET,
+            'PMUSER_CHEQ_RECAPTCHA_SITE_KEY': 'site-key',
+            'PMUSER_CHEQ_RECAPTCHA_SECRET': 'google-secret',
+            'PMUSER_CHEQ_RTI_HOST': 'rti.example.com',
+        });
+        buildDynamicConfig(req);
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(
+            expect.objectContaining({ verifyHost: 'rti.example.com' }));
+    });
+
+    it('does not wire reCAPTCHA when the verify host is missing', () => {
+        const req = buildRequest({
+            ...SECRET,
+            'PMUSER_CHEQ_RECAPTCHA_SITE_KEY': 'site-key',
+            'PMUSER_CHEQ_RECAPTCHA_SECRET': 'google-secret',
+        });
+        const result = buildDynamicConfig(req);
+        expect(result.challenge).toBeUndefined();
+        expect(result.googleRecaptchaConfigured).toBe(false);
+    });
+
+    it('treats REPLACE_ME Google keys as unconfigured', () => {
+        const req = buildRequest({
+            ...SECRET,
+            'PMUSER_CHEQ_RECAPTCHA_SITE_KEY': 'REPLACE_ME',
+            'PMUSER_CHEQ_RECAPTCHA_SECRET': 'REPLACE_ME',
+            'PMUSER_CHEQ_RECAPTCHA_HOST': 'verify.example.com',
+        });
+        expect(buildDynamicConfig(req).googleRecaptchaConfigured).toBe(false);
+    });
+
+    // --- the signing-secret gate: no secret means no challenge, whatever else is configured ---
+
+    it('drops the challenge callbacks when no signing secret is set, even with valid Google keys', () => {
+        const result = buildDynamicConfig(buildRequest({ ...GOOGLE }));
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
+    });
+
+    it('drops the challenge callbacks when no signing secret is set, even for the browser provider', () => {
+        const result = buildDynamicConfig(buildRequest({ 'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'browser' }));
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
+    });
+
+    it('treats a REPLACE_ME signing secret as unset', () => {
+        const req = buildRequest({ 'PMUSER_CHEQ_CHALLENGE_SECRET': 'REPLACE_ME', 'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'browser' });
+        expect(buildDynamicConfig(req).challenge).toBeUndefined();
+    });
+
+    // --- opt-in test keys and numeric options ---
+
+    it('uses Google test keys only when explicitly opted in', () => {
+        const req = buildRequest({
+            ...SECRET,
+            'PMUSER_CHEQ_RECAPTCHA_TEST_KEYS': 'true',
+            'PMUSER_CHEQ_RECAPTCHA_HOST': 'verify.example.com',
+        });
+        expect(buildDynamicConfig(req).googleRecaptchaConfigured).toBe(true);
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(
+            expect.objectContaining({ siteKey: '6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI' }));
+    });
+
+    it('does not use test keys without the opt-in', () => {
+        const req = buildRequest({ ...SECRET, 'PMUSER_CHEQ_RECAPTCHA_HOST': 'verify.example.com' });
+        expect(buildDynamicConfig(req).googleRecaptchaConfigured).toBe(false);
+    });
+
+    it('parses the v3 score threshold and leaves it undefined when absent or invalid', () => {
+        expect(buildDynamicConfig(buildRequest({ 'PMUSER_CHEQ_RECAPTCHA_MIN_SCORE': '0.7' })).recaptchaScoreThreshold).toBe(0.7);
+        expect(buildDynamicConfig(buildRequest({})).recaptchaScoreThreshold).toBeUndefined();
+        expect(buildDynamicConfig(buildRequest({ 'PMUSER_CHEQ_RECAPTCHA_MIN_SCORE': 'abc' })).recaptchaScoreThreshold).toBeUndefined();
+    });
+
+    it('passes CHALLENGE_TTL through to the reCAPTCHA factory, ignoring non-positive values', () => {
+        buildDynamicConfig(buildRequest({ ...SECRET, ...GOOGLE, 'PMUSER_CHEQ_CHALLENGE_TTL': '600' }));
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(expect.objectContaining({ sessionTtlSeconds: 600 }));
+
+        mocks.createRecaptchaChallenge.mockClear();
+        buildDynamicConfig(buildRequest({ ...SECRET, ...GOOGLE, 'PMUSER_CHEQ_CHALLENGE_TTL': '0' }));
+        expect(mocks.createRecaptchaChallenge).toHaveBeenCalledWith(expect.objectContaining({ sessionTtlSeconds: undefined }));
+    });
+
+    // parseStringList returns undefined for an unset variable, and shouldIgnore() treats
+    // undefined as "ignore nothing". So a dynamic config without PMUSER_CHEQ_IGNORE_PATHS used to
+    // classify EVERY request - every stylesheet, image and favicon burning an RTI call - and,
+    // worse, stopped excluding the worker's own self-proxy paths, which must never be classified.
+    // The static config's curated list is the fallback.
+    it('falls back to the built-in ignore paths when PMUSER_CHEQ_IGNORE_PATHS is unset', () => {
+        // Arrange
+        mocks.parseStringList.mockReturnValue(undefined);
+        const req = buildRequest({});
+
+        // Act
+        const result = buildDynamicConfig(req);
+
+        // Assert
+        expect(result.ignorePaths).toEqual(config.ignorePaths);
+        expect(result.ignorePaths).toContain('^/defend/');
+        expect(result.ignorePaths).toContain('^/recaptcha/');
+        expect(result.ignorePaths?.length).toBeGreaterThan(20);
+    });
+
+    it('uses the operator-supplied list when PMUSER_CHEQ_IGNORE_PATHS is set', () => {
+        // Arrange - an explicit value replaces the defaults rather than merging with them.
+        mocks.parseStringList.mockReturnValue(['^/only-this$']);
+        const req = buildRequest({ 'PMUSER_CHEQ_IGNORE_PATHS': '^/only-this$' });
+
+        // Act
+        const result = buildDynamicConfig(req);
+
+        // Assert
+        expect(result.ignorePaths).toEqual(['^/only-this$']);
+    });
+
+    it('logs a warning for an unrecognised provider when debug is on, and falls back to recaptcha-v2', () => {
+        // A typo like 'broswer' would otherwise silently become reCAPTCHA-without-keys, i.e. no
+        // challenge at all, with nothing explaining why.
+        const req = buildRequest({ 'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'broswer', 'PMUSER_CHEQ_DEBUG': 'true' });
+
+        const result = buildDynamicConfig(req);
+
+        expect(result.challengeProvider).toBe('recaptcha-v2');
+        expect(mocks.logLog).toHaveBeenCalledWith(expect.stringContaining('unrecognised PMUSER_CHEQ_CHALLENGE_PROVIDER'));
+    });
+
+    it('does not warn for the legacy `recaptcha` alias', () => {
+        const req = buildRequest({ 'PMUSER_CHEQ_CHALLENGE_PROVIDER': 'recaptcha', 'PMUSER_CHEQ_DEBUG': 'true' });
+
+        const result = buildDynamicConfig(req);
+
+        expect(result.challengeProvider).toBe('recaptcha-v2');
+        expect(mocks.logLog).not.toHaveBeenCalledWith(expect.stringContaining('unrecognised'));
+    });
+
+    it('wires no challenge callbacks when neither Google keys nor a signing secret are set', () => {
         // Arrange
         const req = buildRequest();
 
         // Act
         const result = buildDynamicConfig(req);
 
-        // Assert — relevant
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        // Assert — relevant. Default provider is recaptcha-v2, which needs Google keys; and
+        // without PMUSER_CHEQ_CHALLENGE_SECRET the callbacks are dropped regardless of provider.
+        expect(result.challengeProvider).toBe('recaptcha-v2');
+        expect(result.googleRecaptchaConfigured).toBe(false);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
 
         // Assert — rest
         expect(result.apiKey).toBe('');
@@ -811,8 +1035,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectReasons).toBeUndefined();
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('leaves rtiLoggerHost undefined when PMUSER_CHEQ_RTI_LOGGER_HOST is absent', () => {
@@ -843,8 +1067,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectReasons).toBeUndefined();
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('logs sanitized config (no apiKey/tagHash) when debug is true', () => {
@@ -879,8 +1103,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('does not log when debug is false', () => {
@@ -912,8 +1136,8 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBeUndefined();
         expect(result.ignorePaths).toEqual([]);
         expect(result.rtiLoggerHost).toBeUndefined();
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 
     it('maps all PMUSER variables to the corresponding config fields', () => {
@@ -969,7 +1193,7 @@ describe('buildDynamicConfig', () => {
         expect(result.redirectLocation).toBe('https://blocked.example.com/');
         expect(result.ignorePaths).toEqual(['^/health$', '\\.css$']);
         expect(result.rtiLoggerHost).toBe('logger.example.com');
-        expect(result.challenge).toBe(mocks.turnstileChallengeExample);
-        expect(result.validateChallenge).toBe(mocks.turnstileValidateChallengeExample);
+        expect(result.challenge).toBeUndefined();
+        expect(result.validateChallenge).toBeUndefined();
     });
 });

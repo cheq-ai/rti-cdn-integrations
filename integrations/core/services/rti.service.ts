@@ -37,7 +37,7 @@ export class RTIService implements IRTIService {
                 throw new Error(`Invalid RTI request, response code: ${response.status}, body: ${body}`);
             }
             
-            const rtiResponse: RTIResponse = await response.json();
+            const rtiResponse = (await response.json()) as RTIResponse;
             return rtiResponse;
         } catch (e) {
             const err: Error = e as Error;

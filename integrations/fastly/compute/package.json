@@ -11,8 +11,8 @@
   },
   "devDependencies": {
     "@fastly/js-compute": "^3.0.0",
-    "@vitest/coverage-istanbul": "^4.1.6",
-    "vitest": "^4.0.16"
+    "@vitest/coverage-istanbul": "4.1.6",
+    "vitest": "4.1.6"
   },
   "engines": {
     "node": ">=18"

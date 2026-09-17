@@ -1,10 +1,10 @@
 "use strict";
 
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createRequire } from 'module';
-
-const require = createRequire(import.meta.url);
-const { handleRequest } = require("./handler");
+// Imported through Vitest rather than createRequire(): a native require() bypasses Vite's
+// transform, so istanbul never instruments handler.js and coverage reports 0% even though
+// these tests do exercise it.
+import { handleRequest } from "./handler";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -111,5 +111,94 @@ describe("/validate/<site_key> (reCAPTCHA v2 verification)", () => {
     expect(options.method).toBe("POST");
     expect(options.body).toContain("response=my-token");
     expect(options.body).toContain("secret=test-secret");
+  });
+});
+
+describe("debug logging", () => {
+  // handler.js gates four console.log calls behind `debugging_enabled`. Without a test that
+  // turns it on, those branches never execute - which is what held branch coverage at 60%.
+  afterEach(() => {
+    delete globalThis.__CHEQ_TEST_DEBUG__;
+  });
+
+  test("logs the verify flow when debugging_enabled is true", async () => {
+    globalThis.__CHEQ_TEST_DEBUG__ = "true";
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({ status: 200, json: async () => ({ success: true }) });
+
+    const res = await handleRequest(
+      makeRequest("/validate/my-site-key", {
+        body: "g-recaptcha-response=valid-token",
+        headers: { origurl: "/protected-page" },
+      })
+    );
+
+    expect(res.status).toBe(302);
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join(" | ");
+    expect(logged).toContain("token_present=true");
+    expect(logged).toContain("siteverify_status=200");
+    expect(logged).toContain("result=success");
+    logSpy.mockRestore();
+  });
+
+  test("logs the failure path when debugging_enabled is true", async () => {
+    globalThis.__CHEQ_TEST_DEBUG__ = "true";
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({ status: 200, json: async () => ({ success: false, "error-codes": ["invalid-input-response"] }) });
+
+    const res = await handleRequest(
+      makeRequest("/validate/my-site-key", { body: "g-recaptcha-response=bad-token" })
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("captchaFail")).toBe("1");
+    const logged = logSpy.mock.calls.map((c) => String(c[0])).join(" | ");
+    expect(logged).toContain("result=failure");
+    expect(logged).toContain("invalid-input-response");
+    logSpy.mockRestore();
+  });
+
+  test("stays silent when debugging_enabled is not set", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    fetchMock.mockResolvedValueOnce({ status: 200, json: async () => ({ success: true }) });
+
+    await handleRequest(
+      makeRequest("/validate/my-site-key", { body: "g-recaptcha-response=valid-token" })
+    );
+
+    expect(logSpy).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+});
+
+describe("missing inputs", () => {
+  afterEach(() => {
+    delete globalThis.__CHEQ_TEST_SECRET__;
+  });
+
+  test("treats a body with no g-recaptcha-response as an empty token", async () => {
+    fetchMock.mockResolvedValueOnce({ status: 200, json: async () => ({ success: false }) });
+
+    const res = await handleRequest(
+      makeRequest("/validate/my-site-key", { body: "some-other-field=x" })
+    );
+
+    // Empty token is still sent to Google, which rejects it -> captchaFail, not a crash
+    expect(res.status).toBe(200);
+    expect(res.headers.get("captchaFail")).toBe("1");
+    expect(String(fetchMock.mock.calls[0][1].body)).toContain("response=");
+  });
+
+  test("still calls siteverify when the config store has no secret", async () => {
+    globalThis.__CHEQ_TEST_SECRET__ = "";
+    fetchMock.mockResolvedValueOnce({ status: 200, json: async () => ({ success: false }) });
+
+    const res = await handleRequest(
+      makeRequest("/validate/my-site-key", { body: "g-recaptcha-response=tok" })
+    );
+
+    // Google rejects a blank secret; the handler must surface that as captchaFail rather than throw
+    expect(res.status).toBe(200);
+    expect(String(fetchMock.mock.calls[0][1].body)).toContain("secret=&");
   });
 });

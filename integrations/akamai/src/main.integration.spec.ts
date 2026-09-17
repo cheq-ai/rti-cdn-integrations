@@ -27,7 +27,7 @@ const { mockCallRTI, integrationConfig } = vi.hoisted(() => {
     return { mockCallRTI, integrationConfig };
 });
 
-vi.mock('log', () => ({ log: { log: vi.fn() } }));
+vi.mock('log', () => ({ logger: { log: vi.fn() } }));
 
 vi.mock('./config', () => ({
     config: integrationConfig,
@@ -42,7 +42,7 @@ vi.mock('./rti-service', () => ({ callRTI: mockCallRTI }));
 vi.mock('./rti-logger', () => ({ logToRTI: vi.fn() }));
 
 vi.mock('../../core/helpers/block-page-helpers', () => ({
-    generateDefaultBlockPage: vi.fn().mockReturnValue('<html>blocked</html>'),
+    generateCompactBlockPage: vi.fn().mockReturnValue('<html>blocked</html>'),
 }));
 
 import { onClientRequest } from './main';

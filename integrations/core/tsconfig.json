@@ -1,11 +1,24 @@
 {
   "compilerOptions": {
-    "target": "es2020",
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
     "strict": true,
-    "moduleResolution": "node",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["vitest", "node"]
   },
-  "exclude": ["node_modules"]
+  "include": [
+    "helpers/**/*.ts",
+    "models/**/*.ts",
+    "services/**/*.ts",
+    "testing/**/*.ts",
+    "vitest.config.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
 }

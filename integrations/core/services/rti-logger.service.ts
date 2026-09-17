@@ -1,5 +1,5 @@
 // Standard RTI logger using the Fetch API — suitable for runtimes that support it
-// (Cloudflare Workers, CloudFront@Edge, Node.js, browsers).
+// (fetch-capable edge runtimes, Node.js, browsers).
 // Akamai EdgeWorkers do NOT have fetch() — see integrations/akamai/src/rti-logger.ts
 // for the Akamai-specific implementation that uses httpRequest instead.
 import { IRTILogger } from "../models/rti-logger.interface";

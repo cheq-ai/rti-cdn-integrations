@@ -13,9 +13,9 @@
   "devDependencies": {
     "@types/aws-lambda": "^8.10.92",
     "@types/node": "^20.0.0",
-    "@vitest/coverage-istanbul": "^4.1.6",
+    "@vitest/coverage-istanbul": "4.1.6",
     "prettier": "^2.5.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.16"
+    "vitest": "4.1.6"
   }
 }

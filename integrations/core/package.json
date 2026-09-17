@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "test": "vitest --reporter=verbose --watch false",
+    "test": "tsc --noEmit && vitest --reporter=verbose --watch false",
     "coverage": "vitest run --coverage --coverage.provider=istanbul"
   },
   "devDependencies": {
-    "@vitest/coverage-istanbul": "^4.1.6",
-    "vitest": "^4.0.16"
+    "@types/node": "^26.2.0",
+    "@vitest/coverage-istanbul": "4.1.6",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.6"
   }
 }

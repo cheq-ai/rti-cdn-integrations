@@ -722,12 +722,13 @@ describe('RTIHelperService', () => {
   describe('buildRtiResultHeader', () => {
     const svc = new RTIHelperService({} as any);
 
-    function buildResponse(overrides: { verdict?: string; code?: number; version?: string; ids?: any } = {}) {
+    function buildResponse(overrides: { verdict?: string; code?: number; version?: string; ids?: any; reasons?: number[]; ruleName?: string | null } = {}) {
       return {
         metadata: { version: overrides.version ?? '4.1' },
-        decision: { verdict: overrides.verdict ?? 'benign' },
+        decision: { verdict: overrides.verdict ?? 'benign', ruleName: overrides.ruleName ?? null },
         classification: { code: overrides.code ?? 0 },
         ids: overrides.ids ?? { rayId: 'ray-1', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam2: null },
+        cheqDetection: { reasons: overrides.reasons ?? [] },
       } as any;
     }
 
@@ -793,6 +794,87 @@ describe('RTIHelperService', () => {
 
       // Assert
       expect(result).toBe(`version=4.1;verdict=malicious;threat-type-code=6;ids=${JSON.stringify(ids)}`);
+    });
+
+    // --- includeDebugData: appends reasons + rule-name (Akamai opt-in) ---
+
+    const CR = String.fromCharCode(13);
+    const LF = String.fromCharCode(10);
+
+    test('omits debug data by default even when reasons and ruleName are present', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2], ruleName: 'Suspicious UA' }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('appends reasons and rule-name when includeDebugData is true', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2, 3], ruleName: 'Suspicious UA' }), true);
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)};reasons=1,2,3;rule-name=Suspicious UA`);
+    });
+
+    test('emits an empty reasons value when the reasons array is empty', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [], ruleName: 'Rule A' }), true);
+
+      // Assert
+      expect(result).toContain(';reasons=;rule-name=Rule A');
+    });
+
+    test('emits an empty rule-name when ruleName is null', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [7], ruleName: null }), true);
+
+      // Assert
+      expect(result).toContain(';reasons=7;rule-name=');
+    });
+
+    test('replaces semicolons in ruleName so they cannot split the header', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: 'block;allow' }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=block,allow');
+    });
+
+    test('strips CR and LF from ruleName to prevent header injection', () => {
+      // Arrange
+      const ruleName = 'evil' + CR + LF + 'x-injected: 1';
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=evilx-injected: 1');
+      expect(result).not.toContain(CR);
+      expect(result).not.toContain(LF);
+    });
+
+    test('strips non-printable and non-ASCII characters from ruleName', () => {
+      // Arrange - e-acute (233) is non-ASCII, BEL (7) is a control character
+      const ruleName = 'caf' + String.fromCharCode(233) + String.fromCharCode(7) + 'rule';
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=cafrule');
+    });
+
+    test('truncates ruleName at 128 characters', () => {
+      // Arrange
+      const longName = 'a'.repeat(200);
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: longName }), true);
+
+      // Assert
+      expect(result).toContain(`;rule-name=${'a'.repeat(128)}`);
+      expect(result).not.toContain('a'.repeat(129));
     });
   });
   // #endregion buildRtiResultHeader Method Tests

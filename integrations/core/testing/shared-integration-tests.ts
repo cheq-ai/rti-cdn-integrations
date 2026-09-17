@@ -254,6 +254,145 @@ export function registerSharedIntegrationTests(
 
         //#endregion Redirect tests
 
+
+        //#region Challenge (suspicious verdict) tests
+
+        // These exercise the CHALLENGE branch of the REAL getAction end to end. Deliberately
+        // driven through non-CAPTCHA challengingStrategy values so the assertions hold for every
+        // CDN regardless of whether that CDN wires a challenge callback: what is under test is
+        // that a suspicious verdict reaches CHALLENGE at all, not which page a challenge renders.
+        //
+        // Before these existed, changing getAction so `suspicious` returned ALLOW passed every
+        // CDN suite - only core's own unit tests noticed. That is the gap they close.
+
+        it('returns 403 on suspicious verdict when challengingStrategy is ACCESS_DENIED', async () => {
+            // Arrange
+            setConfig({ ...BASE_CONFIG, challengingStrategy: ActionStrategy.ACCESS_DENIED });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'suspicious' }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(403);
+            expect(result.passedThrough).toBe(false);
+            expect(result.headers['x-cheq-rti-result']).toBeUndefined();
+        });
+
+        it('returns 404 on suspicious verdict when challengingStrategy is NOT_FOUND', async () => {
+            // Arrange
+            setConfig({ ...BASE_CONFIG, challengingStrategy: ActionStrategy.NOT_FOUND });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'suspicious' }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(404);
+            expect(result.passedThrough).toBe(false);
+        });
+
+        it('returns 302 on suspicious verdict when challengingStrategy is REDIRECT', async () => {
+            // Arrange
+            setConfig({
+                ...BASE_CONFIG,
+                challengingStrategy: ActionStrategy.REDIRECT,
+                redirectLocation: 'https://example.com/blocked',
+            });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'suspicious' }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(302);
+            expect(result.headers['location']).toBe('https://example.com/blocked');
+            expect(result.passedThrough).toBe(false);
+        });
+
+        it('routes a benign verdict to CHALLENGE when its code is in challengeTTCodes', async () => {
+            // Arrange - proves the challenge code list drives CHALLENGE, not just the verdict
+            setConfig({
+                ...BASE_CONFIG,
+                challengeTTCodes: [42],
+                challengingStrategy: ActionStrategy.ACCESS_DENIED,
+            });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'benign', code: 42 }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(403);
+            expect(result.passedThrough).toBe(false);
+        });
+
+        it('routes a benign verdict to CHALLENGE when a reason is in challengeReasons', async () => {
+            // Arrange
+            setConfig({
+                ...BASE_CONFIG,
+                challengeReasons: [-3005],
+                challengingStrategy: ActionStrategy.ACCESS_DENIED,
+            });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'benign', reasons: [-3005] }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(403);
+            expect(result.passedThrough).toBe(false);
+        });
+
+        it('block wins when a code is in both blockTTCodes and challengeTTCodes', async () => {
+            // Arrange - pins the documented priority: BLOCK is evaluated before CHALLENGE.
+            // If the order is ever reversed this returns 404 (the challenge strategy) instead.
+            setConfig({
+                ...BASE_CONFIG,
+                blockTTCodes: [7],
+                challengeTTCodes: [7],
+                blockingStrategy: ActionStrategy.ACCESS_DENIED,
+                challengingStrategy: ActionStrategy.NOT_FOUND,
+            });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'benign', code: 7 }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(403);
+        });
+
+        it('malicious still blocks when blockTTCodes is set but does not match', async () => {
+            // Arrange - pins that blockTTCodes ADDS codes rather than filtering malicious down to
+            // only those codes. The rejected upstream variant allowed this request through.
+            setConfig({ ...BASE_CONFIG, blockTTCodes: [4, 5] });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'malicious', code: 99 }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.status).toBe(403);
+            expect(result.passedThrough).toBe(false);
+        });
+
+        it('passes through on suspicious verdict in MONITORING mode', async () => {
+            // Arrange
+            setConfig({ ...BASE_CONFIG, mode: Mode.MONITORING, challengingStrategy: ActionStrategy.ACCESS_DENIED });
+            adapter.setRtiResponse(buildRTIResponse({ verdict: 'suspicious' }));
+
+            // Act
+            const result = await adapter.invoke();
+
+            // Assert
+            expect(result.passedThrough).toBe(true);
+            expect(result.status).toBe(200);
+            expect(result.headers['x-cheq-rti-result']).toContain('verdict=suspicious');
+        });
+
+        //#endregion Challenge (suspicious verdict) tests
+
         //#region Ignore paths tests
 
         it('passes through without calling RTI when path matches ignorePaths', async () => {
