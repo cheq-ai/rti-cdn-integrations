@@ -189,17 +189,63 @@ export class RTIHelperService {
   }
 
   /**
-   * Builds the `x-cheq-rti-result` header value from an RTI response.
-   * Format: `version=X;verdict=Y;threat-type-code=Z;ids={...}`
-   * @param rtiResponse the RTI response object
+   * Maximum length of the `rule-name` field. Rule names are operator-defined free text
+   * with no length bound, and the whole header shares the CDN's header size budget.
    */
-  buildRtiResultHeader(rtiResponse: RTIResponse): string {
-    return [
+  private static readonly RULE_NAME_MAX_LENGTH = 128;
+
+  /**
+   * Makes a rule name safe to carry inside a `;`-delimited header value.
+   *
+   * `decision.ruleName` is operator-defined free text, so it can contain anything:
+   * - CR/LF is a header-injection vector. Cloudflare's `Headers.set` throws on it, but
+   *   Akamai's `setHeader` and CloudFront's header array do not - dropped here along
+   *   with every other control and non-ASCII character.
+   * - a literal `;` would split the field and desync any parser - mapped to `,`.
+   * - unbounded length - truncated to {@link RULE_NAME_MAX_LENGTH}.
+   *
+   * `=` is deliberately left alone: `rule-name` is the last field, and parsers split on
+   * `;` first and then on the FIRST `=`, so an embedded `=` stays inside the value.
+   *
+   * @param ruleName raw {@link Decision.ruleName}, which is `null` when no rule matched
+   * @returns printable-ASCII, delimiter-free, length-capped text (`''` when absent)
+   */
+  private static sanitizeRuleName(ruleName: string | null): string {
+    if (!ruleName) {
+      return '';
+    }
+    return ruleName
+      .replace(/[^\x20-\x7E]/g, '')
+      .replace(/;/g, ',')
+      .substring(0, RTIHelperService.RULE_NAME_MAX_LENGTH);
+  }
+
+  /**
+   * Builds the `x-cheq-rti-result` header value from an RTI response.
+   *
+   * Format: `version=X;verdict=Y;threat-type-code=Z;ids={...}`
+   * With `includeDebugData`: `...;ids={...};reasons=N,N,N;rule-name=S`
+   *
+   * @param rtiResponse the RTI response object
+   * @param includeDebugData appends the detection reason codes and the name of the rule
+   *   that produced the verdict. Off by default, so every caller that omits it gets a
+   *   byte-for-byte unchanged header. Only the Akamai integration opts in, per request
+   *   via the `PMUSER_CHEQ_RTI_DEBUG_DATA` property variable.
+   */
+  buildRtiResultHeader(rtiResponse: RTIResponse, includeDebugData = false): string {
+    const parts = [
       `version=${rtiResponse.metadata.version}`,
       `verdict=${rtiResponse.decision.verdict}`,
       `threat-type-code=${rtiResponse.classification.code}`,
       `ids=${JSON.stringify(rtiResponse.ids)}`,
-    ].join(';');
+    ];
+
+    if (includeDebugData) {
+      parts.push(`reasons=${rtiResponse.cheqDetection.reasons.join(',')}`);
+      parts.push(`rule-name=${RTIHelperService.sanitizeRuleName(rtiResponse.decision.ruleName)}`);
+    }
+
+    return parts.join(';');
   }
 
   /**

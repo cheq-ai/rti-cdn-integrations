@@ -3,7 +3,7 @@
         "target": "es2021",
         "lib": ["es2021", "dom"],
         "module": "es2022",
-        "moduleResolution": "node",
+        "moduleResolution": "bundler",
         "resolveJsonModule": true,
         "allowJs": true,
         "checkJs": false,
@@ -13,8 +13,15 @@
         "forceConsistentCasingInFileNames": true,
         "strict": true,
         "skipLibCheck": true,
-        "types": ["vitest"]
+        // "node" is required by the challenge specs, which use Buffer.byteLength to assert that
+        // the interstitial pages stay under Akamai's 2048-byte respondWith limit. Specs are
+        // type-checked here (we do NOT exclude **/*.spec.ts), so the Node types must be present.
+        "types": ["vitest", "node"]
     },
-    "include": ["src/**/*.ts", "../core/**/*.ts"],
-    "exclude": ["../core/**/*.test.ts", "src/**/*.test.ts"]
+    "include": ["src/**/*.ts", "../core/helpers/**/*.ts", "../core/models/**/*.ts", "../core/services/**/*.ts", "../core/testing/**/*.ts"],
+    "exclude": [
+        "node_modules",
+        "dist",
+        "../core/**/*.spec.ts"
+    ]
 }

@@ -150,3 +150,7 @@ integrations/cloudflare/.wrangler
 # Fastly Compute build artifacts
 integrations/fastly/compute/bin/
 integrations/fastly/compute/pkg/
+
+# Akamai
+# Todo: Remove this when the example is complete and added to the repo.
+integrations/akamai/example/ 

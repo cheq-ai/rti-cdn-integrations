@@ -11,7 +11,7 @@ vi.mock('http-request', () => ({
 }));
 
 vi.mock('log', () => ({
-    log: { log: mocks.logLog },
+    logger: { log: mocks.logLog },
 }));
 
 import { logToRTI } from './rti-logger';

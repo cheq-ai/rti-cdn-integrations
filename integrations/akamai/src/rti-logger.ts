@@ -5,7 +5,7 @@
 // See integrations/core/services/rti-logger.service.ts for the standard fetch()-based implementation
 // used by all other integrations.
 import { httpRequest } from 'http-request';
-import { log } from 'log';
+import { logger as log } from 'log';
 
 export async function logToRTI(
     level: 'info' | 'error',

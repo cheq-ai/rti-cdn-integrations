@@ -1,6 +1,6 @@
 # CHEQ RTI – Fastly VCL Integration
 
-This integration intercepts every request at the Fastly edge, sends it to the **CHEQ Real-Time Intelligence (RTI)** service for bot and malicious traffic detection, and takes the appropriate action before the request ever reaches your origin server.
+This integration intercepts every request at the Fastly edge, sends it to the **CHEQ Real-Time Interception (RTI)** service for bot and malicious traffic detection, and takes the appropriate action before the request ever reaches your origin server.
 
 ---
 

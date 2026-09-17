@@ -574,12 +574,12 @@ CloudFront Event
 When a request is **allowed**, this header is injected before forwarding to origin:
 
 ```
-x-cheq-rti-result: version={v};verdict={v};threat-type-code={n};ids={json};reasons={n,n,...}
+x-cheq-rti-result: version={v};verdict={v};threat-type-code={n};ids={json}
 ```
 
 Example:
 ```
-x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":"abc123",...};reasons=
+x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":"abc123",...}
 ```
 
 Your origin server can read this header for logging, analytics, or additional business logic.

@@ -13,6 +13,7 @@
  *   rayId:      'ray-123'
  *   pageViewId: null
  *   reasons:    []        — empty, no reason-based actions triggered
+ *   ruleName:   null      — no rule matched
  *   all other ids fields: null
  *
  * ## Usage examples
@@ -31,6 +32,7 @@ export function buildRTIResponse(overrides: Partial<{
     code: number;
     version: string;
     reasons: number[];
+    ruleName: string | null;
 }> = {}): Partial<RTIResponse> {
     const ids: Ids = {
         rayId: overrides.rayId ?? 'ray-123',
@@ -44,7 +46,7 @@ export function buildRTIResponse(overrides: Partial<{
     };
     return {
         metadata: { version: overrides.version ?? '4.1' } as any,
-        decision: { verdict: overrides.verdict ?? 'benign' } as any,
+        decision: { verdict: overrides.verdict ?? 'benign', ruleName: overrides.ruleName ?? null } as any,
         classification: { code: overrides.code ?? 0 } as any,
         ids,
         cheqDetection: { reasons: overrides.reasons ?? [] } as any,

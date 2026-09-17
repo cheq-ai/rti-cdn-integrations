@@ -15,7 +15,8 @@ declare module 'http-request' {
     export interface HttpResponse {
         status: number;
         ok: boolean;
-        getHeader(name: string): string[];
+        // Returns undefined (NOT an empty array) when the header is absent - never index unguarded.
+        getHeader(name: string): string[] | undefined;
         getHeaders(): Record<string, string[]>;
         text(): Promise<string>;
         json(): Promise<unknown>;
@@ -25,7 +26,8 @@ declare module 'http-request' {
 }
 
 declare module 'log' {
-    export const log: {
+    // Akamai's built-in log module exports `logger` (not `log`).
+    export const logger: {
         log(...args: unknown[]): void;
         error(...args: unknown[]): void;
     };
@@ -70,7 +72,8 @@ interface EWRequest {
         timezone?: string;
     };
 
-    getHeader(name: string): string[];
+    // Returns undefined (NOT an empty array) when the header is absent - never index unguarded.
+    getHeader(name: string): string[] | undefined;
     getHeaders(): Record<string, string[]>;
     setHeader(name: string, value: string): void;
     addHeader(name: string, value: string): void;
@@ -85,8 +88,47 @@ interface EWRequest {
 // Akamai EdgeWorker response object
 interface EWResponse {
     status: number;
-    getHeader(name: string): string[];
+    // Returns undefined (NOT an empty array) when the header is absent - never index unguarded.
+    getHeader(name: string): string[] | undefined;
     setHeader(name: string, value: string): void;
     addHeader(name: string, value: string): void;
     removeHeader(name: string): void;
+}
+
+// Akamai exposes Web Crypto as a MODULE export, never as a global. Used bare, `crypto.subtle`
+// still compiles - tsconfig includes the "dom" lib, so the compiler believes every browser
+// global exists - and then throws ReferenceError on the edge. Declaring it here means the
+// import is the only spelling that type-checks.
+declare module 'crypto' {
+    export const crypto: {
+        subtle: {
+            digest(algorithm: string, data: Uint8Array): Promise<ArrayBuffer>;
+        };
+        getRandomValues<T extends ArrayBufferView>(array: T): T;
+    };
+}
+
+// TextEncoder/TextDecoder are module exports too. Note this is the `encoding` module - 
+// `text-encode-transform` provides only the TextEncoderStream/TextDecoderStream variants.
+declare module 'encoding' {
+    export class TextEncoder {
+        encode(input?: string): Uint8Array;
+    }
+    export class TextDecoder {
+        constructor(label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean });
+        decode(input?: ArrayBufferView | ArrayBuffer): string;
+    }
+}
+
+// Default export, not a named one: `import URLSearchParams from 'url-search-params'`.
+declare module 'url-search-params' {
+    export default class URLSearchParams {
+        constructor(init?: string | Record<string, string> | string[][]);
+        get(name: string): string | null;
+        set(name: string, value: string): void;
+        append(name: string, value: string): void;
+        has(name: string): boolean;
+        delete(name: string): void;
+        toString(): string;
+    }
 }
