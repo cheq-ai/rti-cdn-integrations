@@ -29,14 +29,14 @@ vi.mock('../package.json', () => ({ name: 'test', version: '1.0.0' }));
 
 vi.mock('./config', () => ({ config: integrationConfig }));
 
-// Mock only the network boundary — RTIService.callRTI.
+// Mock only the network boundary — RTIHttpsService.callRTI.
 // RTIHelperService is NOT mocked, so real decision logic runs.
-vi.mock('../../core/services/rti.service', () => ({
-    RTIService: vi.fn().mockImplementation(function () { return { callRTI: mockCallRTI }; }),
+vi.mock('../../core/services/rti-https.service', () => ({
+    RTIHttpsService: vi.fn().mockImplementation(function () { return { callRTI: mockCallRTI }; }),
 }));
 
-vi.mock('../../core/services/rti-logger.service', () => ({
-    RTILoggerService: vi.fn().mockImplementation(function () {
+vi.mock('../../core/services/rti-https-logger.service', () => ({
+    RTIHttpsLoggerService: vi.fn().mockImplementation(function () {
         return { info: vi.fn().mockResolvedValue(undefined), error: vi.fn().mockResolvedValue(undefined) };
     }),
 }));

@@ -265,8 +265,14 @@ sub cheq_rti_session_generate {
     set var.sig     = regsub(digest.hmac_sha256(var.api_key, var.message), "^0x", "");
     set var.token   = var.ts "." var.sig;
 
+    # SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+    # (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+    # the browser does not send the cookie on that request, so the session is never seen
+    # and the visitor is challenged again on every arrival from outside. Lax sends the
+    # cookie on top-level GET navigations but still withholds it from cross-site
+    # subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
     set req.http.X-Cheq-Session-Cookie = "cq_session_token=" var.token
-        "; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=" std.itoa(var.ttl_seconds);
+        "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=" std.itoa(var.ttl_seconds);
 }
 
 

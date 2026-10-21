@@ -1,15 +1,18 @@
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import { RTIService } from "./rti.service";
 
+// Tests replace the global fetch; put Node's real one back after each test.
+const realFetch = globalThis.fetch;
+
 describe("RTIService", () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    delete (globalThis as any).fetch;
+    (globalThis as any).fetch = realFetch;
   });
 
   describe('constructor', () => {
     test('uses rtiServiceURI from config when provided', async () => {
-      const fakeResponse: any = { status: 200, json: async () => ({}) };
+      const fakeResponse: any = { status: 200, text: async () => '{}' };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const svc = new RTIService({ rtiServiceURI: 'https://custom.example.com' } as any);
@@ -20,7 +23,7 @@ describe("RTIService", () => {
     });
 
     test('falls back to default RTI URL when rtiServiceURI is not configured', async () => {
-      const fakeResponse: any = { status: 200, json: async () => ({}) };
+      const fakeResponse: any = { status: 200, text: async () => '{}' };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const svc = new RTIService({} as any);
@@ -31,26 +34,36 @@ describe("RTIService", () => {
     });
 
     test('uses timeout from config when provided', async () => {
-      const fakeResponse: any = { status: 200, json: async () => ({}) };
-      (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
+      (globalThis as any).fetch = vi.fn().mockResolvedValue({ status: 200, text: async () => '{}' });
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
 
-      // Verify construction doesn't throw with explicit timeout
-      const svc = new RTIService({ timeout: 5000 } as any);
-      await expect(svc.callRTI({} as any)).resolves.toBeDefined();
+      await new RTIService({ timeout: 5000 } as any, 900).callRTI({} as any);
+
+      expect(timeoutSpy).toHaveBeenCalledWith(5000);
     });
 
     test('defaults timeout to 150 when not configured', async () => {
-      const fakeResponse: any = { status: 200, json: async () => ({}) };
-      (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
+      (globalThis as any).fetch = vi.fn().mockResolvedValue({ status: 200, text: async () => '{}' });
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
 
-      const svc = new RTIService({} as any);
-      await expect(svc.callRTI({} as any)).resolves.toBeDefined();
+      await new RTIService({} as any).callRTI({} as any);
+
+      expect(timeoutSpy).toHaveBeenCalledWith(150);
+    });
+
+    test('uses the defaultTimeout ctor parameter when config.timeout is not set', async () => {
+      (globalThis as any).fetch = vi.fn().mockResolvedValue({ status: 200, text: async () => '{}' });
+      const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+
+      await new RTIService({} as any, 900).callRTI({} as any);
+
+      expect(timeoutSpy).toHaveBeenCalledWith(900);
     });
   });
 
   describe('callRTI', () => {
     test('sends POST with correct headers and serialized body', async () => {
-      const fakeResponse: any = { status: 200, json: async () => ({}) };
+      const fakeResponse: any = { status: 200, text: async () => '{}' };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const payload = { tagHash: 'th', apiKey: 'ak' } as any;
@@ -65,7 +78,7 @@ describe("RTIService", () => {
 
     test('returns parsed JSON on 200 response', async () => {
       const fakeBody = { decision: { verdict: 'benign' }, metadata: { version: '1' }, classification: { code: 0 }, ids: [] };
-      const fakeResponse: any = { status: 200, json: async () => fakeBody };
+      const fakeResponse: any = { status: 200, text: async () => JSON.stringify(fakeBody) };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const svc = new RTIService({ timeout: 1000, rtiServiceURI: 'https://example.com' } as any);
@@ -76,7 +89,7 @@ describe("RTIService", () => {
 
     test('returns parsed JSON on 399 response (just below error boundary)', async () => {
       const fakeBody = { decision: { verdict: 'benign' }, classification: { code: 0 }, ids: [] };
-      const fakeResponse: any = { status: 399, json: async () => fakeBody };
+      const fakeResponse: any = { status: 399, text: async () => JSON.stringify(fakeBody) };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const svc = new RTIService({ rtiServiceURI: 'https://example.com' } as any);
@@ -114,7 +127,7 @@ describe("RTIService", () => {
     });
 
     test('wraps malformed JSON response with "request error:" prefix', async () => {
-      const fakeResponse: any = { status: 200, json: async () => { throw new SyntaxError('Unexpected token'); } };
+      const fakeResponse: any = { status: 200, text: async () => 'not json' };
       (globalThis as any).fetch = vi.fn().mockResolvedValue(fakeResponse);
 
       const svc = new RTIService({ rtiServiceURI: 'https://example.com' } as any);

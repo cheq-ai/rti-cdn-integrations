@@ -160,6 +160,7 @@ const respondState: { last: { status: number; headers: Record<string, string>; b
 
 const akamaiAdapter: TestAdapter = {
     name: 'akamai edgeworker',
+    validChallengeSkipsRti: true,
 
     // invoke() always injects PMUSER_CHEQ_USE_DYNAMIC_CONFIG so that setConfig overrides (via buildDynamicConfig)
     // take effect on every invocation. Static config is tested in separate describe blocks below.

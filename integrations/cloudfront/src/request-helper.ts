@@ -1,8 +1,8 @@
 // cspell:ignore cheq
 import { CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
 import { config } from './config';
-import { RTILoggerService } from "../../core/services/rti-logger.service";
-import { RTIService } from "../../core/services/rti.service";
+import { RTIHttpsLoggerService } from "../../core/services/rti-https-logger.service";
+import { RTIHttpsService } from "../../core/services/rti-https.service";
 import { RTIHelperService } from "../../core/services/rti-helper.service";
 import { name, version } from "../package.json";
 import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
@@ -17,9 +17,9 @@ export enum RequestType {
   ORIGIN_REQUEST,
 }
 
-const logger = new RTILoggerService(`${name}-${version}`, config);
+const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
-const rtiService = new RTIService(config);
+const rtiService = new RTIHttpsService(config);
 
 export const handle = async (event: CloudFrontRequestEvent, requestType: RequestType): Promise<CloudFrontRequestResult> => {
     //debugger; // Pause for breakpoints when using SAM - remove for production
@@ -36,11 +36,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
     // Would only throw if invoked directly (not via CloudFront), which should not happen in production.
     const cfRequest : CloudFrontRequest = event.Records[0].cf.request;
 
+    // A client must not be able to hand the origin its own verdict: on paths that return without one (ignored
+    // path, RTI error, challenge error) its copy would reach the origin. CloudFront lowercases header names.
+    delete cfRequest.headers["x-cheq-rti-result"];
+
     try {
-        // Filter out ignored paths and already validated challenges and validate challenge if exists
+        // Filter out ignored paths. A valid challenge session does not skip RTI: it is checked only when RTI
+        // asks for a CAPTCHA (below), so the request still gets a verdict and the x-cheq-rti-result header.
         const requestURL = getRequestUrl(cfRequest);
 
-        if (rtiHelperService.shouldIgnore(requestURL.pathname) || await isValidChallenge(cfRequest, isDebugEnabled)) {
+        if (rtiHelperService.shouldIgnore(requestURL.pathname)) {
             return cfRequest;
         }
 
@@ -48,7 +53,8 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         const startRTI = Date.now();
 
         const fetchedHeaders = getHeaders(config.keepHeadersNames, cfRequest.headers);
-        const cookieHeader = cfRequest.headers["cookie"]?.map((kv) => kv.value).join(', ') || "";
+        // Several Cookie headers are joined with "; ", the cookie separator (", " would glue two cookies together).
+        const cookieHeader = cfRequest.headers["cookie"]?.map((kv) => kv.value).join('; ') || "";
         const { duidCookie, pvidCookie, sCookie } = rtiHelperService.parseCookies(cookieHeader);
         let payload: RTIRequest = {
             tagHash: config.tagHash,
@@ -136,7 +142,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                 case ActionStrategy.CAPTCHA:
                     try {
                         if (config.challenge) {
-                            const challengeResult = await config.challenge(cfRequest, rtiResponse);
+                            // A visitor who already solved the challenge (valid _cq_se session) is not challenged
+                            // again: forward with the real verdict. Only the CAPTCHA is waived, never a block,
+                            // 404 or redirect. If validateChallenge throws, the catch below fails open.
+                            if (await isValidChallenge(cfRequest, isDebugEnabled)) {
+                                if (isDebugEnabled) {
+                                    console.log("valid challenge session, waiving CAPTCHA");
+                                }
+                                break;
+                            }
+                            const challengeResult = await config.challenge(cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
                             return challengeResult;
                         }
                         break;
@@ -144,7 +159,9 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         const err: Error = e as Error;
                         const cfRequestId = getCfRequestId(event);
                         console.error(`Challenge error handling request '${cfRequestId}':`, err);
-                        await logger.error(`Challenge error handling request '${cfRequestId}': ${err.message}`);
+                        if (config.logErrors !== false) {
+                            await logger.error(`Challenge error handling request '${cfRequestId}': ${err.message}`);
+                        }
                         return cfRequest;
                     }
                 default:
@@ -160,7 +177,9 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         const err: Error = e as Error;
         const cfRequestId = getCfRequestId(event);
         console.error(`Error handling request '${cfRequestId}':`, err);
-        await logger.error(`Error handling request '${cfRequestId}': ${err.message}`);
+        if (config.logErrors !== false) {
+            await logger.error(`Error handling request '${cfRequestId}': ${err.message}`);
+        }
     }
 
     return cfRequest;
@@ -186,7 +205,8 @@ function getRequestUrl(cfRequest : CloudFrontRequest): URL {
 function setHeaders(headers: CloudFrontHeaders, rtiResponse: RTIResponse) {
     // Add RTI result header to the request that will be sent to the origin. 
     // This can be used by the origin for debugging, logging, or making decisions based on the RTI result.
-    // Note: The only way to see this header in the browser is to have the origin echo it back in the response headers, so basically we will never see this header in the browser, only in CloudWatch.
+    // On the request to the origin it is only visible in the browser if the origin echoes it back. It is also passed to
+    // config.challenge as addRtiResultHeader: the Turnstile example adds it to the 302 after a solved challenge, which the browser does see.
 
     headers["x-cheq-rti-result"] = [{ key: 'x-cheq-rti-result', value: rtiHelperService.buildRtiResultHeader(rtiResponse) }];
 }
