@@ -570,7 +570,7 @@ The `_cq_se` session cookie is not being set or sent on subsequent requests. Ver
 - The reCAPTCHA verify host (`PMUSER_CHEQ_RECAPTCHA_HOST`, or `PMUSER_CHEQ_RTI_HOST`) is an Akamai-proxied hostname carrying the `/recaptcha/*` rule (EdgeWorkers cannot reach external hosts directly)
 - `PMUSER_CHEQ_CHALLENGE_SECRET` has not changed between issuing and validating - rotating it invalidates every live session cookie
 - `Path=/` is correct for your URL structure
-- `SameSite` may block the cookie on cross-site navigation
+- The cookie is `SameSite=Lax`, not `Strict`. With `Strict` the browser drops `_cq_se` when the visitor arrives from another site (link, ad, redirect), so they are challenged again on every external arrival
 
 ### Fail-open behavior
 

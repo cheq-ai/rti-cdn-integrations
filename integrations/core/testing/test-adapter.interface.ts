@@ -10,7 +10,7 @@
  * ## The solution — adapter pattern
  * Each CDN implements `TestAdapter`, which translates its native format into the common
  * `NormalizedResult` shape. `registerSharedBehaviorTests` then drives all CDNs through the
- * same 39 tests without knowing any CDN-specific details.
+ * same 49 tests (3 only where `validChallengeSkipsRti` is true) without knowing any CDN-specific details.
  *
  * ## What is mocked vs real
  * CDN adapters mock the core service methods via `SharedMocks` (callRTI, shouldIgnore,
@@ -18,7 +18,7 @@
  * precisely. `parseCookies` and `buildRtiResultHeader` are intentionally left as real
  * implementations so tests verify actual output, not duplicated mock formulas.
  *
- * @see registerSharedBehaviorTests in ./shared-behavior-tests.ts
+ * @see registerSharedBehaviorTests in ./shared-unit-tests.ts
  * @see IntegrationTestAdapter in ./integration-test-adapter.interface.ts for the richer
  *      variant used when the real RTIHelperService decision logic should run end-to-end.
  */
@@ -64,8 +64,8 @@ export interface ConfigOverrides {
  *  Each CDN adapter wires these into its vi.mock() factory so the same mock instances
  *  are shared between the adapter and the test suite.
  *
- *  `loggerError` and `loggerInfo` are the RTI logger mock handles. For Cloudflare and
- *  CloudFront these come from the `RTILoggerService` mock (`logger.error` / `logger.info`).
+ *  `loggerError` and `loggerInfo` are the RTI logger mock handles. For Cloudflare they come from
+ *  the `RTILoggerService` mock, for CloudFront from the `RTIHttpsLoggerService` mock (`logger.error` / `logger.info`).
  *  For Akamai they come from the `logToRTI` mock (which fills both roles). 
  */
 export interface SharedMocks {
@@ -95,6 +95,13 @@ export interface SharedMocks {
  */
 export interface TestAdapter {
     name: string;
+    /**
+     * true: a valid challenge session (validateChallenge → true) skips RTI and passes the request through
+     * untouched (Cloudflare, Akamai). false: RTI always runs, and a valid session only waives the CAPTCHA
+     * (CloudFront). The shared tests for the old behaviour run only when this is true; CloudFront covers
+     * the new behaviour in its own spec. Flip it when a CDN moves to the new behaviour.
+     */
+    validChallengeSkipsRti: boolean;
     invoke(options?: InvokeOptions): Promise<NormalizedResult>;
     getLastRTIPayload(): any | undefined;
     setConfig(overrides: ConfigOverrides): void;

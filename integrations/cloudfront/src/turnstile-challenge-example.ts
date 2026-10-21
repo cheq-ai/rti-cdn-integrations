@@ -1,15 +1,112 @@
-import { CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult } from "aws-lambda";
+// cspell:ignore cheq siteverify duid unkeyed
+import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult } from "aws-lambda";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { RTIResponse } from "../../core/models/rti-response.model";
+import type { CloudfrontConfig } from "./config";
 
-const turnstileChallengeExample = async (request: CloudFrontRequest, response: RTIResponse): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
-    const turnstileSiteKey = "REPLACE_ME";
-    const turnstileSecret = "REPLACE_ME";
-    const ttl = 300; // 5 minutes
+/** Settings for the example Turnstile challenge, set in config.ts. */
+export interface TurnstileSettings {
+    /** Site key from the Cloudflare Turnstile dashboard. */
+    siteKey: string;
+    /** Secret key from the Turnstile dashboard, sent to Cloudflare's siteverify endpoint. */
+    secretKey: string;
+    /**
+     * Signs the `_cq_se` session cookie so it cannot be forged. NOT the Turnstile secret: any long random
+     * string, e.g. `openssl rand -hex 32`. Changing it invalidates every session (visitors are challenged again).
+     */
+    sessionSigningSecret: string;
+    /** How long a solved challenge is remembered, in seconds. */
+    sessionTtlSeconds: number;
+}
+
+const isPlaceholder = (value: string | undefined): boolean => !value || value.trim() === "" || value.trim() === "REPLACE_ME";
+
+/**
+ * Accepts `original_url` only when it is a same-site absolute path (as Akamai's reCAPTCHA challenge does).
+ * It arrives as a query parameter, so any link can carry any value. Reflected into `Location` it would turn a
+ * PASSED challenge into an open redirect: a strong phishing tool, since the victim really did just prove they
+ * are human on the genuine site. `//host` and `/\host` are rejected too: browsers read both as protocol-relative.
+ * Returns undefined so the caller falls back to the request URI.
+ */
+function safeReturnPath(raw: string | null | undefined): string | undefined {
+    if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) {
+        return undefined;
+    }
+    return raw;
+}
+
+const DEFAULT_SESSION_TTL_SECONDS = 300;
+
+// Escapes a value for an HTML text node or a quoted attribute. Every value put into the challenge page goes
+// through it: the URI comes from the client, and a raw `"` there would otherwise close the attribute and
+// let the rest of the URI inject markup or a script on the customer's site.
+const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const escapeHtml = (value: string): string => value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+
+// All cookies of the request. A client (e.g. over HTTP/2) can split them over several Cookie headers.
+const requestCookies = (request: CloudFrontRequest): string[] =>
+    (request.headers["cookie"] ?? []).map(h => h.value).join(";").split(";").map(c => c.trim()).filter(Boolean);
+
+// The value of the cookie `name` (everything after the first "="), or undefined.
+const cookieValue = (cookies: string[], name: string): string | undefined =>
+    cookies.find(c => c.startsWith(`${name}=`))?.substring(name.length + 1);
+
+/**
+ * Signs a challenge session: HMAC-SHA256 over the expiry, rayId and the visitor's `_cq_duid` (empty when the
+ * visitor has none), keyed with `secret`, as 32 hex characters. Without the key nobody can produce a valid
+ * `_cq_se` cookie (the old unkeyed SHA-256 could be computed by anyone), and the duid stops a copied `_cq_se`
+ * from working for another visitor. JSON keeps the fields apart (with "a:b:c", a rayId containing ":" could
+ * absorb the duid).
+ */
+function signSession(secret: string, expiresAt: number, rayId: string, duid: string): string {
+    return createHmac("sha256", secret).update(JSON.stringify(["se", expiresAt, rayId, duid])).digest("hex").slice(0, 32);
+}
+
+/** Checks a session signature in constant time. The secret is never a placeholder: createTurnstileChallenge refuses one. */
+function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, duid: string, signature: string): boolean {
+    const expected = Buffer.from(signSession(secret, expiresAt, rayId, duid));
+    const actual = Buffer.from(signature);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/**
+ * Builds the example `challenge` and `validateChallenge` callbacks from the settings in config.ts.
+ * A factory, not an `import { config }`: config.ts imports this file, so that would be circular.
+ *
+ * Returns `{}` (and warns) while `siteKey`, `secretKey` or `sessionSigningSecret` is unset or `REPLACE_ME`:
+ * the CAPTCHA is then disabled and challenged traffic is forwarded with `x-cheq-rti-result`, instead of
+ * showing a broken widget or issuing sessions anyone could forge.
+ */
+export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge"> {
+    const missing = (["siteKey", "secretKey", "sessionSigningSecret"] as const).filter(k => isPlaceholder(settings[k]));
+    if (missing.length > 0) {
+        console.warn(`[turnstile] CAPTCHA disabled, not configured: ${missing.join(", ")} (set them in config.ts)`);
+        return {};
+    }
+    // A TTL of 0, a negative or fractional number, NaN or a string would issue sessions that are already expired
+    // (every visitor challenged again and again) or a broken Max-Age. Fall back to the default instead.
+    const ttlValid = Number.isInteger(settings.sessionTtlSeconds) && settings.sessionTtlSeconds > 0;
+    if (!ttlValid) {
+        console.warn(`[turnstile] invalid sessionTtlSeconds ${JSON.stringify(settings.sessionTtlSeconds)}, using ${DEFAULT_SESSION_TTL_SECONDS} (set a positive whole number of seconds in config.ts)`);
+    }
+    const resolved: TurnstileSettings = ttlValid ? settings : { ...settings, sessionTtlSeconds: DEFAULT_SESSION_TTL_SECONDS };
+    return {
+        challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, request, response, addRtiResultHeader),
+        validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug),
+    };
+}
+
+const turnstileChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
+    const ttl = settings.sessionTtlSeconds;
     let queryStringData = new URLSearchParams(request.querystring);
+    // "cf-turnstile-response" is not set by this code: once the visitor solves the challenge, the Turnstile
+    // widget (api.js) injects a hidden input with this name into the enclosing <form>. The form submits via GET,
+    // so the token arrives here as a query string parameter. It must still be verified server-side (siteverify below).
     // @ts-ignore
     const token = queryStringData?.get("cf-turnstile-response");
 
     if (!token) {
+        // No token means the visitor has not solved the challenge yet. Return a 403 with the Turnstile widget.
         const html = `<!DOCTYPE html>
                     <html lang="en">
                     <head>
@@ -231,14 +328,13 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
                         <p class="subtitle">
                             Please complete the verification below to confirm you're human and continue to the website.
                         </p>
-                        <form id="captcha-form" action="${request.uri}" method="GET">
-                            <input type="hidden" name="original_url" value="${request.uri}">
-                            <input type="hidden" name="request_id" value="${response.ids.rayId}">
-                            <input type="hidden" name="viewer_host" id="viewer_host" value="">
+                        <form id="captcha-form" action="${escapeHtml(request.uri)}" method="GET">
+                            <input type="hidden" name="original_url" value="${escapeHtml(request.uri)}">
+                            <input type="hidden" name="request_id" value="${escapeHtml(response.ids.rayId)}">
                             
                             <div class="captcha-box">
                             <div class="cf-turnstile" 
-                                data-sitekey="${turnstileSiteKey}"
+                                data-sitekey="${escapeHtml(settings.siteKey)}"
                                 data-callback="onTurnstileSuccess"
                                 data-theme="dark">
                             </div>
@@ -255,7 +351,7 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
                         
                         <div class="ref-box">
                             <div class="ref-label">Session ID</div>
-                            <div class="ref-id">${response.ids.rayId}</div>
+                            <div class="ref-id">${escapeHtml(response.ids.rayId)}</div>
                         </div>
                         </div>
                         
@@ -265,8 +361,6 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
                     </div>
 
                     <script>
-                        document.getElementById('viewer_host').value = window.location.host;
-
                         function onTurnstileSuccess(token) {
                         document.getElementById('submit-btn').disabled = false;
                         }
@@ -288,11 +382,12 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
             body: html,
         };
     } else {
+        // Verify the Turnstile token with Cloudflare's siteverify endpoint
         const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: new URLSearchParams({
-                secret: turnstileSecret,
+                secret: settings.secretKey,
                 response: token,
                 remoteip: request.clientIp,
             }).toString(),
@@ -301,22 +396,35 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
         const result = await verifyResponse.json() as { success: boolean };
         if (result.success) {
             const expiresAt = Date.now() + (ttl * 1000);
-            const data = `${expiresAt}:${response.ids.rayId}`;
-            const encoder = new TextEncoder();
-            const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
-            const hashArray = Array.from(new Uint8Array(hashBuffer));
-            const signature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, "0")).join("");
-            
+            // Bound to this visitor's device id. A visitor with no _cq_duid yet gets a session bound to an empty duid, which stops
+            // working once the CHEQ tag sets the cookie (they are challenged once more, then bound).
+            const duid = cookieValue(requestCookies(request), "_cq_duid") ?? "";
+            const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId, duid);
+
             const sessionToken = `${expiresAt}.${signature}`;
 
-            const host = queryStringData?.get("viewer_host") || request.headers["host"]?.[0]?.value || "";
-            const originalPath = queryStringData?.get("original_url") || request.uri;
+            // Redirect back to where the visitor was, on THIS site. The host comes from the request (CloudFront only
+            // routes hosts of this distribution), never from the query string, and original_url must be a path
+            // (see safeReturnPath). Without a Host header the Location stays relative, which the browser resolves
+            // against the current site.
+            const host = request.headers["host"]?.[0]?.value;
+            const returnPath = safeReturnPath(queryStringData?.get("original_url")) ?? request.uri;
             const headers = {};
             // @ts-ignore
-            headers.location = [{ key: 'Location', value: `https://${host}${originalPath}` }];
+            headers.location = [{ key: 'Location', value: host ? `https://${host}${returnPath}` : returnPath }];
+            // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+            // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+            // the browser does not send _cq_se on that request, so the session is never seen
+            // and the visitor is challenged again on every arrival from outside. Lax sends the
+            // cookie on top-level GET navigations but still withholds it from cross-site
+            // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
             // @ts-ignore
-            headers["set-cookie"] = [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ttl}` }];
-            
+            headers["set-cookie"] = [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}` }];
+            // Adds x-cheq-rti-result (the verdict that triggered the challenge), provided by the handler. This 302 goes
+            // to the BROWSER (not the origin), so the client sees verdict, threat-type-code and ids. The redirected
+            // request is checked by RTI again and gets its own header on the way to the origin.
+            addRtiResultHeader?.(headers);
+
             return {
                 status: '302',
                 headers,
@@ -330,17 +438,17 @@ const turnstileChallengeExample = async (request: CloudFrontRequest, response: R
     }
 };
 
-const turnstileValidateChallengeExample = async (request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
+const turnstileValidateChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
     // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)
-    const cookieHeaderMap = (request.headers["cookie"]?.[0]?.value || "").split(";").map(c => c.trim());
-    const cookieValue = cookieHeaderMap.find(c => c.startsWith("_cq_se="))?.split("=")[1]?.split("|");
-    const [cookieToken, cookieRayId] = cookieValue ?? [];
+    const cookies = requestCookies(request);
+    const [cookieToken, cookieRayId] = cookieValue(cookies, "_cq_se")?.split("|") ?? [];
+    const duid = cookieValue(cookies, "_cq_duid") ?? "";
     const rayId = request.headers["x-cheq-ray-id"]?.[0]?.value || cookieRayId;
     const sessionToken = request.headers["x-cheq-challenge"]?.[0]?.value || cookieToken;
 
     const shouldValidateChallenge = sessionToken && rayId;
     if (isDebug) {
-        console.log(`[validateChallenge] cookie header: ${request.headers["cookie"]?.[0]?.value ?? "NOT PRESENT"}`);
+        console.log(`[validateChallenge] cookies: ${cookies.length > 0 ? cookies.join("; ") : "NOT PRESENT"}`);
         console.log(`[validateChallenge] sessionToken: ${sessionToken ?? "NOT FOUND"}, rayId: ${rayId ?? "NOT FOUND"}, shouldValidateChallenge: ${shouldValidateChallenge ?? "NOTHING_TO_VALIDATE_CALL_RTI"}`);
     }
 
@@ -373,15 +481,9 @@ const turnstileValidateChallengeExample = async (request: CloudFrontRequest, isD
                 return false; 
             }
             
-            // Verify signature
-            const data = `${expiresAt}:${rayId}`;
-            const encoder = new TextEncoder();
-            const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(data));
-            const hashArray = Array.from(new Uint8Array(hashBuffer));
-            const expectedSignature = hashArray.slice(0, 16).map(b => b.toString(16).padStart(2, "0")).join("");
-            
-            const match = signature === expectedSignature;
-            
+            // Verify signature (keyed HMAC, constant-time compare)
+            const match = isValidSessionSignature(settings.sessionSigningSecret, expiresAt, rayId, duid, signature);
+
             if (isDebug) {
                 console.log(`[validateChallenge] signature match: ${match}`);
             }
@@ -396,5 +498,3 @@ const turnstileValidateChallengeExample = async (request: CloudFrontRequest, isD
 
     return false;
 }
-
-export { turnstileChallengeExample, turnstileValidateChallengeExample };

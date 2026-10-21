@@ -259,6 +259,12 @@ export function createRecaptchaChallenge(cfg: RecaptchaConfig) {
                 html: '',
                 headers: {
                     'Location': `${redirectTo}${grantSeparator}cq_ok=${await issueGrant(cfg.sessionSecret, rayId)}`,
+                    // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+                    // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+                    // the browser does not send _cq_se on that request, so the session is never seen
+                    // and the visitor is challenged again on every arrival from outside. Lax sends the
+                    // cookie on top-level GET navigations but still withholds it from cross-site
+                    // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
                     'Set-Cookie': `_cq_se=${expiresAt}.${signature}|${rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${sessionTtl}`,
                 },
             };

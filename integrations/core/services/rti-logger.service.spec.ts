@@ -1,6 +1,9 @@
 import { describe, test, expect, afterEach, vi } from 'vitest';
 import { RTILoggerService } from './rti-logger.service';
 
+// Tests replace the global fetch; put Node's real one back after each test.
+const realFetch = globalThis.fetch;
+
 describe('RTILoggerService', () => {
   const baseConfig: any = {
     apiKey: 'api-key',
@@ -11,7 +14,7 @@ describe('RTILoggerService', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    delete (globalThis as any).fetch;
+    (globalThis as any).fetch = realFetch;
   });
 
   describe('constructor', () => {

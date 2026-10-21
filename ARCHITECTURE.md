@@ -17,7 +17,7 @@ RTI API version is **4.1** (`POST /defend/4.1/traffic`).
 | Integration | Runtime | Entry point |
 | --- | --- | --- |
 | Cloudflare | Workers | `integrations/cloudflare/src/index.ts` |
-| CloudFront | Lambda@Edge | `integrations/cloudfront/src/request-helper.ts` |
+| CloudFront | Lambda@Edge | `integrations/cloudfront/src/viewer-request.ts` / `origin-request.ts` (shared logic in `request-helper.ts`) |
 | Akamai | EdgeWorkers | `integrations/akamai/src/main.ts` |
 | Fastly | VCL (+ Compute) | `integrations/fastly/vcl/cheq_rti.vcl` |
 
@@ -46,8 +46,13 @@ core.
 | --- | --- |
 | `core/models/` | Types only — `Config`, `RTIRequest`, `RTIResponse`, `Action`, `ActionStrategy`, `Mode`, `EventType` |
 | `core/services/rti-helper.service.ts` | The decision pipeline. All classification logic lives here |
-| `core/services/rti.service.ts` | `fetch()`-based RTI client |
-| `core/services/rti-logger.service.ts` | `fetch()`-based telemetry/error logger |
+| `core/services/rti-service.base.ts` | Shared RTI request flow (config, status check, JSON parse, errors); subclasses only send |
+| `core/services/rti.service.ts` | `fetch()`-based RTI client (Cloudflare) |
+| `core/services/rti-https.service.ts` | `node:https`-based RTI client (CloudFront: avoids the `fetch` cold-start cost on 128 MB Lambda@Edge) |
+| `core/services/rti-logger.service.base.ts` | Shared logger payload and error handling |
+| `core/services/rti-logger.service.ts` | `fetch()`-based telemetry/error logger (Cloudflare) |
+| `core/services/rti-https-logger.service.ts` | `node:https`-based logger with a 1 s timeout (CloudFront) |
+| `core/services/https-client.ts` | Keep-alive `node:http`/`node:https` POST client with a single retry on a dropped pooled connection |
 | `core/helpers/block-page-helpers.ts` | Renders the HTML 403/404 block page |
 | `core/testing/` | Shared test harness — see [Testing](#testing) |
 
@@ -67,8 +72,8 @@ Every request follows the same path. Only the adapter layer differs per CDN.
    shouldIgnore(path) ─────────────────── match? ──▶ pass to origin
          │
          ▼
-   validateChallenge(request) ─────────── valid? ──▶ pass to origin
-         │
+   validateChallenge(request) ─────────── valid? ──▶ pass to origin   (Cloudflare, Akamai;
+         │                                                            CloudFront: see below)
          ▼
    getEventType(path, method)     →  customId1
    parseCookies(cookieHeader)     →  _cq_duid / _cq_pvid / _cq_s
@@ -91,6 +96,11 @@ Every request follows the same path. Only the adapter layer differs per CDN.
                    ├── REDIRECT      ──▶ 302 + Location
                    └── CAPTCHA       ──▶ config.challenge(request, response)
 ```
+
+CloudFront differs: it does not call `validateChallenge` before RTI. It always calls RTI, and checks
+`validateChallenge` only in the `CAPTCHA` branch: a valid session waives the challenge and the request is
+forwarded with `x-cheq-rti-result` (the real verdict). Otherwise it calls
+`config.challenge(request, response, addRtiResultHeader)`.
 
 ### Action
 
@@ -120,8 +130,9 @@ telemetry still flows, but no action is ever taken. Every shipped config ships i
 | `REDIRECT` | — | always `REDIRECT` (302) |
 
 `CAPTCHA` only does anything when `config.challenge` is wired up; with no challenge callback
-the request falls through to origin. Each integration ships a Cloudflare Turnstile reference
-implementation in `turnstile-challenge-example.ts`.
+the request falls through to origin. Cloudflare and CloudFront ship a Cloudflare Turnstile
+reference in `turnstile-challenge-example.ts`; Akamai ships `cheq-challenge.ts` and
+`recaptcha-v2-challenge.ts`; Fastly verifies reCAPTCHA v2 in its Compute service.
 
 ### Fail open, always
 
@@ -147,6 +158,19 @@ Session correlation accuracy depends on forwarding three CHEQ cookies:
 - It matches on an exact `name=` prefix, so the challenge-session cookie `_cq_se` is never
   mistaken for `_cq_s`.
 
+### Challenge session cookie: `SameSite=Lax`, never `Strict`
+
+Every challenge implementation sets its "challenge passed" session cookie with `SameSite=Lax`:
+`_cq_se` on CloudFront, Cloudflare and Akamai, and `captchaAuth` / `cq_session_token` on Fastly.
+
+`Strict` was used originally and broke real traffic. A visitor who arrives from another site
+(a link, an ad, a redirect) makes a cross-site top-level navigation, and the browser does not send
+a `Strict` cookie on that request. The challenge validation sees no session, so the visitor is
+challenged again every time they come in from outside, even after passing. `Lax` sends the cookie
+on top-level `GET` navigations and still withholds it from cross-site subrequests (iframes,
+images, `fetch`) and cross-site `POST`s, which is all the protection this cookie needs. Each
+`Set-Cookie` line carries a comment saying so. Keep `Lax` when adapting a challenge example.
+
 ### Origin enrichment
 
 On `ALLOW`, the request forwarded to origin carries:
@@ -156,8 +180,10 @@ x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":".
 ```
 
 This is a *request* header, so it is not visible to the browser — it is there for origin
-application logic and CDN access logs. Block, redirect and challenge responses deliberately
-omit it; those responses already carry the reference IDs in the page body.
+application logic and CDN access logs. Block and redirect responses deliberately omit it; those
+responses already carry the reference IDs in the page body. One exception: CloudFront passes
+`config.challenge` an `addRtiResultHeader` function, and its Turnstile example adds the header to the
+302 sent to the browser after a solved challenge.
 
 Those four fields are what every integration emits. `buildRtiResultHeader` takes an optional
 `includeDebugData` flag that appends `reasons` (the detection reason codes) and `rule-name`
@@ -312,7 +338,7 @@ Request:  POST /validate/<site_key>
           body: g-recaptcha-response=<token>   (form-urlencoded)
           header: origurl=<post-success redirect target>
 Success:  302 + Location: <origurl>
-          + Set-Cookie: captchaAuth=1 (HttpOnly, Secure, SameSite=Strict, 900s)
+          + Set-Cookie: captchaAuth=1 (HttpOnly, Secure, SameSite=Lax, 900s)
 Failure:  200 + captchaFail: 1      (VCL restarts to re-show the challenge)
 Error:    200                        (fail open)
 ```
@@ -330,7 +356,7 @@ behavior.
 ### The problem
 
 Three CDNs implement the same pipeline behind three different APIs. Written naively, each CDN
-needs its own ~40 near-identical tests — so a single behavior change means edits in three
+needs its own ~49 near-identical tests — so a single behavior change means edits in three
 places, and one missed edit means silent divergence.
 
 ### The solution — adapter pattern
@@ -389,8 +415,11 @@ Coverage thresholds are 95% statements / 90% branches / 95% functions / 95% line
 2. Extend `Config` with any CDN-specific fields (see `AkamaiConfig`, `CloudfrontConfig`).
 3. Write the adapter: collect headers, build the `RTIRequest`, then drive the core pipeline in
    order — `shouldIgnore` → `validateChallenge` → `getEventType` / `parseCookies` → `callRTI` →
-   `getAction` → `getActionStrategy`.
-4. Reuse `core/services/rti.service.ts` if the runtime has `fetch()`. If not, implement
+   `getAction` → `getActionStrategy` (Cloudflare, Akamai). CloudFront instead calls RTI first and
+   checks `validateChallenge` only for a `CAPTCHA` strategy; new adapters should follow CloudFront.
+4. Reuse `core/services/rti.service.ts` if the runtime has `fetch()`. On a low-CPU Node runtime
+   (like 128 MB Lambda@Edge), use `rti-https.service.ts` and `rti-https-logger.service.ts` instead:
+   loading `fetch` on a cold start is slow enough to hit the RTI timeout. If neither fits, implement
    `IRTIService` and `IRTILogger` against the platform's HTTP API — and cross-reference the
    core files, as Akamai does.
 5. Implement `TestAdapter` and `IntegrationTestAdapter`, then call

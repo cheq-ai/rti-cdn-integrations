@@ -16,7 +16,8 @@
 //   Request:  POST /validate/<site_key>
 //             Body:    application/x-www-form-urlencoded, field: g-recaptcha-response=<token>
 //             Headers: origurl=<redirect target after success>
-//   Success:  302  + Location: <origurl> + Set-Cookie: captchaAuth=1; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900
+//   Success:  302  + Location: <origurl> + Set-Cookie: captchaAuth=1; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=900
+//             (must be Lax, not Strict - see the comment at the Set-Cookie below)
 //   Failure:  200  + captchaFail: 1
 //   Error:    200  (fail open — avoids blocking legitimate users)
 async function handleCaptchaVerify(request) {
@@ -64,7 +65,13 @@ async function handleCaptchaVerify(request) {
         status: 302,
         headers: {
           "Location": origUrl,
-          "Set-Cookie": "captchaAuth=1; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900",
+          // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+          // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+          // the browser does not send the cookie on that request, so the session is never seen
+          // and the visitor is challenged again on every arrival from outside. Lax sends the
+          // cookie on top-level GET navigations but still withholds it from cross-site
+          // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
+          "Set-Cookie": "captchaAuth=1; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=900",
           "Cache-Control": "no-store",
         },
       });

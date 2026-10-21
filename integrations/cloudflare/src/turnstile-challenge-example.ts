@@ -8,10 +8,14 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
     if (request.headers.get("content-type") === "application/x-www-form-urlencoded") {
         formData = await request.formData();
     }
+    // "cf-turnstile-response" is not set by this code: once the visitor solves the challenge, the Turnstile
+    // widget (api.js) injects a hidden input with this name into the enclosing <form>. The form submits via POST,
+    // so the token arrives here in the form body. It must still be verified server-side (siteverify below).
     // @ts-ignore
     const token = formData?.get("cf-turnstile-response");
 
     if (!token) {
+        // No token means the visitor has not solved the challenge yet. Return a 403 with the Turnstile widget.
         const html = `<!DOCTYPE html>
                     <html lang="en">
                     <head>
@@ -285,6 +289,7 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
             },
         });
     } else {
+        // Verify the Turnstile token with Cloudflare's siteverify endpoint
         const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -312,6 +317,12 @@ const turnstileChallengeExample = async (request: Request, response: RTIResponse
                 status: 302,
                 headers: {
                 "Location": decodeURIComponent(redirectUrl),
+                // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+                // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+                // the browser does not send _cq_se on that request, so the session is never seen
+                // and the visitor is challenged again on every arrival from outside. Lax sends the
+                // cookie on top-level GET navigations but still withholds it from cross-site
+                // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
                 "Set-Cookie": `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}`,
                 },
             });

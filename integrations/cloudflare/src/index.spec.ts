@@ -102,6 +102,7 @@ let _lastConsoleLogs: string[] = [];
 
 const cloudflareAdapter: TestAdapter = {
     name: 'cloudflare worker',
+    validChallengeSkipsRti: true,
 
     async invoke(options: InvokeOptions = {}): Promise<NormalizedResult> {
         _lastConsoleLogs = [];

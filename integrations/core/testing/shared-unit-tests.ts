@@ -1,17 +1,18 @@
 // cspell:ignore duid pvid cheq SCOOKIE
 /**
- * Shared behavioral test suite — 40 tests registered once per CDN integration.
+ * Shared behavioral test suite — 49 tests registered once per CDN integration (3 of them only where
+ * `validChallengeSkipsRti` is true).
  *
  * ## What it tests
  * Every behavior that must work identically across Cloudflare, CloudFront and Akamai:
  *
- *   Pass-through     ignored path, valid challenge, no validateChallenge configured
+ *   Pass-through     ignored path, valid challenge (CDNs with validChallengeSkipsRti), no validateChallenge configured
  *   ALLOW            RTI called, request passes through, x-cheq-rti-result header set
  *   Block strategies ACCESS_DENIED → 403, NOT_FOUND → 404, generateDefaultBlockPage args
  *   Redirect         302, location header, default vs custom location, x-cheq-id / page-view-id
  *   CAPTCHA          challenge callback called, absent (pass-through), throws (fail open)
  *   Cookie extraction _cq_duid, _cq_pvid, _cq_s, base64-padded values, absent cookies
- *   validateChallenge returns false (calls RTI), throws (fail open)
+ *   validateChallenge returns false (calls RTI), throws (fail open, CDNs with validChallengeSkipsRti)
  *   Header absence   no x-cheq-rti-result on block or redirect responses
  *   Querystring      forwarded in endUserParams.requestUrl
  *   Error handling   RTI throws Error, RTI throws non-Error value
@@ -26,7 +27,7 @@
  *
  * ## How to use
  * Each CDN test file creates a `TestAdapter`, creates/exposes the `SharedMocks` object,
- * then calls `registerSharedBehaviorTests(adapter, mocks)` once. The 40 tests are
+ * then calls `registerSharedBehaviorTests(adapter, mocks)` once. The tests are
  * registered under a `[shared] {cdn-name}` describe block automatically.
  *
  * @see TestAdapter in ./test-adapter.interface.ts
@@ -48,7 +49,7 @@ const B64_SCOOKIE = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lC
  *
  * ## How it works
  * Calling this function invokes Vitest's `describe()` and `it()` registration functions,
- * which tell Vitest "here are tests to run". This is equivalent to writing all ~40 `it(...)`
+ * which tell Vitest "here are tests to run". This is equivalent to writing all ~49 `it(...)`
  * blocks directly in the CDN's spec file — just without the duplication. Vitest collects
  * everything registered during module evaluation and executes it when the suite runs.
  *
@@ -90,7 +91,7 @@ export function registerSharedBehaviorTests(adapter: TestAdapter, mocks: SharedM
             expect(mocks.generateDefaultBlockPage).not.toHaveBeenCalled();
         });
 
-        it('passes through without calling RTI when challenge is already valid', async () => {
+        it.skipIf(!adapter.validChallengeSkipsRti)('passes through without calling RTI when challenge is already valid', async () => {
             // Arrange
             adapter.setConfig({ validateChallenge: vi.fn().mockResolvedValue(true) });
 
@@ -107,7 +108,7 @@ export function registerSharedBehaviorTests(adapter: TestAdapter, mocks: SharedM
             expect(mocks.generateDefaultBlockPage).not.toHaveBeenCalled();
         });
 
-        it('passes through (fails open) when validateChallenge throws', async () => {
+        it.skipIf(!adapter.validChallengeSkipsRti)('passes through (fails open) when validateChallenge throws', async () => {
             // Arrange
             adapter.setConfig({ validateChallenge: vi.fn().mockRejectedValue(new Error('validate crash')) });
 
@@ -774,7 +775,7 @@ export function registerSharedBehaviorTests(adapter: TestAdapter, mocks: SharedM
             expect(result.headers['x-cheq-rti-result']).toBeDefined();
         });
 
-        it('passes through (fails open) when validateChallenge throws', async () => {
+        it.skipIf(!adapter.validChallengeSkipsRti)('passes through (fails open) when validateChallenge throws', async () => {
             // Arrange
             adapter.setConfig({ validateChallenge: vi.fn().mockRejectedValue(new Error('validate crash')) });
 

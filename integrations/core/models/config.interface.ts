@@ -125,7 +125,8 @@ export interface Config {
   routeToEventType?: RouteToEventType[];
 
   /**
-   * Timeout in milliseconds before cancelling RTI request - Default is 150 ms.
+   * Timeout in milliseconds before cancelling RTI request.
+   * Default: 2000 ms for CloudFront (RTIHttpsService), 150 ms for the fetch-based RTIService used by the other CDNs.
    */
   timeout?: number;
 
@@ -152,4 +153,12 @@ export interface Config {
    * In Future, we may expand the telemetry functionality to include more log types and more detailed information about the RTI calls.
    */
   telemetry: boolean;
+
+  /**
+   * Enable error logging. When an error is caught while handling a request, it will be sent to the RTI Logger service (via HTTP).
+   * Errors are always written to the console regardless of this setting.
+   *
+   * Defaults to `true` — only an explicit `false` disables it.
+   */
+  logErrors?: boolean;
 }
