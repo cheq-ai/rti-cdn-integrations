@@ -52,19 +52,18 @@ const cookieValue = (cookies: string[], name: string): string | undefined =>
     cookies.find(c => c.startsWith(`${name}=`))?.substring(name.length + 1);
 
 /**
- * Signs a challenge session: HMAC-SHA256 over the expiry, rayId and the visitor's `_cq_duid` (empty when the
- * visitor has none), keyed with `secret`, as 32 hex characters. Without the key nobody can produce a valid
- * `_cq_se` cookie (the old unkeyed SHA-256 could be computed by anyone), and the duid stops a copied `_cq_se`
- * from working for another visitor. JSON keeps the fields apart (with "a:b:c", a rayId containing ":" could
- * absorb the duid).
+ * Signs a challenge session: HMAC-SHA256 over the expiry and rayId, keyed with `secret`, as 32 hex characters.
+ * Without the key nobody can produce a valid `_cq_se` cookie (the old unkeyed SHA-256 could be computed by anyone).
+ * Deliberately NOT bound to the visitor's `_cq_duid`: on a first visit the challenge is solved before the CHEQ tag
+ * has set that cookie, so a bound session broke as soon as it appeared and the visitor had to solve the CAPTCHA twice.
  */
-function signSession(secret: string, expiresAt: number, rayId: string, duid: string): string {
-    return createHmac("sha256", secret).update(JSON.stringify(["se", expiresAt, rayId, duid])).digest("hex").slice(0, 32);
+function signSession(secret: string, expiresAt: number, rayId: string): string {
+    return createHmac("sha256", secret).update(JSON.stringify(["se", expiresAt, rayId])).digest("hex").slice(0, 32);
 }
 
 /** Checks a session signature in constant time. The secret is never a placeholder: createTurnstileChallenge refuses one. */
-function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, duid: string, signature: string): boolean {
-    const expected = Buffer.from(signSession(secret, expiresAt, rayId, duid));
+function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, signature: string): boolean {
+    const expected = Buffer.from(signSession(secret, expiresAt, rayId));
     const actual = Buffer.from(signature);
     return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
@@ -396,10 +395,7 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
         const result = await verifyResponse.json() as { success: boolean };
         if (result.success) {
             const expiresAt = Date.now() + (ttl * 1000);
-            // Bound to this visitor's device id. A visitor with no _cq_duid yet gets a session bound to an empty duid, which stops
-            // working once the CHEQ tag sets the cookie (they are challenged once more, then bound).
-            const duid = cookieValue(requestCookies(request), "_cq_duid") ?? "";
-            const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId, duid);
+            const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId);
 
             const sessionToken = `${expiresAt}.${signature}`;
 
@@ -442,7 +438,6 @@ const turnstileValidateChallengeExample = async (settings: TurnstileSettings, re
     // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)
     const cookies = requestCookies(request);
     const [cookieToken, cookieRayId] = cookieValue(cookies, "_cq_se")?.split("|") ?? [];
-    const duid = cookieValue(cookies, "_cq_duid") ?? "";
     const rayId = request.headers["x-cheq-ray-id"]?.[0]?.value || cookieRayId;
     const sessionToken = request.headers["x-cheq-challenge"]?.[0]?.value || cookieToken;
 
@@ -482,7 +477,7 @@ const turnstileValidateChallengeExample = async (settings: TurnstileSettings, re
             }
             
             // Verify signature (keyed HMAC, constant-time compare)
-            const match = isValidSessionSignature(settings.sessionSigningSecret, expiresAt, rayId, duid, signature);
+            const match = isValidSessionSignature(settings.sessionSigningSecret, expiresAt, rayId, signature);
 
             if (isDebug) {
                 console.log(`[validateChallenge] signature match: ${match}`);
