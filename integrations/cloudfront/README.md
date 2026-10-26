@@ -847,7 +847,7 @@ Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
                │
                ▼
           Generate signed session token:
-          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId, _cq_duid])[0:32 hex]}"
+          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId])[0:32 hex]}"
                │
                ▼
           Return HTTP 302 redirect to original URL
@@ -870,7 +870,7 @@ Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
 On subsequent requests RTI always runs. `config.validateChallenge` is called only when RTI asks for a CAPTCHA again:
 
 ```
-Read _cq_se and _cq_duid (from all Cookie headers) → parse _cq_se as {token}|{rayId}
+Read _cq_se (from all Cookie headers) → parse _cq_se as {token}|{rayId}
   (an x-cheq-challenge / x-cheq-ray-id request header, if present, overrides the token / rayId)
      │
      ▼
@@ -878,7 +878,7 @@ Split token → {expiresAt}.{signature}
      │
      ├── expired? (Date.now() > expiresAt) → return false (challenged again)
      │
-     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId, _cq_duid]), constant-time compare
+     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId]), constant-time compare
               │
          Matches? → return true (CAPTCHA waived: forwarded with x-cheq-rti-result, real verdict)
          No match? → return false (challenged again)
@@ -897,8 +897,8 @@ _cq_se={expiresAtMs}.{hexSignature}|{rayId}
 ```
 
 - `expiresAtMs`: Unix timestamp in milliseconds (TTL default: 300 seconds)
-- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId, duid]`, where `duid` is the visitor's `_cq_duid` cookie (empty when absent). Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
-- **Bound to the visitor:** the session only validates with the same `_cq_duid` it was issued with, so a copied `_cq_se` cookie alone does not work for another visitor. It is not bulletproof: a client that copies **both** cookies still gets in. A visitor without `_cq_duid` gets a session bound to "no duid"; once the CHEQ tag sets the cookie, they are challenged once more and then bound.
+- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId]`. Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
+- **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. A copied `_cq_se` cookie therefore works in another browser until it expires (`sessionTtlSeconds`).
 - `rayId`: RTI ray ID from the original BLOCK/CHALLENGE response
 
 ### Implementing a Custom Challenge
@@ -1123,8 +1123,6 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 **Fix:** Verify the `Set-Cookie` header in the 302 response. Check that the cookie `Path=/` is correct for your URL structure. Make sure the cookie uses `SameSite=Lax` (the shipped example does). `SameSite=Strict` breaks visitors coming from other sites: the cookie is not sent on the cross-site navigation, so they are challenged again.
 
 A second cause: the `_cq_session` cookie name starts with `_cq_se` — the example matches `_cq_se=` (with the `=`) to avoid this collision. Verify this is the case in your implementation.
-
-A third cause: the session is bound to the visitor's `_cq_duid` cookie. A visitor challenged before the CHEQ tag set `_cq_duid` is challenged once more after it appears, and a visitor whose `_cq_duid` changes (cleared cookies, another browser profile) needs a new session. Seeing the CAPTCHA once more in these cases is expected; seeing it on every request is not.
 
 ### "Verification failed" after a refresh, Back, or a long wait
 

@@ -287,50 +287,38 @@ describe('validateChallenge', () => {
     // --- Signature format and comparison ---
 
     it.each([
-        ['without a _cq_duid cookie', undefined, ''],
-        ['with a _cq_duid cookie', '_cq_duid=dev-A', 'dev-A'],
-    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId, duid]), first 32 hex (known answer)', async (_label, cookie, duid) => {
+        ['without a _cq_duid cookie', undefined],
+        ['with a _cq_duid cookie', '_cq_duid=dev-A'],
+    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId]), first 32 hex (known answer)', async (_label, cookie) => {
         const now = 1_700_000_000_000;
         const { signature, expiresAt } = await issueSession('ray-1', testSettings, now, cookie);
-        const signed = JSON.stringify(['se', now + 300_000, 'ray-1', duid]);
+        const signed = JSON.stringify(['se', now + 300_000, 'ray-1']);
         const expected = createHmac('sha256', testSettings.sessionSigningSecret).update(signed).digest('hex').slice(0, 32);
         expect(expiresAt).toBe(now + 300_000);
         expect(signature).toBe(expected);
     });
 
-    // --- Bound to the visitor's _cq_duid (a copied _cq_se cookie alone does not work) ---
+    // --- Not bound to the visitor's _cq_duid ---
 
-    it('accepts the session when the request carries the same _cq_duid it was issued with', async () => {
-        const { cookie } = await issueSession('ray-abc123', testSettings, undefined, '_cq_duid=dev-A');
+    it('accepts a session issued before the CHEQ tag set _cq_duid once the cookie appears (no second CAPTCHA)', async () => {
+        // First visit: the challenge is solved before any page with the CHEQ tag has loaded, so there is no _cq_duid yet.
+        const { cookie } = await issueSession('ray-abc123');
         expect(await validateChallenge(buildRequest(`${cookie}; _cq_duid=dev-A`), false)).toBe(true);
     });
 
-    it('rejects the session with a different _cq_duid', async () => {
+    it.each([
+        ['the same _cq_duid', '; _cq_duid=dev-A'],
+        ['a different _cq_duid', '; _cq_duid=dev-B'],
+        ['no _cq_duid', ''],
+    ])('accepts a session issued with _cq_duid when the request has %s', async (_label, duidCookie) => {
         const { cookie } = await issueSession('ray-abc123', testSettings, undefined, '_cq_duid=dev-A');
-        expect(await validateChallenge(buildRequest(`${cookie}; _cq_duid=dev-B`), false)).toBe(false);
-    });
-
-    it('rejects the session when the _cq_duid cookie is missing', async () => {
-        const { cookie } = await issueSession('ray-abc123', testSettings, undefined, '_cq_duid=dev-A');
-        expect(await validateChallenge(buildRequest(cookie), false)).toBe(false);
-    });
-
-    it('a session issued without _cq_duid is accepted only while the request has none', async () => {
-        const { cookie } = await issueSession('ray-abc123');
-        expect(await validateChallenge(buildRequest(cookie), false)).toBe(true);
-        expect(await validateChallenge(buildRequest(`${cookie}; _cq_duid=dev-A`), false)).toBe(false);
-    });
-
-    it('cannot move the duid into the rayId to drop the binding (unambiguous signed data)', async () => {
-        const { token } = await issueSession('ray-abc123', testSettings, undefined, '_cq_duid=dev-A');
-        // With a plain "a:b:c" join, rayId "ray-abc123:dev-A" + no duid would sign the same text.
-        expect(await validateChallenge(buildRequest(`_cq_se=${token}|ray-abc123:dev-A`), false)).toBe(false);
+        expect(await validateChallenge(buildRequest(`${cookie}${duidCookie}`), false)).toBe(true);
     });
 
     // --- Several Cookie header entries (HTTP/2 clients can split cookies) ---
 
-    it('finds _cq_se and _cq_duid in later Cookie header entries', async () => {
-        const { cookie } = await issueSession('ray-abc123', testSettings, undefined, '_cq_duid=dev-A');
+    it('finds _cq_se in a later Cookie header entry', async () => {
+        const { cookie } = await issueSession('ray-abc123');
         const request = buildRequest();
         request.headers['cookie'] = [
             { key: 'Cookie', value: 'theme=dark' },
@@ -338,15 +326,6 @@ describe('validateChallenge', () => {
             { key: 'Cookie', value: '_cq_duid=dev-A' },
         ];
         expect(await validateChallenge(request, false)).toBe(true);
-    });
-
-    it('signs with the _cq_duid from a later Cookie header entry of the challenge request', async () => {
-        stubSiteverify(true);
-        const request = buildTurnstileRequest(solvedQuery);
-        request.headers['cookie'] = [{ key: 'Cookie', value: 'theme=dark' }, { key: 'Cookie', value: '_cq_duid=dev-A' }];
-        const result = await challenge(request, buildRTIResponse('ray-abc123')) as any;
-        const cookie = result.headers['set-cookie'][0].value.split(';')[0];
-        expect(await validateChallenge(buildRequest(`${cookie}; _cq_duid=dev-A`), false)).toBe(true);
     });
 
     it('compares signatures with timingSafeEqual (constant time)', async () => {
