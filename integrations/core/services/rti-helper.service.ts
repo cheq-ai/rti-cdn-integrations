@@ -60,6 +60,37 @@ export class RTIHelperService {
   }
 
   /**
+   * Whether a reply to a challenge page goes to the challenge callback: when RTI allows it (no strategy) or asks for
+   * a CAPTCHA. Blocks, 404s and redirects are always enforced. Listed positively, so a new strategy is enforced
+   * unless it is added here: a solved token must never bypass it by default.
+   * @param actionStrategy the strategy from {@link getActionStrategy}, or null when the action is ALLOW
+   */
+  isChallengeReplyAllowed(actionStrategy: ActionStrategy | null): boolean {
+    return actionStrategy === null || actionStrategy === ActionStrategy.CAPTCHA;
+  }
+
+  /**
+   * The message of anything thrown, for logging in a catch. Never throws itself: code can throw undefined, null or any
+   * object, and reading `.message` on those (or `String()` on a null-prototype object) would throw inside the catch and
+   * break the fail-open. An `Error` gives its message, anything else `String(e)`; if that throws,
+   * `Object.prototype.toString` (e.g. `[object Object]`); if even that throws (a hostile Proxy), `"unknown error"`.
+   * The message goes through `String()` too: code can set it to anything, and a Symbol there would make the
+   * caller's template literal throw.
+   * @param e the value caught
+   */
+  errorMessage(e: unknown): string {
+    try {
+      return String(e instanceof Error ? e.message : e);
+    } catch {
+      try {
+        return Object.prototype.toString.call(e);
+      } catch {
+        return "unknown error";
+      }
+    }
+  }
+
+  /**
    * Returns the {@link ActionStrategy} based on configuration and {@link Action}
    * @param action
    */

@@ -9,8 +9,10 @@ import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model"
 import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
+import { Mode } from '../../core/models/mode.model';
 import { Ids, RTIResponse } from '../../core/models/rti-response.model';
 import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers';
+import { randomUUID } from 'node:crypto';
 
 export enum RequestType {
   VIEWER_REQUEST,
@@ -20,6 +22,12 @@ export enum RequestType {
 const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIHttpsService(config);
+
+// Once per cold start: without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING
+// mode it is handled like any request (e.g. forwarded with the form fields when RTI allows it).
+if (config.challenge && !config.isChallengeResponse) {
+    console.warn("[challenge] config.isChallengeResponse is not set: replies to the challenge page are not recognized (see Implementing a Custom Challenge in the README)");
+}
 
 export const handle = async (event: CloudFrontRequestEvent, requestType: RequestType): Promise<CloudFrontRequestResult> => {
     //debugger; // Pause for breakpoints when using SAM - remove for production
@@ -107,14 +115,27 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
+        const actionStrategy = action !== Action.ALLOW ? rtiHelperService.getActionStrategy(action) : null;
+
+        if (isDebugEnabled && action !== Action.ALLOW) {
+            console.log(`action strategy: ${actionStrategy !== null ? `${ActionStrategy[actionStrategy]} (${actionStrategy})` : "none (should not happen)"} `);
+        }
+
+        // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA) and
+        // whatever session the visitor has, config.challenge answers it (the Turnstile example verifies the token and
+        // redirects to original_url). Forwarded instead, the origin would get the form fields in place of the visitor's
+        // query string.
+        // Checked before the session waiver (two tabs, Back, refresh). Only for ALLOW or CAPTCHA (isChallengeReplyAllowed):
+        // any other strategy (blocks, 404s, redirects) is enforced as usual.
+        if (rtiHelperService.isChallengeReplyAllowed(actionStrategy) && await shouldAnswerChallengeReply(event, cfRequest)) {
+            if (isDebugEnabled) {
+                console.log("challenge reply, passing it to challenge");
+            }
+            return await answerChallengeReply(event, cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+        }
+
         // If action is not allow, return the corresponding response to client based on action strategy
         if (action !== Action.ALLOW) {
-            const actionStrategy = rtiHelperService.getActionStrategy(action);
-
-            if (isDebugEnabled) {
-                console.log(`action strategy: ${actionStrategy !== null ? `${ActionStrategy[actionStrategy]} (${actionStrategy})` : "none (should not happen)"} `);
-            }
-
             switch (actionStrategy) {
                 case ActionStrategy.ACCESS_DENIED:
                     return {
@@ -156,12 +177,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         }
                         break;
                     } catch (e) {
-                        const err: Error = e as Error;
-                        const cfRequestId = getCfRequestId(event);
-                        console.error(`Challenge error handling request '${cfRequestId}':`, err);
-                        if (config.logErrors !== false) {
-                            await logger.error(`Challenge error handling request '${cfRequestId}': ${err.message}`);
-                        }
+                        await logChallengeError(event, e);
                         return cfRequest;
                     }
                 default:
@@ -174,16 +190,90 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
 
         return cfRequest;
     } catch (e) {
-        const err: Error = e as Error;
         const cfRequestId = getCfRequestId(event);
-        console.error(`Error handling request '${cfRequestId}':`, err);
+        console.error(`Error handling request '${cfRequestId}':`, e);
         if (config.logErrors !== false) {
-            await logger.error(`Error handling request '${cfRequestId}': ${err.message}`);
+            await logger.error(`Error handling request '${cfRequestId}': ${rtiHelperService.errorMessage(e)}`);
+        }
+
+        // The request could not be evaluated (RTI error or timeout, a malformed RTI response, any other error before the
+        // decision): a reply is still answered by config.challenge, or the origin would get the form fields. There is no
+        // verdict, so it gets a stand-in response and no addRtiResultHeader.
+        if (await shouldAnswerChallengeReply(event, cfRequest)) {
+            return await answerChallengeReply(event, cfRequest, await rtiFailureResponse(event));
         }
     }
 
     return cfRequest;
 };
+
+// A reply goes to config.challenge in BLOCKING mode only: MONITORING never changes a response. config.isChallengeResponse
+// is customer code: only a synchronous `true` counts (an async detector's Promise is no reply), and if it throws, the
+// request is handled as no reply and the error is logged. It must never throw out of here: this also runs in the outer
+// catch, where a throw would fail the whole request.
+async function shouldAnswerChallengeReply(event: CloudFrontRequestEvent, cfRequest: CloudFrontRequest): Promise<boolean> {
+    if (config.mode !== Mode.BLOCKING || !config.challenge || !config.isChallengeResponse) {
+        return false;
+    }
+    try {
+        return config.isChallengeResponse(cfRequest) === true;
+    } catch (e) {
+        const cfRequestId = getCfRequestId(event);
+        console.error(`Challenge reply check error handling request '${cfRequestId}':`, e);
+        if (config.logErrors !== false) {
+            await logger.error(`Challenge reply check error handling request '${cfRequestId}': ${rtiHelperService.errorMessage(e)}`);
+        }
+        return false;
+    }
+}
+
+// Passes a challenge reply to config.challenge. If it throws, the request is forwarded (fail open).
+async function answerChallengeReply(event: CloudFrontRequestEvent, cfRequest: CloudFrontRequest, rtiResponse: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult> {
+    try {
+        return await config.challenge!(cfRequest, rtiResponse, addRtiResultHeader);
+    } catch (e) {
+        await logChallengeError(event, e);
+        return cfRequest;
+    }
+}
+
+// Stands in for the RTI response when the request could not be evaluated (see the outer catch in handle), so a
+// challenge reply can still be answered. It is NOT an RTI answer: there is no verdict, classification or other data,
+// only ids, and the cast hides that from the type.
+// - ids.rayId is the CloudFront request id, not an RTI ray id. challenge needs a non-empty, unique id: the Turnstile
+//   example signs the session with it and stores it in the _cq_se cookie (validateChallenge rejects an empty one, so ''
+//   would issue a session that never works). It is never compared with RTI. Never request_id from the query: the client
+//   controls that, and it would end up in the Set-Cookie header.
+// - A CloudFront request id that is not a plain id (cookie separators, spaces: our own on_error_request_id fallback),
+//   empty, too long or not unique (the constant unknown_request_id) is replaced by a random one, and logged with both
+//   values so it can be traced. CloudFront does not document the id's characters, so this is checked, not assumed.
+// - ids.customParam2 is the real CloudFront request id, as customId2 is in the RTI payload of the normal flow.
+async function rtiFailureResponse(event: CloudFrontRequestEvent): Promise<RTIResponse> {
+    const cfRequestId = getCfRequestId(event);
+    let rayId = cfRequestId;
+    if (!/^[A-Za-z0-9_=.-]{1,200}$/.test(cfRequestId) || cfRequestId === "unknown_request_id") {
+        rayId = `cf-fallback-${randomUUID()}`;
+        const message = `RTI failed and the CloudFront request id ${JSON.stringify(cfRequestId)} is not usable as the stand-in rayId, using ${rayId}`;
+        console.warn(`[challenge] ${message}`);
+        if (config.logErrors !== false) {
+            await logger.error(message);
+        }
+    }
+    const ids: Ids = {
+        rayId,
+        pageViewId: null, duid: null, uniqueVisitId: null,
+        customParam1: null, customParam2: cfRequestId, customParam3: null, customParam4: null,
+    };
+    return { ids } as RTIResponse;
+}
+
+async function logChallengeError(event: CloudFrontRequestEvent, e: unknown) {
+    const cfRequestId = getCfRequestId(event);
+    console.error(`Challenge error handling request '${cfRequestId}':`, e);
+    if (config.logErrors !== false) {
+        await logger.error(`Challenge error handling request '${cfRequestId}': ${rtiHelperService.errorMessage(e)}`);
+    }
+}
 
 async function isValidChallenge(cfRequest : CloudFrontRequest, isDebugEnabled: boolean | undefined): Promise<boolean> {
     const validChallenge = await config.validateChallenge?.(cfRequest, isDebugEnabled) ?? false;

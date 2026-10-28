@@ -102,6 +102,13 @@ CloudFront differs: it does not call `validateChallenge` before RTI. It always c
 forwarded with `x-cheq-rti-result` (the real verdict). Otherwise it calls
 `config.challenge(request, response, addRtiResultHeader)`.
 
+CloudFront also routes the reply to its challenge page. The solved form is a new request with a new verdict, so in
+`BLOCKING` mode, when the strategy is none (ALLOW) or `CAPTCHA` (`isChallengeReplyAllowed`) and the
+`config.isChallengeResponse` callback recognizes the request, it goes to `config.challenge` before the session waiver,
+which verifies it and redirects to the original URL. Any other strategy (blocks, 404s, redirects) is enforced as usual. When the request cannot be
+evaluated (RTI error or timeout, a malformed RTI response, any other error before the decision), a recognized reply
+still goes to `config.challenge`, with a stand-in response (only `ids`) and no `addRtiResultHeader`.
+
 ### Action
 
 `Action` is what to do; `ActionStrategy` is how to do it. Both are resolved in
@@ -138,7 +145,9 @@ reference in `turnstile-challenge-example.ts`; Akamai ships `cheq-challenge.ts` 
 
 Every error path passes the request to origin: RTI timeout, network failure, malformed
 response, a throwing `validateChallenge`, a throwing `challenge`, an unrecognized action
-strategy. A broken integration degrades to a no-op rather than taking the customer's site
+strategy. On CloudFront a throwing `isChallengeResponse` counts as "not a reply", and a reply whose RTI call failed
+is still passed to `challenge` (if that throws too, it is passed to origin). Logging in a catch uses
+`RTIHelperService.errorMessage()`, which never throws, whatever was thrown. A broken integration degrades to a no-op rather than taking the customer's site
 down. Cloudflare reinforces this at the platform level with `passThroughOnException()`.
 
 ### Cookies

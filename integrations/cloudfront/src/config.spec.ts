@@ -14,7 +14,7 @@ afterEach(() => {
 });
 
 describe('shipped config.ts', () => {
-    it('leaves challenge and validateChallenge undefined while the Turnstile secrets are REPLACE_ME, and warns once', async () => {
+    it('leaves challenge, validateChallenge and isChallengeResponse undefined while the Turnstile secrets are REPLACE_ME, and warns once', async () => {
         vi.resetModules();
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -22,15 +22,18 @@ describe('shipped config.ts', () => {
 
         expect(config.challenge).toBeUndefined();
         expect(config.validateChallenge).toBeUndefined();
+        expect(config.isChallengeResponse).toBeUndefined();
+        expect('handleChallengeReply' in config).toBe(false);
         expect(warn).toHaveBeenCalledOnce();
         expect(warn).toHaveBeenCalledWith(expect.stringContaining('siteKey, secretKey, sessionSigningSecret'));
     });
 
-    it('passes the turnstile settings to createTurnstileChallenge and wires both callbacks it returns', async () => {
+    it('passes the turnstile settings to createTurnstileChallenge and wires the three callbacks it returns', async () => {
         vi.resetModules();
         const challenge = vi.fn();
         const validateChallenge = vi.fn();
-        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge }));
+        const isChallengeResponse = vi.fn();
+        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge, isChallengeResponse }));
         vi.doMock('./turnstile-challenge-example', () => ({ createTurnstileChallenge }));
 
         const config = await loadConfig();
@@ -44,6 +47,8 @@ describe('shipped config.ts', () => {
         });
         expect(config.challenge).toBe(challenge);
         expect(config.validateChallenge).toBe(validateChallenge);
+        expect(config.isChallengeResponse).toBe(isChallengeResponse);
+        expect('handleChallengeReply' in config).toBe(false);
     });
 
     it('ships safe defaults', async () => {

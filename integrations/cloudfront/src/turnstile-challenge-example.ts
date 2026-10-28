@@ -1,8 +1,11 @@
 // cspell:ignore cheq siteverify duid unkeyed
-import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult } from "aws-lambda";
+import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult, CloudFrontResultResponse } from "aws-lambda";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { RTIResponse } from "../../core/models/rti-response.model";
 import type { CloudfrontConfig } from "./config";
+
+const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
+
 
 /** Settings for the example Turnstile challenge, set in config.ts. */
 export interface TurnstileSettings {
@@ -69,14 +72,14 @@ function isValidSessionSignature(secret: string, expiresAt: number, rayId: strin
 }
 
 /**
- * Builds the example `challenge` and `validateChallenge` callbacks from the settings in config.ts.
+ * Builds the example `challenge`, `validateChallenge` and `isChallengeResponse` callbacks from the settings in config.ts.
  * A factory, not an `import { config }`: config.ts imports this file, so that would be circular.
  *
  * Returns `{}` (and warns) while `siteKey`, `secretKey` or `sessionSigningSecret` is unset or `REPLACE_ME`:
  * the CAPTCHA is then disabled and challenged traffic is forwarded with `x-cheq-rti-result`, instead of
  * showing a broken widget or issuing sessions anyone could forge.
  */
-export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge"> {
+export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge" | "isChallengeResponse"> {
     const missing = (["siteKey", "secretKey", "sessionSigningSecret"] as const).filter(k => isPlaceholder(settings[k]));
     if (missing.length > 0) {
         console.warn(`[turnstile] CAPTCHA disabled, not configured: ${missing.join(", ")} (set them in config.ts)`);
@@ -92,20 +95,31 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
     return {
         challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, request, response, addRtiResultHeader),
         validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug),
+        isChallengeResponse: turnstileIsChallengeResponseExample,
     };
 }
 
+/**
+ * True when the request is the reply to the challenge page: the solved form came back with a Turnstile token.
+ * Only the field name is checked (`cf-turnstile-response`, added by the Turnstile widget to its form), so a
+ * site's own GET form with a Turnstile widget looks like a reply too.
+ */
+const turnstileIsChallengeResponseExample = (request: CloudFrontRequest): boolean =>
+    !!new URLSearchParams(request.querystring).get(TURNSTILE_RESPONSE_QUERY_PARAM);
+
 const turnstileChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
-    const ttl = settings.sessionTtlSeconds;
     let queryStringData = new URLSearchParams(request.querystring);
-    // "cf-turnstile-response" is not set by this code: once the visitor solves the challenge, the Turnstile
+    // TURNSTILE_RESPONSE_QUERY_PARAM is not set by this code: once the visitor solves the challenge, the Turnstile
     // widget (api.js) injects a hidden input with this name into the enclosing <form>. The form submits via GET,
     // so the token arrives here as a query string parameter. It must still be verified server-side (siteverify below).
     // @ts-ignore
-    const token = queryStringData?.get("cf-turnstile-response");
+    const token = queryStringData?.get(TURNSTILE_RESPONSE_QUERY_PARAM);
 
     if (!token) {
         // No token means the visitor has not solved the challenge yet. Return a 403 with the Turnstile widget.
+        // The return URL keeps the query string (gclid, utm_*, ...): request.uri is only the path. It must travel
+        // in original_url, not in the form action: a GET form replaces the action's query with its own fields.
+        const originalUrl = request.querystring ? `${request.uri}?${request.querystring}` : request.uri;
         const html = `<!DOCTYPE html>
                     <html lang="en">
                     <head>
@@ -328,7 +342,7 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
                             Please complete the verification below to confirm you're human and continue to the website.
                         </p>
                         <form id="captcha-form" action="${escapeHtml(request.uri)}" method="GET">
-                            <input type="hidden" name="original_url" value="${escapeHtml(request.uri)}">
+                            <input type="hidden" name="original_url" value="${escapeHtml(originalUrl)}">
                             <input type="hidden" name="request_id" value="${escapeHtml(response.ids.rayId)}">
                             
                             <div class="captcha-box">
@@ -381,50 +395,8 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
             body: html,
         };
     } else {
-        // Verify the Turnstile token with Cloudflare's siteverify endpoint
-        const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-                secret: settings.secretKey,
-                response: token,
-                remoteip: request.clientIp,
-            }).toString(),
-        });
-
-        const result = await verifyResponse.json() as { success: boolean };
-        if (result.success) {
-            const expiresAt = Date.now() + (ttl * 1000);
-            const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId);
-
-            const sessionToken = `${expiresAt}.${signature}`;
-
-            // Redirect back to where the visitor was, on THIS site. The host comes from the request (CloudFront only
-            // routes hosts of this distribution), never from the query string, and original_url must be a path
-            // (see safeReturnPath). Without a Host header the Location stays relative, which the browser resolves
-            // against the current site.
-            const host = request.headers["host"]?.[0]?.value;
-            const returnPath = safeReturnPath(queryStringData?.get("original_url")) ?? request.uri;
-            const headers = {};
-            // @ts-ignore
-            headers.location = [{ key: 'Location', value: host ? `https://${host}${returnPath}` : returnPath }];
-            // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
-            // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
-            // the browser does not send _cq_se on that request, so the session is never seen
-            // and the visitor is challenged again on every arrival from outside. Lax sends the
-            // cookie on top-level GET navigations but still withholds it from cross-site
-            // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
-            // @ts-ignore
-            headers["set-cookie"] = [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}` }];
-            // Adds x-cheq-rti-result (the verdict that triggered the challenge), provided by the handler. This 302 goes
-            // to the BROWSER (not the origin), so the client sees verdict, threat-type-code and ids. The redirected
-            // request is checked by RTI again and gets its own header on the way to the origin.
-            addRtiResultHeader?.(headers);
-
-            return {
-                status: '302',
-                headers,
-            };
+        if (await verifyTurnstileToken(settings, token, request.clientIp)) {
+            return sessionRedirect(settings, request, response, queryStringData, addRtiResultHeader);
         } else {
             return {
                 status: '403',
@@ -433,6 +405,62 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
         }
     }
 };
+
+/** Verifies a Turnstile token with Cloudflare's siteverify endpoint. A token is single-use and expires after 300 seconds. */
+async function verifyTurnstileToken(settings: TurnstileSettings, token: string, clientIp: string): Promise<boolean> {
+    const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+            secret: settings.secretKey,
+            response: token,
+            remoteip: clientIp,
+        }).toString(),
+    });
+
+    const result = await verifyResponse.json() as { success: boolean };
+    return result.success === true;
+}
+
+/**
+ * Where the visitor goes after the challenge, on THIS site. The host comes from the request (CloudFront only routes
+ * hosts of this distribution), never from the query string, and original_url must be a path (see safeReturnPath).
+ * Without a Host header the Location stays relative, which the browser resolves against the current site.
+ */
+function returnLocation(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
+    const host = request.headers["host"]?.[0]?.value;
+    const returnPath = safeReturnPath(queryStringData.get("original_url")) ?? request.uri;
+    return host ? `https://${host}${returnPath}` : returnPath;
+}
+
+/** The 302 back to where the visitor was, with a new `_cq_se` session. Only sent once the token is verified. */
+function sessionRedirect(settings: TurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): CloudFrontResultResponse {
+    const ttl = settings.sessionTtlSeconds;
+    const expiresAt = Date.now() + (ttl * 1000);
+    const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId);
+
+    const sessionToken = `${expiresAt}.${signature}`;
+
+    const headers: CloudFrontHeaders = {
+        location: [{ key: 'Location', value: returnLocation(request, queryStringData) }],
+        // SameSite=Lax, NOT Strict. A visitor who reaches the site from another site
+        // (link click, ad, redirect) makes a cross-site top-level navigation. With Strict
+        // the browser does not send _cq_se on that request, so the session is never seen
+        // and the visitor is challenged again on every arrival from outside. Lax sends the
+        // cookie on top-level GET navigations but still withholds it from cross-site
+        // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
+        "set-cookie": [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}` }],
+    };
+    // Adds x-cheq-rti-result (the verdict of this request), provided by the handler. This 302 goes to the BROWSER
+    // (not the origin), so the client sees verdict, threat-type-code and ids. The redirected request is checked by
+    // RTI again and gets its own header on the way to the origin.
+    addRtiResultHeader?.(headers);
+
+    return {
+        status: '302',
+        headers,
+    };
+}
 
 const turnstileValidateChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
     // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)

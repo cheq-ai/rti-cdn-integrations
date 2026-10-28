@@ -37,8 +37,8 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
     const real = await importOriginal<typeof import('../../core/services/rti-helper.service')>();
     return {
         RTIHelperService: vi.fn().mockImplementation(function (config: any) {
-            // buildRtiResultHeader and parseCookies are pure functions with no side effects — use the
-            // real implementation so tests verify actual output rather than a duplicated mock formula.
+            // buildRtiResultHeader, parseCookies, isChallengeReplyAllowed and errorMessage are pure functions with no side
+            // effects — use the real implementation so tests verify actual output rather than a duplicated mock formula.
             const realInstance = new real.RTIHelperService(config);
             return {
                 shouldIgnore: mocks.shouldIgnore,
@@ -48,6 +48,8 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 validateConfig: vi.fn().mockReturnValue([]),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
                 buildRtiResultHeader: realInstance.buildRtiResultHeader.bind(realInstance),
+                isChallengeReplyAllowed: realInstance.isChallengeReplyAllowed.bind(realInstance),
+                errorMessage: realInstance.errorMessage.bind(realInstance),
             };
         }),
     };
@@ -69,6 +71,7 @@ vi.mock('../../core/helpers/block-page-helpers', () => ({
 import { handle, RequestType } from './request-helper';
 import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
+import { Mode } from '../../core/models/mode.model';
 import { config } from './config';
 import type { TestAdapter, NormalizedResult, InvokeOptions, ConfigOverrides } from '../../core/testing/test-adapter.interface';
 import { registerSharedBehaviorTests } from '../../core/testing/shared-unit-tests';
@@ -78,6 +81,11 @@ import { RTIHttpsLoggerService } from '../../core/services/rti-https-logger.serv
 import { createTurnstileChallenge } from './turnstile-challenge-example';
 
 // request-helper creates its services once, at import. Copied now: vi.clearAllMocks() in beforeEach wipes mock.calls.
+// The shipped Turnstile reply detector, set as config.isChallengeResponse in 'request-helper handle'.
+const turnstileIsChallengeResponse = createTurnstileChallenge({
+    siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'signing-secret', sessionTtlSeconds: 300,
+}).isChallengeResponse;
+
 const rtiServiceCtorCalls = [...vi.mocked(RTIHttpsService).mock.calls];
 const loggerCtorCalls = [...vi.mocked(RTIHttpsLoggerService).mock.calls];
 
@@ -208,6 +216,8 @@ const cloudfrontAdapter: TestAdapter = {
         (config as any).logErrors = undefined;
         (config as any).challenge = undefined;
         (config as any).validateChallenge = mocks.validateChallenge;
+        (config as any).isChallengeResponse = undefined;
+        (config as any).mode = undefined;
         (config as any).redirectLocation = 'https://www.cheq.ai/';
         (config as any).keepHeadersNames = [];
     },
@@ -255,6 +265,8 @@ describe('request-helper handle', () => {
         (config as any).keepHeadersNames = [];
         (config as any).challenge = undefined;
         (config as any).validateChallenge = mocks.validateChallenge;
+        (config as any).isChallengeResponse = turnstileIsChallengeResponse;
+        (config as any).mode = undefined;
         (config as any).redirectLocation = 'https://www.cheq.ai/';
     });
 
@@ -1203,6 +1215,624 @@ describe('request-helper handle', () => {
         expect(mocks.generateDefaultBlockPage).toHaveBeenCalledWith(status, title, expect.objectContaining({ rayId: 'ray-123' }), 'req-123');
     });
 
+    // --- Challenge reply: the solved form always goes to config.challenge (BLOCKING only), blocks still win ---
+
+    const replyQuery = new URLSearchParams({ original_url: '/landing?gclid=abc', request_id: 'ray-page', 'cf-turnstile-response': 'tok' }).toString();
+    const replyEvent = (cookies = '') => buildEvent('/landing', 'example.com', '1.2.3.4', replyQuery, cookies);
+    const replyChallenge = () => {
+        (config as any).mode = Mode.BLOCKING;
+        const challenge = vi.fn().mockResolvedValue({ status: '302', headers: {} });
+        (config as any).challenge = challenge;
+        return challenge;
+    };
+
+    // --- config.isChallengeResponse: recognizes a reply; customer code, so it may be missing, wrong or throw ---
+
+    it('recognizes a reply with config.isChallengeResponse, called with the request', async () => {
+        // Arrange: a CAPTCHA with its own token field
+        const challenge = replyChallenge();
+        const detector = vi.fn((request: any) => new URLSearchParams(request.querystring).has('my-captcha-token'));
+        (config as any).isChallengeResponse = detector;
+        const event = buildEvent('/landing', 'example.com', '1.2.3.4', 'my-captcha-token=abc');
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '302', headers: {} });
+        expect(detector).toHaveBeenCalledWith(event.Records[0].cf.request);
+        expect(challenge).toHaveBeenCalledOnce();
+    });
+
+    it('does not treat a Turnstile-shaped query as a reply when the configured detector says no', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = vi.fn().mockReturnValue(false);
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('forwards a reply unchanged when config.isChallengeResponse is not set', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = undefined;
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe(replyQuery);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['false', () => false],
+        ['undefined', () => undefined],
+        ['a truthy string', () => 'yes'],
+        ['1', () => 1],
+        ['a Promise of true (an async detector)', () => Promise.resolve(true)],
+    ])('treats a request as a reply only when config.isChallengeResponse returns true, not %s', async (_, value) => {
+        // Arrange
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = vi.fn().mockImplementation(value);
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=benign');
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['an Error', () => new Error('detector failed'), 'detector failed'],
+        ['undefined', () => undefined, 'undefined'],
+    ])('treats the request as no reply and logs it when config.isChallengeResponse throws %s', async (_, value, logged) => {
+        // Arrange
+        expectError = true;
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = vi.fn().mockImplementation(() => { throw value(); });
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert: forwarded as RTI decided (ALLOW, with the verdict header), challenge not called
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=benign');
+        expect(challenge).not.toHaveBeenCalled();
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("Challenge reply check error handling request 'req-123'"), value());
+        expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge reply check error handling request 'req-123': ${logged}`);
+    });
+
+    it('still challenges a CAPTCHA request when config.isChallengeResponse throws', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        const challenge = captchaVerdict();
+        (config as any).isChallengeResponse = vi.fn().mockImplementation(() => { throw new Error('detector failed'); });
+
+        // Act
+        const result = await handle(buildEvent(), RequestType.VIEWER_REQUEST);
+
+        // Assert: the usual CAPTCHA path, as if it were no reply
+        expect(result).toEqual({ status: '403', body: '<html>captcha</html>' });
+        expect(challenge).toHaveBeenCalledOnce();
+    });
+
+    it('forwards a reply when RTI fails and config.isChallengeResponse throws too', async () => {
+        // Arrange
+        expectError = true;
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = vi.fn().mockImplementation(() => { throw undefined; });
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).not.toHaveBeenCalled();
+        expect(mocks.loggerError).toHaveBeenCalledWith("Challenge reply check error handling request 'req-123': undefined");
+    });
+
+    it('does not call config.isChallengeResponse for a request that is blocked anyway', async () => {
+        // Arrange
+        replyChallenge();
+        const detector = vi.fn().mockReturnValue(true);
+        (config as any).isChallengeResponse = detector;
+        mocks.getAction.mockReturnValue(Action.BLOCK);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.ACCESS_DENIED);
+
+        // Act
+        const result = await handle(replyEvent(), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert
+        expect(result.status).toBe('403');
+        expect(detector).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['in MONITORING mode', Mode.MONITORING, true],
+        ['without config.challenge', Mode.BLOCKING, false],
+    ])('does not call config.isChallengeResponse %s', async (_, mode, withChallenge) => {
+        // Arrange
+        (config as any).mode = mode;
+        (config as any).challenge = withChallenge ? vi.fn() : undefined;
+        const detector = vi.fn().mockReturnValue(true);
+        (config as any).isChallengeResponse = detector;
+
+        // Act
+        await handle(replyEvent(), RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(detector).not.toHaveBeenCalled();
+    });
+
+    it('sends a reply that RTI allows to config.challenge instead of forwarding it', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '302', headers: {} });
+        expect(challenge).toHaveBeenCalledWith(
+            event.Records[0].cf.request,
+            expect.objectContaining({ decision: expect.objectContaining({ verdict: 'benign' }) }),
+            expect.any(Function), // addRtiResultHeader
+        );
+        expect(event.Records[0].cf.request.headers['x-cheq-rti-result']).toBeUndefined();
+    });
+
+    it('passes an addRtiResultHeader that sets the verdict of the reply', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+
+        // Act
+        await handle(replyEvent(), RequestType.VIEWER_REQUEST);
+        const headers: Record<string, any> = {};
+        challenge.mock.calls[0][2](headers);
+
+        // Assert
+        expect(headers['x-cheq-rti-result'][0].value).toContain('verdict=benign');
+    });
+
+    it('sends a CAPTCHA reply to config.challenge even with a valid session (checked before the session waiver)', async () => {
+        // Arrange
+        (config as any).mode = Mode.BLOCKING;
+        const challenge = captchaVerdict();
+        mocks.validateChallenge.mockResolvedValue(true);
+
+        // Act
+        const result = await handle(replyEvent('_cq_se=tok|ray'), RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '403', body: '<html>captcha</html>' });
+        expect(challenge).toHaveBeenCalledOnce();
+        expect(mocks.validateChallenge).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        [Action.BLOCK, ActionStrategy.ACCESS_DENIED, '403'],
+        [Action.BLOCK, ActionStrategy.NOT_FOUND, '404'],
+        [Action.REDIRECT, ActionStrategy.REDIRECT, '302'],
+        [Action.CHALLENGE, ActionStrategy.ACCESS_DENIED, '403'],
+    ])('still blocks a reply for action %s / strategy %s (returns %s)', async (action, strategy, status) => {
+        // Arrange
+        const challenge = replyChallenge();
+        mocks.getAction.mockReturnValue(action);
+        mocks.getActionStrategy.mockReturnValue(strategy);
+
+        // Act
+        const result = await handle(replyEvent(), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert
+        expect(result.status).toBe(status);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('forwards a reply unchanged in MONITORING mode', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+        (config as any).mode = Mode.MONITORING;
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe(replyQuery);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('forwards a request that is not a reply unchanged when RTI allows it', async () => {
+        // Arrange
+        const challenge = replyChallenge();
+        const event = buildEvent('/landing', 'example.com', '1.2.3.4', 'gclid=abc');
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe('gclid=abc');
+        expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=benign');
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('forwards a reply when no challenge is configured', async () => {
+        // Arrange
+        (config as any).mode = Mode.BLOCKING;
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+    });
+
+    it('forwards a reply when RTI throws and no challenge is configured', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe(replyQuery);
+    });
+
+    it('sends a reply to config.challenge with the stand-in response when the RTI response is malformed (any error before the decision)', async () => {
+        // Arrange: RTI answers, but the answer cannot be evaluated
+        expectError = true;
+        const challenge = replyChallenge();
+        mocks.getAction.mockImplementation(() => { throw new TypeError("Cannot read properties of undefined (reading 'verdict')"); });
+
+        // Act
+        const result = await handle(replyEvent(), RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '302', headers: {} });
+        const [, response, addRtiResultHeader] = challenge.mock.calls[0];
+        expect(response.ids.rayId).toBe('req-123');
+        expect(response.decision).toBeUndefined();
+        expect(addRtiResultHeader).toBeUndefined();
+    });
+
+    it('forwards a reply when RTI throws and config.isChallengeResponse is not set', async () => {
+        // Arrange
+        expectError = true;
+        const challenge = replyChallenge();
+        (config as any).isChallengeResponse = undefined;
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('forwards a reply on an ignored path unchanged, without RTI or config.isChallengeResponse', async () => {
+        // Arrange: the README tells sites to exclude their own Turnstile forms this way
+        const challenge = replyChallenge();
+        const detector = vi.fn().mockReturnValue(true);
+        (config as any).isChallengeResponse = detector;
+        mocks.shouldIgnore.mockReturnValue(true);
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe(replyQuery);
+        expect(mocks.callRTI).not.toHaveBeenCalled();
+        expect(detector).not.toHaveBeenCalled();
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('sends a reply to config.challenge when the action has no strategy ("should not happen"), like ALLOW', async () => {
+        // Arrange: a non-ALLOW action that getActionStrategy does not map
+        const challenge = replyChallenge();
+        mocks.getAction.mockReturnValue(Action.CHALLENGE);
+        mocks.getActionStrategy.mockReturnValue(null);
+
+        // Act
+        const result = await handle(replyEvent(), RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '302', headers: {} });
+        expect(challenge).toHaveBeenCalledOnce();
+    });
+
+    it('logs a throwing config.isChallengeResponse only to the console when logErrors is false', async () => {
+        // Arrange
+        expectError = true;
+        replyChallenge();
+        (config as any).logErrors = false;
+        (config as any).isChallengeResponse = vi.fn().mockImplementation(() => { throw new Error('detector failed'); });
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('Challenge reply check error'), expect.objectContaining({ message: 'detector failed' }));
+        expect(mocks.loggerError).not.toHaveBeenCalled();
+    });
+
+    it('logs in debug mode that a reply goes to config.challenge', async () => {
+        // Arrange
+        replyChallenge();
+        (config as any).debug = true;
+        const logs: string[] = [];
+        vi.spyOn(console, 'log').mockImplementation((...args) => { logs.push(String(args[0])); });
+
+        // Act
+        await handle(replyEvent(), RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(logs).toContain('challenge reply, passing it to challenge');
+    });
+
+    // --- A thrown value that is not an Error must not break the fail-open (logging used to read .message on it) ---
+
+    const nonErrors: [string, () => unknown, string][] = [
+        ['undefined', () => undefined, 'undefined'],
+        ['null', () => null, 'null'],
+        ['a string', () => 'boom', 'boom'],
+        ['a null-prototype object', () => Object.create(null), '[object Object]'],
+        ['an object whose toString throws', () => ({ toString() { throw new Error('toString failed'); } }), '[object Object]'],
+        ['an Error whose message is a Symbol', () => Object.assign(new Error(), { message: Symbol('s') }), 'Symbol(s)'],
+    ];
+
+    it('forwards a reply when config.challenge throws synchronously (not a rejected promise)', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        (config as any).challenge = vi.fn().mockImplementation(() => { throw new Error('sync throw'); });
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge error handling request 'req-123': sync throw`);
+    });
+
+    it.each(nonErrors)('forwards a reply when config.challenge rejects with %s, calling it once', async (_, value, logged) => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        const challenge = vi.fn().mockImplementation(() => Promise.reject(value()));
+        (config as any).challenge = challenge;
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).toHaveBeenCalledOnce();
+        expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge error handling request 'req-123': ${logged}`);
+    });
+
+    it.each(nonErrors)('forwards a CAPTCHA request when config.challenge rejects with %s', async (_, value, logged) => {
+        // Arrange
+        expectError = true;
+        captchaVerdict().mockImplementation(() => Promise.reject(value()));
+        const event = buildEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge error handling request 'req-123': ${logged}`);
+    });
+
+    it.each(nonErrors)('forwards the request when RTI rejects with %s', async (_, value, logged) => {
+        // Arrange
+        expectError = true;
+        mocks.callRTI.mockImplementation(() => Promise.reject(value()));
+        const event = buildEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalledWith(`Error handling request 'req-123': ${logged}`);
+    });
+
+    it('forwards a reply when RTI and config.challenge both reject with undefined', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        const challenge = vi.fn().mockImplementation(() => Promise.reject(undefined));
+        (config as any).challenge = challenge;
+        mocks.callRTI.mockImplementation(() => Promise.reject(undefined));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).toHaveBeenCalledOnce();
+    });
+
+    it('forwards a reply and logs the error when config.challenge throws (fail open)', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        (config as any).challenge = vi.fn().mockRejectedValue(new Error('siteverify unreachable'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('req-123'), expect.objectContaining({ message: 'siteverify unreachable' }));
+        expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('siteverify unreachable'));
+    });
+
+    it('still sends a reply to config.challenge when RTI throws, with a stand-in response (CloudFront request id only) and no addRtiResultHeader', async () => {
+        // Arrange
+        expectError = true;
+        const challenge = replyChallenge();
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toEqual({ status: '302', headers: {} });
+        expect(challenge).toHaveBeenCalledOnce();
+        const [request, response, addRtiResultHeader] = challenge.mock.calls[0];
+        expect(request).toBe(event.Records[0].cf.request);
+        // Not an RTI answer: only the CloudFront request id, as rayId (it signs the example's session) and as customParam2
+        // (as customId2 in the normal RTI payload). No verdict, classification or other ids.
+        expect(response).toEqual({
+            ids: {
+                rayId: 'req-123', customParam2: 'req-123',
+                pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam3: null, customParam4: null,
+            },
+        });
+        expect(addRtiResultHeader).toBeUndefined();
+        expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('RTI timeout'));
+    });
+
+    // --- The stand-in rayId must be a plain, unique id (the example signs it and puts it in a cookie) ---
+
+    // Sends a reply while RTI is down, with the given CloudFront request id (undefined: none in the event).
+    const replyWithRtiDown = async (requestId: string | undefined) => {
+        expectError = true;
+        const challenge = replyChallenge();
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+        if (requestId === undefined) {
+            delete (event.Records[0].cf.config as any).requestId;
+        } else {
+            (event.Records[0].cf.config as any).requestId = requestId;
+        }
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        await handle(event, RequestType.VIEWER_REQUEST);
+        return { response: challenge.mock.calls[0][1], warn };
+    };
+
+    it('uses a plain CloudFront request id as the stand-in rayId, without a warning', async () => {
+        // Act
+        const { response, warn } = await replyWithRtiDown('4TyzHTaYWb1GX1qTfsHhEqV6HUDd_BzoBZnwfnvQc_1oF26ClkoUSEQ==');
+
+        // Assert
+        expect(response.ids.rayId).toBe('4TyzHTaYWb1GX1qTfsHhEqV6HUDd_BzoBZnwfnvQc_1oF26ClkoUSEQ==');
+        expect(warn).not.toHaveBeenCalled();
+        expect(mocks.loggerError).not.toHaveBeenCalledWith(expect.stringContaining('not usable as rayId'));
+    });
+
+    it.each([
+        ['cookie separators', 'abc; Domain=evil|x', 'abc; Domain=evil|x'],
+        ['spaces and parentheses (the on_error_request_id fallback)', 'on_error_request_id (boom)', 'on_error_request_id (boom)'],
+        ['an empty id', '', ''],
+        ['no id in the event (the constant unknown_request_id, not unique)', undefined, 'unknown_request_id'],
+        ['more than 200 characters', 'a'.repeat(201), 'a'.repeat(201)],
+    ])('replaces a CloudFront request id with %s by a random stand-in rayId, logged to the console and the RTI logger', async (_, requestId, cfRequestId) => {
+        // Act
+        const { response, warn } = await replyWithRtiDown(requestId);
+
+        // Assert: a random plain id, while customParam2 keeps the real one for correlation
+        expect(response.ids.rayId).toMatch(/^cf-fallback-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+        expect(response.ids.customParam2).toBe(cfRequestId);
+        const message = `RTI failed and the CloudFront request id ${JSON.stringify(cfRequestId)} is not usable as the stand-in rayId, using ${response.ids.rayId}`;
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(`[challenge] ${message}`);
+        expect(mocks.loggerError).toHaveBeenCalledWith(message);
+    });
+
+    it('uses a new random stand-in rayId for every request', async () => {
+        // Act
+        const first = await replyWithRtiDown('bad id');
+        const second = await replyWithRtiDown('bad id');
+
+        // Assert
+        expect(first.response.ids.rayId).not.toBe(second.response.ids.rayId);
+    });
+
+    it('logs a replaced stand-in rayId only to the console when logErrors is false', async () => {
+        // Arrange
+        (config as any).logErrors = false;
+
+        // Act
+        const { warn } = await replyWithRtiDown('bad id');
+
+        // Assert
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('not usable as the stand-in rayId'));
+        expect(mocks.loggerError).not.toHaveBeenCalled();
+    });
+
+    it('forwards a reply when RTI throws and config.challenge throws too', async () => {
+        // Arrange
+        expectError = true;
+        (config as any).mode = Mode.BLOCKING;
+        (config as any).challenge = vi.fn().mockRejectedValue(new Error('siteverify unreachable'));
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('siteverify unreachable'));
+    });
+
+    it.each([
+        ['MONITORING mode', Mode.MONITORING, 'tok'],
+        ['a request that is not a reply', Mode.BLOCKING, ''],
+    ])('does not call config.challenge when RTI throws for %s', async (_, mode, token) => {
+        // Arrange
+        expectError = true;
+        const challenge = replyChallenge();
+        (config as any).mode = mode;
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        const event = buildEvent('/landing', 'example.com', '1.2.3.4', token ? replyQuery : 'gclid=abc');
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(challenge).not.toHaveBeenCalled();
+    });
+
     // --- End to end with the real Turnstile example (only RTI, logger and siteverify are stubbed) ---
 
     it('Turnstile end to end: challenge page, solved 302 with cookie and header, then the cookie waives the CAPTCHA', async () => {
@@ -1245,5 +1875,128 @@ describe('request-helper handle', () => {
         expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=suspicious');
         expect(siteverify).toHaveBeenCalledOnce();
         expect(mocks.callRTI).toHaveBeenCalledTimes(3);
+    });
+
+    it('Turnstile end to end: RTI allows the reply, which still gets the session and goes back to the original query string', async () => {
+        // Arrange
+        const turnstile = createTurnstileChallenge({
+            siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+        });
+        (config as any).challenge = turnstile.challenge;
+        (config as any).validateChallenge = turnstile.validateChallenge;
+        (config as any).mode = Mode.BLOCKING;
+        mocks.getAction.mockReturnValue(Action.CHALLENGE);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+        mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-page' }));
+        const siteverify = vi.fn().mockResolvedValue({ json: async () => ({ success: true }) });
+        vi.stubGlobal('fetch', siteverify);
+
+        // Act 1: challenge page for a URL with a query string
+        const page = await handle(buildEvent('/landing', 'example.com', '1.2.3.4', 'gclid=abc'), RequestType.VIEWER_REQUEST) as any;
+        const originalUrl = page.body.match(/name="original_url" value="([^"]*)"/)[1].replace(/&amp;/g, '&');
+
+        // Act 2: the solved form comes back, but RTI now allows it
+        mocks.getAction.mockReturnValue(Action.ALLOW);
+        mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'benign', rayId: 'ray-reply' }));
+        const replyQuery = new URLSearchParams({ original_url: originalUrl, request_id: 'ray-page', 'cf-turnstile-response': 'tok' }).toString();
+        const solved = await handle(buildEvent('/landing', 'example.com', '1.2.3.4', replyQuery), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert 2: verified, same 302 and session as a challenged reply, not forwarded to the origin
+        expect(solved.status).toBe('302');
+        expect(solved.headers.location[0].value).toBe('https://example.com/landing?gclid=abc');
+        expect(siteverify).toHaveBeenCalledOnce();
+        const cookie = solved.headers['set-cookie'][0].value.split(';')[0];
+        expect(cookie).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|ray-reply$/);
+        expect(solved.headers['set-cookie'][0].value).toContain('Max-Age=300');
+
+        // Act 3: the redirected request is challenged again → the cookie waives the CAPTCHA, the URL is forwarded as is
+        mocks.getAction.mockReturnValue(Action.CHALLENGE);
+        mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-next' }));
+        const event = buildEvent('/landing', 'example.com', '1.2.3.4', 'gclid=abc', cookie);
+        const forwarded = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert 3
+        expect(forwarded).toBe(event.Records[0].cf.request);
+        expect(event.Records[0].cf.request.querystring).toBe('gclid=abc');
+        expect(siteverify).toHaveBeenCalledOnce();
+    });
+
+    const realTurnstile = (siteverifyResult: unknown) => {
+        const turnstile = createTurnstileChallenge({
+            siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+        });
+        (config as any).challenge = turnstile.challenge;
+        (config as any).validateChallenge = turnstile.validateChallenge;
+        (config as any).mode = Mode.BLOCKING;
+        const siteverify = siteverifyResult instanceof Error
+            ? vi.fn().mockRejectedValue(siteverifyResult)
+            : vi.fn().mockResolvedValue(siteverifyResult);
+        vi.stubGlobal('fetch', siteverify);
+        return siteverify;
+    };
+
+    it('Turnstile end to end: a refresh of a used reply URL that RTI allows reaches challenge and gets its failure response', async () => {
+        // Arrange: RTI allows the refresh, the token was already used
+        const siteverify = realTurnstile({ json: async () => ({ success: false, 'error-codes': ['timeout-or-duplicate'] }) });
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST) as any;
+
+        // Assert: not forwarded with the form fields, no session
+        expect(siteverify).toHaveBeenCalledOnce();
+        expect(result).not.toBe(event.Records[0].cf.request);
+        expect(result.status).toBe('403');
+        expect(result.headers?.['set-cookie']).toBeUndefined();
+    });
+
+    it('Turnstile end to end: RTI is down, the solved reply still gets the session and goes back to the original URL', async () => {
+        // Arrange
+        expectError = true;
+        realTurnstile({ json: async () => ({ success: true }) });
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+
+        // Act
+        const result = await handle(replyEvent(), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe('https://example.com/landing?gclid=abc');
+        expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|req-123;/);
+        expect(result.headers['x-cheq-rti-result']).toBeUndefined();
+    });
+
+    it('Turnstile end to end: RTI is down and the CloudFront request id is unusable, the session still works', async () => {
+        // Arrange
+        expectError = true;
+        realTurnstile({ json: async () => ({ success: true }) });
+        mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const event = replyEvent();
+        (event.Records[0].cf.config as any).requestId = 'abc; Domain=evil|x'; // read-only in the types
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST) as any;
+
+        // Assert: one well-formed cookie, with the random rayId, that validateChallenge accepts
+        const setCookie: string = result.headers['set-cookie'][0].value;
+        expect(setCookie).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|cf-fallback-[0-9a-f-]{36}; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=300$/);
+        const cookie = setCookie.split(';')[0];
+        const next = buildEvent('/landing', 'example.com', '1.2.3.4', 'gclid=abc', cookie).Records[0].cf.request;
+        expect(await (config as any).validateChallenge(next, false)).toBe(true);
+    });
+
+    it('Turnstile end to end: the siteverify call fails → the reply is forwarded (fail open)', async () => {
+        // Arrange
+        expectError = true;
+        realTurnstile(new Error('siteverify unreachable'));
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(result).toBe(event.Records[0].cf.request);
+        expect(mocks.loggerError).toHaveBeenCalledWith(expect.stringContaining('Challenge error'));
     });
 });

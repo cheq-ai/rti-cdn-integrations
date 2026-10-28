@@ -135,8 +135,9 @@ integrations/cloudfront/
 │   ├── request-helper.ts              # Shared RTI processing logic (both lambdas call this)
 │   ├── turnstile-challenge-example.ts # Reference CAPTCHA challenge implementation (Cloudflare Turnstile)
 │   ├── request-helper.spec.ts         # Unit tests for the handler (+ the shared behavioral suite)
-│   ├── request-helper.integration.spec.ts # Shared integration suite with the real decision logic
-│   ├── turnstile-challenge-example.spec.ts # Challenge page, siteverify, session signing and validation
+│   ├── request-helper.integration.spec.ts # Shared integration suite + challenge replies, with the real decision logic
+│   ├── request-helper.startup.spec.ts # What request-helper logs at load (missing isChallengeResponse)
+│   ├── turnstile-challenge-example.spec.ts # Challenge page, reply detection, siteverify, session signing and validation
 │   ├── config.spec.ts                 # The shipped config.ts: defaults and Turnstile wiring
 │   └── validate-config.spec.ts        # Sanity-check that config.ts passes validation
 │
@@ -181,7 +182,7 @@ integrations/core/                     # Shared library (bundled by esbuild at b
 │   ├── rti-https.service.spec.ts      # Unit tests for the https RTI caller
 │   ├── rti.service.ts                 # fetch-based RTI caller (used by other CDNs)
 │   ├── rti.service.spec.ts            # Unit tests for RTI service
-│   ├── rti-helper.service.ts          # Action/strategy decision logic
+│   ├── rti-helper.service.ts          # Action/strategy decision logic, challenge-reply strategy check, safe error messages
 │   ├── rti-helper.service.spec.ts     # Unit tests for helper service
 │   ├── rti-logger.service.base.ts     # Shared payload and error handling for the RTI loggers
 │   ├── rti-logger.service.base.spec.ts # Unit tests for the shared logger logic
@@ -371,8 +372,9 @@ This one seems less important for rti v4 and kept in case it will be needed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `challenge` | `(request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void) => Promise<CloudFrontRequestResult \| CloudFrontResponseResult>` | `undefined` | Called when action strategy is `CAPTCHA` (and the visitor has no valid session). Receives the full CloudFront request and RTI response. Must return a CloudFront response (e.g. challenge page) or the request (pass-through). `addRtiResultHeader` sets `x-cheq-rti-result` on the headers you pass it; call it on the responses that should carry the verdict (the example does so only on the 302 after a solved challenge). See `turnstile-challenge-example.ts` for a reference implementation. |
-| `validateChallenge` | `(request: CloudFrontRequest, isDebug?: boolean) => Promise<boolean>` | `undefined` | Called only when the RTI action strategy is `CAPTCHA` and `challenge` is set. Return `true` when the visitor already solved the challenge (e.g. a valid session cookie): the challenge is waived and the request is forwarded with `x-cheq-rti-result` carrying the real verdict. It does **not** skip RTI: every request still gets a verdict. Only the `CAPTCHA` strategy is waived: `ACCESS_DENIED`, `NOT_FOUND` and `REDIRECT` are always enforced. If you set `blockingStrategy: CAPTCHA`, a valid session also waives blocked (malicious) traffic. If it throws, the request is passed through without the header (fail-open). |
+| `challenge` | `(request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void) => Promise<CloudFrontRequestResult \| CloudFrontResponseResult>` | `undefined` | Called when action strategy is `CAPTCHA` (and the visitor has no valid session). In `BLOCKING` mode also called for every reply to the challenge page when RTI allows it or the strategy is `CAPTCHA`, with or without a valid session, and when the request cannot be evaluated (see [The reply to the challenge page](#the-reply-to-the-challenge-page)). Any other strategy is enforced as usual. Receives the full CloudFront request and RTI response. Must return a CloudFront response (e.g. challenge page) or the request (pass-through). `addRtiResultHeader` sets `x-cheq-rti-result` on the headers you pass it; call it on the responses that should carry the verdict (the example does so only on the 302 after a solved challenge). See `turnstile-challenge-example.ts` for a reference implementation. |
+| `validateChallenge` | `(request: CloudFrontRequest, isDebug?: boolean) => Promise<boolean>` | `undefined` | Called only when the RTI action strategy is `CAPTCHA` and `challenge` is set, and never for a reply that `isChallengeResponse` recognizes (in `BLOCKING` mode that reply goes to `challenge` first, see [The reply to the challenge page](#the-reply-to-the-challenge-page)). An unrecognized reply (no `isChallengeResponse`, or it returns something other than `true` or throws) goes through the usual flow, including this check. Return `true` when the visitor already solved the challenge (e.g. a valid session cookie): the challenge is waived and the request is forwarded with `x-cheq-rti-result` carrying the real verdict. It does **not** skip RTI: every request still gets a verdict. Only the `CAPTCHA` strategy is waived: `ACCESS_DENIED`, `NOT_FOUND` and `REDIRECT` are always enforced. If you set `blockingStrategy: CAPTCHA`, a valid session also waives blocked (malicious) traffic. If it throws, the request is passed through without the header (fail-open). |
+| `isChallengeResponse` | `(request: CloudFrontRequest) => boolean` | `undefined` | Recognizes the reply to the challenge page; in `BLOCKING` mode such a reply always goes to `challenge` (see [The reply to the challenge page](#the-reply-to-the-challenge-page)). The Turnstile example looks for `cf-turnstile-response` in the query. Only a synchronous `true` counts: any other value, a `Promise` included, means no reply. If it throws, the request is handled as no reply and the error is logged. Not set while `challenge` is: replies are not recognized, and a warning is logged once per cold start. Not called in `MONITORING` mode, without `challenge`, or when the request is blocked, 404'd or redirected anyway. |
 | `keepHeadersNames` | `string[]` | — | **Required** (pass `[]` to send all headers). When non-empty, only these header names are sent to RTI, on both triggers. Useful for reducing payload size when only certain headers are relevant. On origin-request, the origin request policy also limits which headers exist in the first place. |
 
 ### Network & Endpoints
@@ -394,20 +396,20 @@ This one seems less important for rti v4 and kept in case it will be needed.
 ### Complete Config Example
 
 ```typescript
-// Replaces the `turnstile` block and the `config` object in src/config.ts. All imports are shown for
+// Replaces the `turnstileConfig` block and the `config` object in src/config.ts. All imports are shown for
 // completeness: src/config.ts already has Mode and createTurnstileChallenge, so add only ActionStrategy and EventType.
 import { Mode } from '../../core/models/mode.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { EventType } from '../../core/models/event-type.model';
 import { createTurnstileChallenge } from './turnstile-challenge-example';
 
-const turnstile = {
+const turnstileConfig = {
   siteKey: "REPLACE_ME",
   secretKey: "REPLACE_ME",
   sessionSigningSecret: "REPLACE_ME", // NOT the Turnstile secret: `openssl rand -hex 32`
   sessionTtlSeconds: 300,
 };
-const turnstileChallenge = createTurnstileChallenge(turnstile); // both undefined until configured
+const turnstileChallenge = createTurnstileChallenge(turnstileConfig); // all three undefined until configured
 
 export const config: CloudfrontConfig = {
   // --- Required ---
@@ -470,6 +472,7 @@ export const config: CloudfrontConfig = {
   // --- Challenge (CAPTCHA) ---
   challenge: turnstileChallenge.challenge,
   validateChallenge: turnstileChallenge.validateChallenge,
+  isChallengeResponse: turnstileChallenge.isChallengeResponse,
 
   // --- Origin-request header filtering ---
   // [] or undefined = forward all available headers to RTI (recommended)
@@ -567,6 +570,11 @@ CloudFront Event
 │    In MONITORING mode: always returns ALLOW                      │
 └─────────────────────────────────────────────────────────────────┘
        │
+       ├─── BLOCKING + config.challenge, no strategy (ALLOW) or CAPTCHA (isChallengeReplyAllowed),
+       │    and config.isChallengeResponse(req) === true (a throw counts as false, logged)
+       │                  config.challenge(req, resp) → verify token, 302 to original_url
+       │                  (before the session waiver; on error: fail-open)
+       │
        ├─── ALLOW ──────────────────────────────────────────────────►
        │                  Inject x-cheq-rti-result header
        │                  Return cfRequest to origin
@@ -589,7 +597,9 @@ CloudFront Event
 ┌─────────────────────────────────────────────────────────────────┐
 │ ERROR HANDLING (outer try/catch)                                 │
 │ Any exception → console.error (+ logger unless logErrors: false) │
-│                → return cfRequest                                │
+│                → BLOCKING challenge reply: config.challenge      │
+│                  (stand-in response, see the challenge section)  │
+│                → otherwise return cfRequest                      │
 │ FAIL-OPEN: on any error, traffic is allowed through              │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -711,7 +721,7 @@ These numbers show that the network cost is the same for both clients and the di
 - Switching to `node:https` removes most of the client's cold-start cost, but the connection setup (DNS, TCP, TLS) remains. At ~1.2 s per cold call in our measurement, a 1,500ms timeout leaves little margin, so edge regions far from the RTI endpoint may still time out on cold starts.
 - Use the `rti_duration` telemetry (sent to the CHEQ logger endpoint, not to CloudWatch) and CloudWatch `REPORT` lines (an `Init Duration` field marks a cold start) to see how often your deployment hits this.
 
-**The logger call adds to the same request.** The handler waits for the RTI logger before it answers the viewer: on every error (unless `logErrors` is `false`), and after every RTI call when `telemetry` is on. On a cold container this is a second new TLS connection, to a different host. The logger therefore also uses `node:https` (`RTIHttpsLoggerService`) and gives up after 1,000ms, so a slow logger cannot push the request past the 5 s viewer-request limit. Up to two log calls can be awaited in one request (telemetry after the RTI call, then an error log if anything later fails, e.g. the challenge), so the worst case is about `config.timeout` + 2 × 1,000ms, plus the challenge's own time. Keep `config.timeout` at or below about 2,500ms for viewer-request. A log that times out is written to CloudWatch (`rti logger api error (continue running): ...`) and dropped. The logger endpoint also closes idle connections after 60s, so its connections are closed after 50s like the RTI ones.
+**The logger call adds to the same request.** The handler waits for the RTI logger before it answers the viewer: on every error (unless `logErrors` is `false`), and after every RTI call when `telemetry` is on. On a cold container this is a second new TLS connection, to a different host. The logger therefore also uses `node:https` (`RTIHttpsLoggerService`) and gives up after 1,000ms, so a slow logger cannot push the request past the 5 s viewer-request limit. Each awaited log call can add up to 1,000ms. A request can await: telemetry after the RTI call; an error log when anything fails (the RTI call, the decision, the challenge); and, for a reply to the challenge page, a log when `isChallengeResponse` throws or when the stand-in `rayId` is replaced (see [The reply to the challenge page](#the-reply-to-the-challenge-page)). Usually at most two come together (e.g. an RTI error, then a challenge error), so the worst case is about `config.timeout` + 2 × 1,000ms, plus the challenge's own time. Up to four only when several of these fail in the same request. Keep `config.timeout` at or below about 2,500ms for viewer-request. A log that times out is written to CloudWatch (`rti logger api error (continue running): ...`) and dropped. The logger endpoint also closes idle connections after 60s, so its connections are closed after 50s like the RTI ones.
 
 #### Reused connections
 
@@ -812,7 +822,7 @@ This is just an example for Captcha using Cloudflare Turnstile, the customer can
 
 ### Setup
 
-The settings live in the `turnstile` block at the top of [`src/config.ts`](src/config.ts). Replace three values:
+The settings live in the `turnstileConfig` block at the top of [`src/config.ts`](src/config.ts). Replace three values:
 
 | Setting | Where it comes from |
 |---------|---------------------|
@@ -822,21 +832,24 @@ The settings live in the `turnstile` block at the top of [`src/config.ts`](src/c
 
 `sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds; any other value (0, negative, fractional, a string) logs a warning and 300 is used.
 
-`config.ts` passes them to `createTurnstileChallenge(turnstile)`, which returns `challenge` and `validateChallenge`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns neither and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
+`config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
 ### How the Challenge Flow Works
 
 ```
-Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
+Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blockingStrategy: CAPTCHA)
+                and there is no valid session → config.challenge() called
+                    (in BLOCKING mode also for every reply, see The reply to the challenge page)
         │
         ▼
  Does the request have a `cf-turnstile-response` query parameter?
         │
    NO ──┤──► Return HTTP 403 with CAPTCHA challenge page
-        │       (Turnstile widget + hidden form)
+        │       (Turnstile widget + hidden form; `original_url` holds the path and query string)
         │       User solves the CAPTCHA
         │       Turnstile widget injects hidden `cf-turnstile-response` input into the form
-        │       Form submits (GET) back to same URL with token appended
+        │       Form submits (GET) to the same path: the query becomes original_url, request_id
+        │       and cf-turnstile-response (the visitor's own query travels inside original_url)
         │
    YES ──► POST token to Cloudflare siteverify API (server-side)
                │
@@ -867,7 +880,8 @@ Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
 > navigations while still withholding it from cross-site subrequests (iframes, images, `fetch`) and cross-site `POST`s.
 > Keep `Lax` if you copy or adapt the challenge example.
 
-On subsequent requests RTI always runs. `config.validateChallenge` is called only when RTI asks for a CAPTCHA again:
+On subsequent requests RTI always runs. `config.validateChallenge` is called only when RTI asks for a CAPTCHA again
+(and the request is not a reply that `isChallengeResponse` recognizes, which goes to `config.challenge` instead):
 
 ```
 Read _cq_se (from all Cookie headers) → parse _cq_se as {token}|{rayId}
@@ -885,10 +899,63 @@ Split token → {expiresAt}.{signature}
 ```
 
 A valid session waives only the `CAPTCHA` strategy (with `blockingStrategy: CAPTCHA` that includes blocked traffic). An `ACCESS_DENIED`, `NOT_FOUND` or `REDIRECT` response is enforced as usual, and a benign verdict is forwarded
-with the header without checking the cookie. The session expiry is fixed (not extended on later requests).
+with the header without checking the cookie (unless it is a reply to the challenge page). The session expiry is fixed (not extended on later requests).
 
 > **Cost:** a request with a valid session now makes an RTI call too, which matters for cold-start timeouts on viewer-request
 > (see [Memory, CPU and Cold Starts](#memory-cpu-and-cold-starts)). Checking the signature itself takes microseconds.
+
+### The reply to the challenge page
+
+The solved form is a new request, so RTI gives it a new verdict. When that verdict is no longer a CAPTCHA (e.g. `ALLOW`),
+or a valid `_cq_se` session would waive it (two tabs, Back, refresh), forwarding it would send the origin
+`?original_url=…&request_id=…&cf-turnstile-response=…` instead of the visitor's query string, without setting a session.
+So in `BLOCKING` mode the handler passes every reply to `config.challenge`, which answers it (the Turnstile example
+verifies the token and redirects to `original_url`):
+
+```
+BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChallengeReplyAllowed)
+     │
+     ├── any other strategy (ACCESS_DENIED / NOT_FOUND / REDIRECT) → enforced as usual (isChallengeResponse is not called)
+     │
+     └── no strategy (ALLOW) or CAPTCHA, with or without a session
+              │
+         config.isChallengeResponse(request) === true?   (Turnstile example: cf-turnstile-response in the query, with a value)
+              │
+              ├── no, not set, or it throws → the usual flow (forward, CAPTCHA, session waiver, ...)
+              │
+              └── yes → config.challenge (the Turnstile example:)
+                         Verified → 302 to original_url with a new _cq_se session (same sessionTtlSeconds)
+                         Failed (used, expired or forged token) → 403 "Verification failed" (see Troubleshooting)
+```
+
+- **The challenge recognizes its own reply.** `config.isChallengeResponse` comes with the challenge (the Turnstile
+  example returns it from `createTurnstileChallenge`), so the handler knows nothing about any CAPTCHA's field names.
+- **Field name only.** The Turnstile example's `isChallengeResponse` looks only for the Turnstile field name. A site's own
+  `GET` form with a Turnstile widget therefore looks like a reply too: in `BLOCKING` mode it is verified by
+  `config.challenge` and redirected to its own URL instead of reaching the origin. Exclude such pages with `ignorePaths`.
+- **Customer code, handled defensively.** Only a synchronous `true` counts (an `async` detector's `Promise` means no reply).
+  If it throws, the request is handled as no reply (the usual flow) and the error is logged, also when RTI is down.
+  Without `isChallengeResponse` replies are not recognized, and a warning is logged once per cold start.
+- **RTI down.** When a recognized reply cannot be evaluated (RTI error or timeout, a malformed RTI response, or any other
+  error before the decision, which all end in the handler's outer `catch`), it still goes to `config.challenge`, without
+  `addRtiResultHeader` and with a stand-in `response` that is **not an RTI answer**: only `ids` exists, with
+  `ids.rayId` and `ids.customParam2` set to the CloudFront request id (like `customId2` in the normal RTI payload) and every
+  other id `null`. There is no `decision`, `classification` or anything else.
+  - **Why `ids.rayId` is set:** `challenge` needs a non-empty, unique id. The example signs the `_cq_se` session with it and
+    stores it in the cookie, and `validateChallenge` rejects a session with an empty one. It is never compared with RTI, so
+    the session works like any other: the visitor proved they are human to Cloudflare, only the RTI verdict is missing.
+  - **Always a plain, unique id.** CloudFront does not document the request id's characters, so it is checked: if it is
+    not 1 to 200 of `A-Z a-z 0-9 _ = . -` (e.g. our own `on_error_request_id (...)` fallback, which has spaces), or it
+    is the constant `unknown_request_id`, `ids.rayId` is a random `cf-fallback-<uuid>` instead. `ids.customParam2` keeps
+    the real CloudFront request id. Both values are logged (`console.warn`, and the RTI logger unless `logErrors` is
+    `false`), so the session can be traced to the request.
+  - **It is not an RTI ray id.** Do not log or report it as one in a custom `challenge`, and check any other field before
+    reading it (a throw is caught and the reply is forwarded).
+  - It is never taken from `request_id` in the query: the client controls that value, and it would end up in `Set-Cookie`.
+  - **Cost:** while RTI is failing, each reply makes a siteverify call that a plain fail-open forward would not.
+- It never lengthens a session or skips RTI: a new `_cq_se` still needs a token that Cloudflare verifies, and the
+  redirected request is checked by RTI again. `MONITORING` mode forwards replies unchanged, like everything else.
+- If `config.challenge` throws (e.g. the siteverify call fails), the reply is forwarded (fail-open).
 
 ### Session Cookie Format
 
@@ -899,17 +966,19 @@ _cq_se={expiresAtMs}.{hexSignature}|{rayId}
 - `expiresAtMs`: Unix timestamp in milliseconds (TTL default: 300 seconds)
 - `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId]`. Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
 - **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. A copied `_cq_se` cookie therefore works in another browser until it expires (`sessionTtlSeconds`).
-- `rayId`: RTI ray ID from the original BLOCK/CHALLENGE response
+- `rayId`: the RTI ray ID of the request that was answered with the session, i.e. the reply to the challenge page (not
+  the request that showed the page). When RTI was down, the CloudFront request id or a random `cf-fallback-<uuid>` (see
+  the **RTI down** item in [The reply to the challenge page](#the-reply-to-the-challenge-page)).
 
 ### Implementing a Custom Challenge
 
-Replace `turnstileChallenge.challenge` / `turnstileChallenge.validateChallenge` in `config.ts` with your own functions (one or both) matching these signatures:
+Replace `turnstileChallenge.challenge` / `turnstileChallenge.validateChallenge` / `turnstileChallenge.isChallengeResponse` in `config.ts` with your own functions (any of them) matching these signatures:
 
 ```typescript
 // config.challenge
 async (
   request: CloudFrontRequest,
-  rtiResponse: RTIResponse,
+  rtiResponse: RTIResponse, // when RTI failed (reply only): a stand-in with only `ids`, see "RTI down"
   addRtiResultHeader?: (headers: CloudFrontHeaders) => void // optional: adds x-cheq-rti-result to these headers
 ): Promise<CloudFrontRequestResult | CloudFrontResponseResult>
 
@@ -918,11 +987,23 @@ async (
   request: CloudFrontRequest,
   isDebug?: boolean
 ): Promise<boolean>
+
+// config.isChallengeResponse (synchronous: only `true` counts)
+(
+  request: CloudFrontRequest
+): boolean
 ```
 
 The `challenge` function must return either:
 - A CloudFront **response** object (e.g. 403 with challenge page HTML, or 302 redirect)
 - The original **request** (pass-through, if you want to allow after custom logic). It reaches the origin **without** `x-cheq-rti-result` unless you call `addRtiResultHeader(request.headers)` first.
+
+A custom `challenge` must also handle the reply to its own page (see [The reply to the challenge page](#the-reply-to-the-challenge-page)),
+and `isChallengeResponse` must recognize that reply (e.g. by your CAPTCHA's token field). `challenge` is called for every
+request it recognizes, also when RTI allows it, when the visitor has a valid session, and when RTI fails (a stand-in
+`response` with only `ids`, where `ids.rayId` is the CloudFront request id and not an RTI ray id, and no
+`addRtiResultHeader`: see the **RTI down** item there). Without `isChallengeResponse`, replies are not recognized (a warning is
+logged once per cold start): in `BLOCKING` mode a reply that RTI allows then reaches the origin with the form fields.
 
 > **Note:** If `config.challenge` throws, the error is caught and the request is passed through (fail-open). Errors are logged via `console.error`, and to the RTI logger unless `logErrors` is `false`.
 
@@ -956,8 +1037,9 @@ npm test
 
 Tests are in:
 - `src/request-helper.spec.ts` — the handler's own tests plus the shared behavioral suite (`core/testing/shared-unit-tests.ts`)
-- `src/request-helper.integration.spec.ts` — the shared integration suite, with the real decision logic
-- `src/turnstile-challenge-example.spec.ts` — challenge page, siteverify, session signing and validation
+- `src/request-helper.integration.spec.ts` — the shared integration suite and the challenge-reply cases, with the real decision logic
+- `src/request-helper.startup.spec.ts` — what `request-helper.ts` logs when it loads (`challenge` without `isChallengeResponse`)
+- `src/turnstile-challenge-example.spec.ts` — challenge page, reply detection, siteverify, session signing and validation
 - `src/config.spec.ts` — the shipped `config.ts`: defaults and Turnstile wiring
 - `src/validate-config.spec.ts` — verifies `config.ts` passes validation
 - `../../core/services/*.spec.ts` — unit tests for core services (run separately from `integrations/core/`)
@@ -1080,9 +1162,9 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 
 **Symptom:** CloudWatch shows `Task timed out after X seconds`.
 
-**Cause:** The whole handler took longer than the Lambda limit (5 s for viewer-request, 30 s for origin-request). A slow RTI call alone does not cause this: it is aborted after `config.timeout` and the request passes through. The handler's time is `config.timeout` + up to 1,000ms per awaited logger call (telemetry, errors) + the challenge's own time. The Turnstile example verifies tokens with global `fetch` and **no timeout**, so a slow siteverify is not bounded, and the first verification in a cold container also pays the `fetch` (undici) load cost.
+**Cause:** The whole handler took longer than the Lambda limit (5 s for viewer-request, 30 s for origin-request). A slow RTI call alone does not cause this: it is aborted after `config.timeout` and the request passes through. The handler's time is `config.timeout` + up to 1,000ms per awaited logger call (telemetry, errors, and the challenge-reply logs: usually at most two in one request, up to four when several things fail) + the challenge's own time. The Turnstile example verifies tokens with global `fetch` and **no timeout**, so a slow siteverify is not bounded, and the first verification in a cold container also pays the `fetch` (undici) load cost.
 
-**Fix:** When `config.timeout` is not set, the RTI call times out after 2000ms. Increase it if your network latency to the RTI endpoint is higher. For viewer-request, keep it at or below about 2,500ms so the RTI call, two logger calls (1,000ms each) and the challenge fit in the 5 s limit. Use the origin-request approach if you need more time. If you use the Turnstile example on viewer-request, add a timeout to its siteverify call (e.g. `signal: AbortSignal.timeout(1000)`). Consider checking `rti_duration` logs to understand your P99 latency.
+**Fix:** When `config.timeout` is not set, the RTI call times out after 2000ms. Increase it if your network latency to the RTI endpoint is higher. For viewer-request, keep it at or below about 2,500ms so the RTI call, two logger calls (1,000ms each, the usual maximum) and the challenge fit in the 5 s limit. Use the origin-request approach if you need more time. If you use the Turnstile example on viewer-request, add a timeout to its siteverify call (e.g. `signal: AbortSignal.timeout(1000)`). Consider checking `rti_duration` logs to understand your P99 latency.
 
 ### RTI call aborted due to timeout
 
@@ -1128,7 +1210,7 @@ A second cause: the `_cq_session` cookie name starts with `_cq_se` — the examp
 
 **Symptom:** The visitor sees a plain `403 Verification failed. Please try again.` page with no widget, and refreshing shows it again.
 
-**Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example answers with the plain 403. Every refresh resends the same dead token.
+**Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example answers with the plain 403. Every refresh resends the same dead token. In `BLOCKING` mode this happens whether RTI allows the reply or asks for a CAPTCHA: either way it goes to `config.challenge` (see [The reply to the challenge page](#the-reply-to-the-challenge-page)).
 
 **Fix:** The visitor can open the page without the query string (or navigate on), which gives a fresh challenge. To avoid the dead end, change the failure branch of `turnstileChallengeExample` to a `302` back to the same path **without** `cf-turnstile-response`, `original_url` and `request_id` (with `Cache-Control: no-store`), so the next request shows a fresh widget. This cannot loop by itself: the page only submits when the visitor clicks *Continue*. Log siteverify's `error-codes` when they are not `timeout-or-duplicate`; codes such as `invalid-input-secret` mean the `secretKey` in `config.ts` is wrong.
 
@@ -1138,7 +1220,7 @@ A second cause: the `_cq_session` cookie name starts with `_cq_se` — the examp
 
 ### Fail-open behavior
 
-If the RTI API is unreachable, times out, or returns an unexpected error, the Lambda **always passes the request through** to the origin unchanged (apart from removing any client-sent `x-cheq-rti-result`). This is by design — the integration prioritizes availability over security in error scenarios. A malformed `rtiServiceURI` or `rtiLoggerURI` also fails open: the services are created when the Lambda starts, but the URL is only checked on each call.
+If the RTI API is unreachable, times out, or returns an unexpected error, the Lambda **always passes the request through** to the origin unchanged (apart from removing any client-sent `x-cheq-rti-result`). This is by design — the integration prioritizes availability over security in error scenarios. One exception: in `BLOCKING` mode a reply to the challenge page still goes to `config.challenge`, which redirects it to the original URL (see [The reply to the challenge page](#the-reply-to-the-challenge-page)); if that throws too, the reply is passed through. A malformed `rtiServiceURI` or `rtiLoggerURI` also fails open: the services are created when the Lambda starts, but the URL is only checked on each call.
 
 Errors are logged to CloudWatch (via `console.error`) and, unless `logErrors` is `false`, to the RTI logger endpoint (via `RTIHttpsLoggerService`, which gives up after 1,000ms).
 
@@ -1154,7 +1236,7 @@ The `integrations/core/` package is a shared TypeScript library bundled into eac
 |---------|------|---------|
 | `RTIHttpsService` | `services/rti-https.service.ts` | RTI caller used by this integration. Sends `POST` with the request payload over `node:https` with a keep-alive agent (idle connections are closed after 50s, before the RTI endpoint's 60s idle timeout; if a pooled connection is still found dropped, the call is retried once on a new one, see [Reused connections](#reused-connections)), applies `config.timeout` to the whole call (connect, send, read body), parses the JSON response. |
 | `RTIService` | `services/rti.service.ts` | `fetch`-based RTI caller used by the other CDN integrations. Same timeout handling (`config.timeout` covers the whole call) and HTTP-status error messages as `RTIHttpsService` (network errors differ: fetch reports `fetch failed`, `node:https` the Node error such as `connect ECONNREFUSED ...`), but falls back to a 150ms timeout (instead of 2000ms) when `config.timeout` is not set; handles timeouts via `AbortSignal.timeout()`. Both extend `RTIServiceBase` (`services/rti-service.base.ts`), which resolves the URL and timeout from config. |
-| `RTIHelperService` | `services/rti-helper.service.ts` | Decision logic: `shouldIgnore()`, `getEventType()`, `parseCookies()`, `getAction()`, `getActionStrategy()`, `buildRtiResultHeader()`, `getCheqCookie()`, `getHeaderByName()`, `validateConfig()`. |
+| `RTIHelperService` | `services/rti-helper.service.ts` | Decision logic: `shouldIgnore()`, `getEventType()`, `parseCookies()`, `getAction()`, `getActionStrategy()`, `isChallengeReplyAllowed()`, `buildRtiResultHeader()`, `errorMessage()`, `getCheqCookie()`, `getHeaderByName()`, `validateConfig()`. |
 | `RTIHttpsLoggerService` | `services/rti-https-logger.service.ts` | Logger used by this integration. Sends log messages to the RTI logger endpoint over `node:https` with a keep-alive agent (idle connections closed after 50s) and gives up after 1,000ms. Swallows all errors to avoid breaking the request flow. |
 | `RTILoggerService` | `services/rti-logger.service.ts` | `fetch`-based logger used by the other CDN integrations. Same payload and error handling, no timeout. Both extend `RTILoggerServiceBase` (`services/rti-logger.service.base.ts`). |
 | `HttpsClient` | `services/https-client.ts` | Keep-alive JSON `POST` client on `node:http`/`node:https`, shared by `RTIHttpsService` and `RTIHttpsLoggerService`. Sends `User-Agent: cheq-rti-cloudfront`; does not follow redirects or strip a BOM (see [Differences from the previous `fetch` client](#differences-from-the-previous-fetch-client)). |

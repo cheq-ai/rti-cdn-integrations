@@ -25,7 +25,7 @@ const testSettings: TurnstileSettings = {
 
 type Callbacks = Required<ReturnType<typeof createTurnstileChallenge>>;
 const build = (settings: TurnstileSettings) => createTurnstileChallenge(settings) as Callbacks;
-const { challenge, validateChallenge } = build(testSettings);
+const { challenge, validateChallenge, isChallengeResponse } = build(testSettings);
 
 function buildRequest(cookieValue?: string, rayIdHeader?: string, challengeHeader?: string): CloudFrontRequest {
     const headers: Record<string, { key: string; value: string }[]> = {};
@@ -100,11 +100,13 @@ async function issueSession(rayId: string, settings = testSettings, now?: number
 }
 
 describe('createTurnstileChallenge', () => {
-    it('returns challenge and validateChallenge when all settings are set, without warning', () => {
+    it('returns exactly challenge, validateChallenge and isChallengeResponse when all settings are set, without warning', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const result = createTurnstileChallenge(testSettings);
+        expect(Object.keys(result).sort()).toEqual(['challenge', 'isChallengeResponse', 'validateChallenge']);
         expect(result.challenge).toBeTypeOf('function');
         expect(result.validateChallenge).toBeTypeOf('function');
+        expect(result.isChallengeResponse).toBeTypeOf('function');
         expect(warn).not.toHaveBeenCalled();
     });
 
@@ -164,6 +166,13 @@ describe('validateChallenge', () => {
 
     it('returns false when cookie header has no _cq_se cookie', async () => {
         expect(await validateChallenge(buildRequest('_cq_duid=device-abc; _cq_pvid=pv-xyz'), false)).toBe(false);
+    });
+
+    it('validates without logging when isDebug is omitted (defaults to false)', async () => {
+        const { cookie } = await issueSession('ray-abc123');
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        expect(await (validateChallenge as (request: CloudFrontRequest) => Promise<boolean>)(buildRequest(cookie))).toBe(true);
+        expect(log).not.toHaveBeenCalled();
     });
 
     // --- Valid session ---
@@ -366,6 +375,33 @@ describe('validateChallenge', () => {
     });
 });
 
+describe('isChallengeResponse', () => {
+    it.each([
+        ['the challenge page reply', new URLSearchParams({ original_url: '/landing?gclid=abc', request_id: 'ray', 'cf-turnstile-response': 'tok' }).toString()],
+        ["a site's own form with a Turnstile widget (only the field name is checked)", 'q=shoes&cf-turnstile-response=tok'],
+        ['an encoded token value', `cf-turnstile-response=${encodeURIComponent('a+b/c=')}`],
+    ])('returns true for %s', (_, querystring) => {
+        expect(isChallengeResponse(buildTurnstileRequest(querystring))).toBe(true);
+    });
+
+    it.each([
+        ['no query string', ''],
+        ['an unrelated query', 'gclid=abc'],
+        ['an empty token', 'cf-turnstile-response='],
+        ['the field name only as a value', 'x=cf-turnstile-response'],
+        ['a similar field name', 'cf-turnstile-response-x=tok'],
+        ['the field name with another case', 'CF-Turnstile-Response=tok'],
+    ])('returns false for %s', (_, querystring) => {
+        expect(isChallengeResponse(buildTurnstileRequest(querystring))).toBe(false);
+    });
+
+    it('returns false when the request has no query string at all', () => {
+        const request = buildTurnstileRequest();
+        delete (request as any).querystring;
+        expect(isChallengeResponse(request)).toBe(false);
+    });
+});
+
 describe('challenge', () => {
 
     // --- No token: serve challenge page ---
@@ -405,6 +441,25 @@ describe('challenge', () => {
         const result = await challenge(buildTurnstileRequest(), buildRTIResponse('ray-abc-123')) as any;
         expect(result.body).toContain('action="/page"');
         expect(result.body).toContain('value="ray-abc-123"');
+    });
+
+    it('puts the request query string into original_url, not into the form action', async () => {
+        const result = await challenge(buildTurnstileRequest('gclid=abc&utm_source=x'), buildRTIResponse()) as any;
+        expect(result.body).toContain('name="original_url" value="/page?gclid=abc&amp;utm_source=x"');
+        expect(result.body).toContain('action="/page"');
+    });
+
+    it('returns the visitor to the original query string after solving the challenge', async () => {
+        const originalQuery = 'q=a%20b&tag=c%2Bd&gclid=abc';
+        const page = await challenge(buildTurnstileRequest(originalQuery), buildRTIResponse()) as any;
+        const entities: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+        const fieldValue: string = page.body.match(/name="original_url" value="([^"]*)"/)[1]
+            .replace(/&(amp|lt|gt|quot|#39);/g, (_: string, e: string) => entities[e]);
+        // What the browser sends: the form fields, URL-encoded, replacing any query of the action.
+        const submitted = new URLSearchParams({ original_url: fieldValue, request_id: 'ray-123', 'cf-turnstile-response': 'valid-token' }).toString();
+        stubSiteverify(true);
+        const result = await challenge(buildTurnstileRequest(submitted, 'example.com'), buildRTIResponse()) as any;
+        expect(result.headers.location[0].value).toBe(`https://example.com/page?${originalQuery}`);
     });
 
     // --- Token present: verify with Turnstile ---

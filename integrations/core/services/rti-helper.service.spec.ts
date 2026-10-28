@@ -311,6 +311,118 @@ describe('RTIHelperService', () => {
   });
   // #endregion getActionStrategy Method Tests
 
+  // #region isChallengeReplyAllowed Method Tests
+  describe('isChallengeReplyAllowed', () => {
+    test.each([
+      [true, 'no strategy (ALLOW)', null],
+      [true, 'CAPTCHA', ActionStrategy.CAPTCHA],
+      [false, 'ACCESS_DENIED', ActionStrategy.ACCESS_DENIED],
+      [false, 'NOT_FOUND', ActionStrategy.NOT_FOUND],
+      [false, 'REDIRECT', ActionStrategy.REDIRECT],
+    ])('returns %s for %s', (expected, _, strategy) => {
+      // Arrange
+      const svc = new RTIHelperService({} as any);
+
+      // Act & Assert
+      expect(svc.isChallengeReplyAllowed(strategy)).toBe(expected);
+    });
+
+    test('covers every ActionStrategy (a new strategy must be added to the table above)', () => {
+      // Arrange
+      const tested = [ActionStrategy.CAPTCHA, ActionStrategy.ACCESS_DENIED, ActionStrategy.NOT_FOUND, ActionStrategy.REDIRECT];
+
+      // Act & Assert
+      expect(Object.values(ActionStrategy).filter(v => typeof v === 'number').sort()).toEqual([...tested].sort());
+    });
+  });
+  // #endregion isChallengeReplyAllowed Method Tests
+
+  // #region errorMessage Method Tests
+  describe('errorMessage', () => {
+    // A Proxy that throws on every operation: instanceof, property reads, Symbol.toStringTag and conversion all fail.
+    const hostileProxy = () => new Proxy({}, {
+      get() { throw new Error('get trap'); },
+      getPrototypeOf() { throw new Error('getPrototypeOf trap'); },
+      has() { throw new Error('has trap'); },
+    });
+
+    class CustomError extends Error {}
+
+    test.each([
+      // Errors: their message
+      ['an Error', () => new Error('boom'), 'boom'],
+      ['a TypeError', () => new TypeError('bad type'), 'bad type'],
+      ['an Error subclass', () => new CustomError('custom'), 'custom'],
+      ['an Error with an empty message', () => new Error(''), ''],
+      ['an AbortSignal timeout DOMException', () => new DOMException('The operation was aborted due to timeout', 'TimeoutError'), 'The operation was aborted due to timeout'],
+      // Primitives: String()
+      ['undefined', () => undefined, 'undefined'],
+      ['null', () => null, 'null'],
+      ['a string', () => 'boom', 'boom'],
+      ['an empty string', () => '', ''],
+      ['a number', () => 42, '42'],
+      ['NaN', () => NaN, 'NaN'],
+      ['a boolean', () => false, 'false'],
+      ['a bigint', () => 10n, '10'],
+      ['a symbol', () => Symbol('s'), 'Symbol(s)'],
+      // Objects: String(), which uses toString / Symbol.toStringTag
+      ['a plain object', () => ({ a: 1 }), '[object Object]'],
+      ['an error-like object (not an Error, so no .message)', () => ({ message: 'looks like an error' }), '[object Object]'],
+      ['an object with its own toString', () => ({ toString: () => 'custom string' }), 'custom string'],
+      ['an object with Symbol.toStringTag', () => ({ [Symbol.toStringTag]: 'Tagged' }), '[object Tagged]'],
+      ['an array', () => [1, 'two'], '1,two'],
+      ['a Date', () => new Date(0), new Date(0).toString()],
+      // String() throws: fall back to Object.prototype.toString
+      ['a null-prototype object', () => Object.create(null), '[object Object]'],
+      ['an object whose toString throws', () => ({ toString() { throw new Error('toString failed'); } }), '[object Object]'],
+      ['an object whose toString returns an object', () => ({ toString: () => ({}), valueOf: () => ({}) }), '[object Object]'],
+      ['an Error whose message getter throws', () => Object.defineProperty(new Error(), 'message', { get() { throw new Error('getter'); } }), '[object Error]'],
+      // An Error whose message is not a string: converted, or a caller's `${...}` would throw on it
+      ['an Error with a number message', () => Object.assign(new Error(), { message: 42 }), '42'],
+      ['an Error with a Symbol message', () => Object.assign(new Error(), { message: Symbol('s') }), 'Symbol(s)'],
+      ['an Error with an undefined message', () => Object.assign(new Error(), { message: undefined }), 'undefined'],
+      ['an Error with an object message whose toString throws', () => Object.assign(new Error(), { message: { toString() { throw new Error('x'); } } }), '[object Error]'],
+      // Everything throws: a fixed text
+      ['a Proxy that throws on every operation', hostileProxy, 'unknown error'],
+      ['a revoked Proxy', () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); return proxy; }, 'unknown error'],
+    ])('returns the message of %s', (_, value, expected) => {
+      // Arrange
+      const svc = new RTIHelperService({} as any);
+
+      // Act & Assert
+      expect(svc.errorMessage(value())).toBe(expected);
+    });
+
+    test('returns the message of an Error from another realm (e.g. vm), through String()', async () => {
+      // Arrange: instanceof Error is false across realms, so the message comes from Error.prototype.toString
+      const { runInNewContext } = await import('node:vm');
+      const foreign = runInNewContext('new Error("from vm")');
+      const svc = new RTIHelperService({} as any);
+
+      // Act & Assert
+      expect(foreign instanceof Error).toBe(false);
+      expect(svc.errorMessage(foreign)).toBe('Error: from vm');
+    });
+
+    test('always returns a string that a template literal can embed', () => {
+      // Arrange
+      const svc = new RTIHelperService({} as any);
+      const values = [
+        undefined, null, 0, '', Symbol(), 1n, {}, [], Object.create(null), hostileProxy(), new Error(),
+        Object.assign(new Error(), { message: Symbol() }),
+        Object.assign(new Error(), { message: { toString() { throw new Error('x'); } } }),
+      ];
+
+      // Act & Assert
+      for (const value of values) {
+        const message = svc.errorMessage(value);
+        expect(typeof message).toBe('string');
+        expect(() => `log: ${message}`).not.toThrow();
+      }
+    });
+  });
+  // #endregion errorMessage Method Tests
+
   // #region getCheqCookie Method Tests
   describe('getCheqCookie', () => {
     const svc = new RTIHelperService({} as any);
