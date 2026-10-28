@@ -854,7 +854,8 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
    YES ──► POST token to Cloudflare siteverify API (server-side)
                │
           Verification fails ──► Return 403 "Verification failed" (plain text, no widget;
-                                  see Troubleshooting: "Verification failed" after refresh)
+          (or hostname / action        see Troubleshooting: "Verification failed" after refresh)
+           do not match: Token checks)
                │
           Verification passes
                │
@@ -903,6 +904,32 @@ with the header without checking the cookie (unless it is a reply to the challen
 
 > **Cost:** a request with a valid session now makes an RTI call too, which matters for cold-start timeouts on viewer-request
 > (see [Memory, CPU and Cold Starts](#memory-cpu-and-cold-starts)). Checking the signature itself takes microseconds.
+
+### Token checks
+
+siteverify's `success` only says a token is genuine for the site key. The example accepts a token only when siteverify
+also reports that it was solved **on this host** (`hostname` equals the request's `Host`; both are compared in
+lowercase, without a `:port`, and without a scheme, userinfo, path or trailing dot should either ever carry one) and
+**on the CHEQ widget** (`action` is `cheq-challenge`, set by `data-action` on the challenge page).
+That stops a token solved on another site that shares the site key, or on another Turnstile widget of this site (the
+customer's own login or newsletter form), from buying a CHEQ session. A rejected token gets the usual
+"Verification failed" response, and when the token was genuine the cause is logged (`console.warn`, never the token):
+`[turnstile] token valid but hostname 'x' ≠ request host 'y'`, or `... action '' ≠ 'cheq-challenge' (is data-action
+missing from the challenge page?)`.
+
+- **Do not remove `data-action="cheq-challenge"`** from the challenge page (or change `CHALLENGE_ACTION` on one side
+  only). Without it every token is rejected, and visitors loop on the CAPTCHA. An empty or missing action is never
+  accepted as a fallback: the site's other widgets usually have none, so that would let exactly those tokens through.
+- **Origin-request trigger:** CloudFront sets `Host` to the **origin's** domain unless the origin request policy forwards
+  the viewer's `Host` (`OriginRequestPolicy` does, `OriginRequestPolicyNoHost` does not). Then every token fails the
+  hostname check. Forward `Host`, or run the challenge on viewer-request. The redirect after the challenge depends on the
+  same header (it is built from `Host`). A request with no `Host` at all is rejected.
+- **Test keys:** Cloudflare's dummy secret keys answer with fixed values, not your host or `cheq-challenge` (their
+  [testing docs](https://developers.cloudflare.com/turnstile/troubleshooting/testing/) show `hostname: "localhost"`,
+  `action: "test"`), so both checks reject every test token. Use real keys to test the whole flow end to end.
+- **The token stays in the URL.** The challenge form submits with `GET`, so `cf-turnstile-response` appears in the query
+  string (browser history, CloudFront and origin logs). That is a known, low-risk limitation: a token is single-use and
+  expires within minutes. Moving it to a `POST` body would need Lambda@Edge body access and is not done.
 
 ### The reply to the challenge page
 

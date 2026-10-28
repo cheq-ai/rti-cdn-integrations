@@ -7,6 +7,12 @@ import type { CloudfrontConfig } from "./config";
 
 const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
 
+/**
+ * The Turnstile action of the CHEQ challenge widget: set as `data-action` on the challenge page and required in the
+ * siteverify result, so a token solved on another widget (another site, or the site's own login form) is rejected.
+ */
+const CHALLENGE_ACTION = "cheq-challenge";
+
 
 /** Settings for the example Turnstile challenge, set in config.ts. */
 export interface TurnstileSettings {
@@ -335,6 +341,7 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
                             <div class="captcha-box">
                             <div class="cf-turnstile" 
                                 data-sitekey="${escapeHtml(settings.siteKey)}"
+                                data-action="${CHALLENGE_ACTION}"${/* REQUIRED: verifyTurnstileToken rejects tokens without this action. Removing it locks every visitor in a CAPTCHA loop. */ ""}
                                 data-callback="onTurnstileSuccess"
                                 data-theme="dark">
                             </div>
@@ -382,7 +389,7 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
             body: html,
         };
     } else {
-        if (await verifyTurnstileToken(settings, token, request.clientIp)) {
+        if (await verifyTurnstileToken(settings, token, request)) {
             return sessionRedirect(settings, request, response, queryStringData, addRtiResultHeader);
         } else {
             return {
@@ -393,27 +400,63 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
     }
 };
 
-/** Verifies a Turnstile token with Cloudflare's siteverify endpoint. A token is single-use and expires after 300 seconds. */
-async function verifyTurnstileToken(settings: TurnstileSettings, token: string, clientIp: string): Promise<boolean> {
+/**
+ * Verifies a Turnstile token with Cloudflare's siteverify endpoint. A token is single-use and expires after 300 seconds.
+ *
+ * `success` alone only says the token is genuine for this site key. It is accepted only when it was also solved on
+ * THIS host and on the CHEQ challenge widget ({@link CHALLENGE_ACTION}): otherwise a token from another site sharing
+ * the site key, or from another Turnstile widget on this site (a login or newsletter form), would buy a CHEQ session.
+ * An empty or missing action is rejected too, never accepted "to be safe": the site's other widgets usually have none,
+ * so allowing it would let exactly those tokens through. No Host header means the host cannot be checked: rejected.
+ * Both hosts go through RTIStatelessUtils.normalizeHost first, so case, a `:port` or a stray scheme do not cause a mismatch.
+ */
+async function verifyTurnstileToken(settings: TurnstileSettings, token: string, request: CloudFrontRequest): Promise<boolean> {
     const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
             secret: settings.secretKey,
             response: token,
-            remoteip: clientIp,
+            remoteip: request.clientIp,
         }).toString(),
     });
 
-    const result = await verifyResponse.json() as { success: boolean };
-    return result.success === true;
+    const result = await verifyResponse.json() as { success?: boolean; hostname?: string; action?: string };
+    if (result.success !== true) {
+        return false;
+    }
+
+    // The token is genuine from here on, so a mismatch is worth a warning: it points at a setup problem (a missing
+    // data-action, Host not forwarded to origin-request, test keys) as often as at a reused token. Never log the token.
+    const requestHost = RTIStatelessUtils.normalizeHost(request.headers["host"]?.[0]?.value);
+    const hostname = RTIStatelessUtils.normalizeHost(result.hostname);
+    const action = result.action ?? "";
+    let accepted = true;
+
+    if (!requestHost) {
+        console.warn(`[turnstile] token valid but the request has no Host header to check hostname '${hostname}' against (on origin-request, forward the viewer's Host)`);
+        accepted = false;
+    } else if (hostname !== requestHost) {
+        console.warn(`[turnstile] token valid but hostname '${hostname}' ≠ request host '${requestHost}'`);
+        accepted = false;
+    }
+
+    if (action !== CHALLENGE_ACTION) {
+        // An empty action is what a challenge page without data-action produces; another action is another widget.
+        const hint = action ? "" : " (is data-action missing from the challenge page?)";
+        console.warn(`[turnstile] token valid but action '${action}' ≠ '${CHALLENGE_ACTION}'${hint}`);
+        accepted = false;
+    }
+
+    return accepted;
 }
 
 /**
  * Where the visitor goes after the challenge, on THIS site. The host comes from the request (CloudFront only routes
  * hosts of this distribution), never from the query string, and original_url must be a path (see
  * RTIStatelessUtils.safeReturnPath, shared with Akamai's reCAPTCHA challenge). Without a Host header the Location
- * stays relative, which the browser resolves against the current site - so the path check is all that keeps it there.
+ * would stay relative, resolved by the browser against the current site; verifyTurnstileToken already rejects such a
+ * request (no host to check the token against), so that branch is only a fallback.
  */
 function returnLocation(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
     const host = request.headers["host"]?.[0]?.value;

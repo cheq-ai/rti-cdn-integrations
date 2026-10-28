@@ -195,6 +195,43 @@ export class RTIStatelessUtils {
   }
 
   /**
+   * Reduces a host to its bare lowercase name, so two ways of writing one host compare equal - e.g. a request's `Host`
+   * header and the `hostname` a CAPTCHA provider reports for a solved token. Neither should carry more than
+   * `host[:port]`, but a client sends any text it likes, so both sides go through this. It fails closed: a value with
+   * no host left (only a scheme, a port, userinfo...) becomes `''`, which callers must treat as no host. Strips:
+   * - the case, and surrounding whitespace
+   * - a scheme: `https://shop.com` → `shop.com`
+   * - anything from the first `/`, `?` or `#`: `shop.com/page` → `shop.com`
+   * - userinfo, up to the last `@`: `user:pass@shop.com` → `shop.com`
+   * - the port and anything after it: `shop.com:443` → `shop.com`. An IPv6 literal keeps its brackets and loses
+   *   only what follows them: `[2001:db8::1]:8443` → `[2001:db8::1]`
+   * - trailing dots (the DNS root): `shop.com.` → `shop.com`
+   *
+   * Idempotent: `normalizeHost(normalizeHost(x)) === normalizeHost(x)`. The result never contains `/ ? # @`, has no
+   * `:` outside IPv6 brackets, and does not start or end with whitespace or end with a dot.
+   *
+   * @param value the raw host, or `null` / `undefined` when absent
+   * @returns the bare host, `''` when nothing is left
+   */
+  static normalizeHost(value: string | null | undefined): string {
+    let host = (value ?? '')
+      .toLowerCase()
+      .trim()
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+      .replace(/[/?#].*$/, '')
+      .replace(/^.*@/, '')
+      .replace(/^\s+/, '');
+
+    if (host.startsWith('[') && host.includes(']')) {
+      host = host.slice(0, host.indexOf(']') + 1);
+    } else {
+      host = host.replace(/:.*$/, '');
+    }
+
+    return host.replace(/[\s.]+$/, '');
+  }
+
+  /**
    * Maximum length of the `rule-name` field. Rule names are operator-defined free text
    * with no length bound, and the whole header shares the CDN's header size budget.
    */

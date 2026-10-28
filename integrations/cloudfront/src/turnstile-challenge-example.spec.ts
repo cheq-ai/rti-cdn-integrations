@@ -47,7 +47,8 @@ function buildRequest(cookieValue?: string, rayIdHeader?: string, challengeHeade
     } as unknown as CloudFrontRequest;
 }
 
-function buildTurnstileRequest(querystring = '', hostHeader?: string, cookie?: string): CloudFrontRequest {
+// The Host matches what stubSiteverify(true) answers, so a solved token is accepted. Pass null for no Host header.
+function buildTurnstileRequest(querystring = '', hostHeader: string | null = 'example.com', cookie?: string): CloudFrontRequest {
     const headers: Record<string, { key: string; value: string }[]> = {};
     if (hostHeader) {
         headers['host'] = [{ key: 'Host', value: hostHeader }];
@@ -76,11 +77,16 @@ function buildRTIResponse(rayId = 'ray-123'): RTIResponse {
 
 const solvedQuery = new URLSearchParams({ 'cf-turnstile-response': 'valid-token' }).toString();
 
-const stubSiteverify = (success: boolean) => {
-    const fetchMock = vi.fn().mockResolvedValue({ json: async () => ({ success }) });
+/** Stubs siteverify with this exact result (it is what `verifyResponse.json()` resolves to). */
+const stubSiteverifyResult = (result: Record<string, unknown>) => {
+    const fetchMock = vi.fn().mockResolvedValue({ json: async () => result });
     vi.stubGlobal('fetch', fetchMock);
     return fetchMock;
 };
+
+/** true: a token solved on the CHEQ widget of buildTurnstileRequest's default host. false: a token Turnstile rejects. */
+const stubSiteverify = (success: boolean) =>
+    stubSiteverifyResult(success ? { success, hostname: 'example.com', action: 'cheq-challenge' } : { success });
 
 /**
  * Solves the challenge (siteverify stubbed to succeed) and returns the session cookie it issues, so the
@@ -576,20 +582,16 @@ describe('challenge', () => {
             expect(result.headers.location[0].value).toBe('https://example.com/page');
         });
 
-    it('uses a relative Location when the request has no Host header', async () => {
-        stubSiteverify(true);
-        const result = await challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse()) as any;
-        expect(result.headers.location[0].value).toBe('/page');
-    });
-
     // Browsers delete tab, LF and CR from a URL before parsing it, so "/\t/evil.com" passed the leading-slash checks
-    // yet resolved to "//evil.com". With no Host header the Location is relative, which made it an open redirect.
+    // yet resolved to "//evil.com" - an open redirect through a relative Location (no Host header). No Host is now
+    // rejected before any redirect (see the token checks below), but the path must still never reach Location:
+    // CR/LF would split the header, and the relative branch of returnLocation stays as a fallback.
     it.each(['/\t/evil.com', '/\n/evil.com', '/\r/evil.com', '/\t\\evil.com', '/page\r\nSet-Cookie: a=1'])(
-        'rejects original_url %j without a Host header, so the relative Location cannot leave the site', async (originalUrl) => {
+        'rejects original_url %j and redirects to the request URI instead', async (originalUrl) => {
             stubSiteverify(true);
             const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': originalUrl }).toString();
             const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
-            expect(result.headers.location[0].value).toBe('/page');
+            expect(result.headers.location[0].value).toBe('https://example.com/page');
         });
 
     it('does not put a viewer_host field in the challenge form', async () => {
@@ -604,5 +606,210 @@ describe('challenge', () => {
         expect(result.status).toBe('403');
         expect(result.body).toContain('Verification failed');
         expect(result.headers?.['set-cookie']).toBeUndefined();
+    });
+});
+
+// siteverify's `success` only says the token is genuine for the site key. It must also have been solved on this host
+// and on the CHEQ widget (data-action="cheq-challenge"): otherwise a token from another site sharing the key, or from
+// another Turnstile widget on this site (a login or newsletter form), would buy a CHEQ session.
+describe('challenge token checks (hostname and action)', () => {
+    const solvedOn = (host: string | null) => challenge(buildTurnstileRequest(solvedQuery, host), buildRTIResponse('ray-checks')) as Promise<any>;
+
+    const expectSession = (result: any) => {
+        expect(result.status).toBe('302');
+        expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|ray-checks;/);
+    };
+
+    const expectRejected = (result: any) => {
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('Verification failed');
+        expect(result.headers?.['set-cookie']).toBeUndefined();
+    };
+
+    it('puts data-action="cheq-challenge" on the widget, and the source comment next to it is not sent', async () => {
+        const page = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(page.body).toMatch(/<div class="cf-turnstile"[^>]*\sdata-action="cheq-challenge"/);
+        expect(page.body).not.toContain('REQUIRED');
+        expect(page.body).not.toContain('CAPTCHA loop');
+        expect(page.body).not.toContain('/*');
+    });
+
+    it('issues a session when the token was solved on this host and on the CHEQ widget', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+        expectSession(await solvedOn('shop.com'));
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['another hostname', { hostname: 'evil.com', action: 'cheq-challenge' }, "hostname 'evil.com' ≠ request host 'shop.com'"],
+        ['a subdomain of this host', { hostname: 'login.shop.com', action: 'cheq-challenge' }, "hostname 'login.shop.com' ≠ request host 'shop.com'"],
+        ['no hostname', { action: 'cheq-challenge' }, "hostname '' ≠ request host 'shop.com'"],
+        ['another action (the site\'s own login widget)', { hostname: 'shop.com', action: 'login' }, "action 'login' ≠ 'cheq-challenge'"],
+        ['an action in another case', { hostname: 'shop.com', action: 'CHEQ-CHALLENGE' }, "action 'CHEQ-CHALLENGE' ≠ 'cheq-challenge'"],
+        ['an empty action (a widget without data-action)', { hostname: 'shop.com', action: '' }, "action '' ≠ 'cheq-challenge' (is data-action missing from the challenge page?)"],
+        ['no action at all', { hostname: 'shop.com' }, "action '' ≠ 'cheq-challenge' (is data-action missing from the challenge page?)"],
+    ])('rejects a valid token with %s, and warns why', async (_, fields, reason) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, ...fields });
+
+        expectRejected(await solvedOn('shop.com'));
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(`[turnstile] token valid but ${reason}`);
+    });
+
+    it('warns about both when hostname and action are wrong', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: 'evil.com', action: 'login' });
+
+        expectRejected(await solvedOn('shop.com'));
+        expect(warn).toHaveBeenCalledTimes(2);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("hostname 'evil.com'"));
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("action 'login'"));
+    });
+
+    it.each(['shop.com:443', 'shop.com:8443', 'Shop.COM', 'SHOP.com:443'])(
+        'matches request host %j to hostname shop.com (case and :port ignored)', async (host) => {
+            stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+            expectSession(await solvedOn(host));
+        });
+
+    it('matches a hostname in another case', async () => {
+        stubSiteverifyResult({ success: true, hostname: 'Shop.COM', action: 'cheq-challenge' });
+        expectSession(await solvedOn('shop.com'));
+    });
+
+    // Neither side should carry more than host[:port], but both are normalized the same way, just in case.
+    it.each([
+        ['a scheme', 'https://shop.com'],
+        ['an http scheme', 'http://shop.com'],
+        ['a scheme, port and path', 'https://shop.com:443/page?q=1#top'],
+        ['a trailing slash', 'shop.com/'],
+        ['a path', 'shop.com/login'],
+        ['a query', 'shop.com?x=1'],
+        ['a fragment', 'shop.com#x'],
+        ['userinfo', 'user@shop.com'],
+        ['userinfo with a password and a port', 'https://user:pass@shop.com:8443'],
+        ['a trailing dot (DNS root)', 'shop.com.'],
+        ['a trailing dot and a port', 'shop.com.:443'],
+        ['an empty port', 'shop.com:'],
+        ['surrounding spaces', '  shop.com  '],
+        ['all of it, in upper case', '  HTTPS://User@Shop.COM.:443/Path  '],
+    ])('matches shop.com when the hostname has %s (%j)', async (_, hostname) => {
+        stubSiteverifyResult({ success: true, hostname, action: 'cheq-challenge' });
+        expectSession(await solvedOn('shop.com'));
+    });
+
+    it.each([
+        ['a scheme', 'https://shop.com'],
+        ['a trailing dot (DNS root)', 'shop.com.'],
+        ['a path', 'shop.com/page'],
+        ['userinfo', 'user@shop.com'],
+        ['surrounding spaces', ' shop.com '],
+    ])('matches hostname shop.com when the request Host has %s (%j)', async (_, host) => {
+        stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+        expectSession(await solvedOn(host));
+    });
+
+    it.each([
+        ['an IPv6 literal with a port', '[2001:db8::1]:8443', '[2001:db8::1]'],
+        ['an IPv6 literal without a port', '[2001:db8::1]', '[2001:db8::1]'],
+        ['an IPv4 address with a port', '203.0.113.7:443', '203.0.113.7'],
+    ])('keeps %s intact apart from the port (%j)', async (_, host, hostname) => {
+        stubSiteverifyResult({ success: true, hostname, action: 'cheq-challenge' });
+        expectSession(await solvedOn(host));
+    });
+
+    it.each([
+        ['a lookalike that only shares a prefix', 'shop.com.evil.com'],
+        ['a lookalike that only shares a suffix', 'evilshop.com'],
+        ['the real host hidden in userinfo', 'shop.com@evil.com'],
+        ['the real host hidden in the path', 'evil.com/shop.com'],
+        ['the real host hidden in the query', 'evil.com?shop.com'],
+        ['another IPv6 literal', '[2001:db8::2]'],
+    ])('still rejects %s (%j) after normalizing', async (_, hostname) => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname, action: 'cheq-challenge' });
+        expectRejected(await solvedOn('shop.com'));
+    });
+
+    it.each(['https://', 'http://:443', ':443', '/', ' ', '.', 'user@'])(
+        'rejects a hostname that normalizes to nothing (%j), even against a request Host that does too', async (value) => {
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            stubSiteverifyResult({ success: true, hostname: value, action: 'cheq-challenge' });
+            const request = buildTurnstileRequest(solvedQuery, null);
+            request.headers['host'] = [{ key: 'Host', value }];
+            expectRejected(await challenge(request, buildRTIResponse('ray-checks')));
+        });
+
+    it('rejects when the request has no Host header, and warns why', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+
+        expectRejected(await solvedOn(null));
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('no Host header'));
+    });
+
+    it('rejects an empty Host header, or one that is only a port', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: '', action: 'cheq-challenge' });
+
+        for (const host of ['', ':443']) {
+            const request = buildTurnstileRequest(solvedQuery, null);
+            request.headers['host'] = [{ key: 'Host', value: host }];
+            expectRejected(await challenge(request, buildRTIResponse('ray-checks')));
+        }
+    });
+
+    it('does not warn when Turnstile itself rejects the token (nothing to compare)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: false, hostname: 'evil.com', 'error-codes': ['invalid-input-response'] });
+
+        expectRejected(await solvedOn('shop.com'));
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('rejects a result without success, even when hostname and action match', async () => {
+        stubSiteverifyResult({ hostname: 'shop.com', action: 'cheq-challenge' });
+        expectRejected(await solvedOn('shop.com'));
+    });
+
+    it('never logs the token', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: 'evil.com', action: '' });
+
+        await solvedOn('shop.com');
+        const logged = [...warn.mock.calls, ...log.mock.calls].flat().join('\n');
+        expect(warn).toHaveBeenCalled();
+        expect(logged).not.toContain('valid-token');
+    });
+
+    it('sends request.clientIp as remoteip', async () => {
+        const fetchMock = stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+        const request = buildTurnstileRequest(solvedQuery, 'shop.com');
+        (request as any).clientIp = '203.0.113.7';
+
+        await challenge(request, buildRTIResponse('ray-checks'));
+        expect(new URLSearchParams(fetchMock.mock.calls[0][1].body).get('remoteip')).toBe('203.0.113.7');
+    });
+
+    it('applies the same checks to a reply to the challenge page (the request isChallengeResponse recognizes)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const reply = buildTurnstileRequest(
+            new URLSearchParams({ original_url: '/landing?gclid=abc', request_id: 'ray-page', 'cf-turnstile-response': 'tok' }).toString(),
+            'shop.com',
+        );
+        expect(isChallengeResponse(reply)).toBe(true);
+
+        stubSiteverifyResult({ success: true, hostname: 'shop.com' });
+        expectRejected(await challenge(reply, buildRTIResponse('ray-checks')));
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("action ''"));
+
+        stubSiteverifyResult({ success: true, hostname: 'shop.com', action: 'cheq-challenge' });
+        const accepted = await challenge(reply, buildRTIResponse('ray-checks')) as any;
+        expectSession(accepted);
+        expect(accepted.headers.location[0].value).toBe('https://shop.com/landing?gclid=abc');
     });
 });

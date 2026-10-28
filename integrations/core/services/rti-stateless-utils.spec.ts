@@ -991,10 +991,10 @@ describe('RTIStatelessUtils', () => {
       const ALPHABET = ['/', '\\', '\t', '\n', '\r', '\x00', '\x7F', ' ', '.', ':', '@', '%', '?', '#', 'a', '。', '／'];
       const allStrings = (maxLength: number) => {
         let level = [''];
-        const all: string[] = [];
+        let all: string[] = [];
         for (let length = 1; length <= maxLength; length++) {
           level = level.flatMap(prefix => ALPHABET.map(ch => prefix + ch));
-          all.push(...level);
+          all = all.concat(level);
         }
         return all;
       };
@@ -1024,6 +1024,181 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion safeReturnPath Method Tests
+
+  // #region normalizeHost Method Tests
+  describe('normalizeHost', () => {
+    const normalizeHost = (value: string | null | undefined) => RTIStatelessUtils.normalizeHost(value);
+
+    describe('absent or empty input', () => {
+      test.each([
+        ['undefined', undefined],
+        ['null', null],
+        ['an empty string', ''],
+        ['only spaces', '   '],
+        ['only a tab and newline', '\t\n'],
+      ])('returns "" for %s', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe('');
+      });
+    });
+
+    describe('a bare host: unchanged', () => {
+      test.each([
+        ['a domain', 'shop.com'],
+        ['a subdomain', 'www.shop.co.uk'],
+        ['a single label', 'localhost'],
+        ['a hyphenated domain', 'my-shop.example'],
+        ['a punycode domain', 'xn--bcher-kva.example'],
+        ['an IPv4 address', '203.0.113.7'],
+        ['an IPv6 literal', '[2001:db8::1]'],
+        ['the IPv6 loopback', '[::1]'],
+      ])('keeps %s', (_, host) => {
+        // Act & Assert
+        expect(normalizeHost(host)).toBe(host);
+      });
+    });
+
+    describe('each part that is stripped', () => {
+      test.each([
+        // case and whitespace
+        ['upper case', 'SHOP.COM', 'shop.com'],
+        ['mixed case', 'Shop.Com', 'shop.com'],
+        ['leading and trailing spaces', '  shop.com  ', 'shop.com'],
+        ['a trailing tab and newline', 'shop.com\t\r\n', 'shop.com'],
+        // scheme
+        ['an https scheme', 'https://shop.com', 'shop.com'],
+        ['an http scheme', 'http://shop.com', 'shop.com'],
+        ['an upper-case scheme', 'HTTPS://shop.com', 'shop.com'],
+        ['another scheme', 'wss://shop.com', 'shop.com'],
+        ['a scheme with + . -', 'git+ssh.x-y://shop.com', 'shop.com'],
+        // path, query, fragment
+        ['a trailing slash', 'shop.com/', 'shop.com'],
+        ['a path', 'shop.com/a/b', 'shop.com'],
+        ['a query', 'shop.com?x=1', 'shop.com'],
+        ['a fragment', 'shop.com#top', 'shop.com'],
+        ['a path, query and fragment', 'shop.com/a?b=1#c', 'shop.com'],
+        // userinfo
+        ['a user', 'user@shop.com', 'shop.com'],
+        ['a user and password', 'user:pass@shop.com', 'shop.com'],
+        ['several @ (up to the last one)', 'a@b@shop.com', 'shop.com'],
+        ['an @ in the path (not userinfo)', 'shop.com/a@b', 'shop.com'],
+        // port
+        ['a port', 'shop.com:443', 'shop.com'],
+        ['a high port', 'shop.com:65535', 'shop.com'],
+        ['an empty port', 'shop.com:', 'shop.com'],
+        ['two ports', 'shop.com:443:80', 'shop.com'],
+        ['a non-numeric port', 'shop.com:abc', 'shop.com'],
+        ['a port on an IPv4 address', '203.0.113.7:8080', '203.0.113.7'],
+        ['a port on an IPv6 literal', '[2001:db8::1]:8443', '[2001:db8::1]'],
+        ['an empty port on an IPv6 literal', '[::1]:', '[::1]'],
+        ['anything after an IPv6 literal', '[::1]junk', '[::1]'],
+        // trailing dots
+        ['a trailing dot (the DNS root)', 'shop.com.', 'shop.com'],
+        ['several trailing dots', 'shop.com...', 'shop.com'],
+        ['a trailing dot before the port', 'shop.com.:443', 'shop.com'],
+        ['a trailing dot and spaces mixed', 'shop.com. . ', 'shop.com'],
+        // everything at once
+        ['all of it', '  HTTPS://User:Pass@Shop.COM.:8443/Path?q=1#Frag  ', 'shop.com'],
+        ['all of it on IPv6', 'https://user@[2001:DB8::1]:8443/x', '[2001:db8::1]'],
+      ])('strips %s', (_, value, expected) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe(expected);
+      });
+    });
+
+    describe('values with no host left: "" (fails closed)', () => {
+      test.each([
+        ['only a scheme', 'https://'],
+        ['a scheme and a port', 'http://:443'],
+        ['only a port', ':443'],
+        ['only a colon', ':'],
+        ['only a slash', '/'],
+        ['only a path', '/shop.com'],
+        ['only a query', '?shop.com'],
+        ['only userinfo', 'user@'],
+        ['only a dot', '.'],
+        ['only dots and spaces', ' . . '],
+      ])('returns "" for %s (%j)', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe('');
+      });
+    });
+
+    describe('what it must not merge: different hosts stay different', () => {
+      test.each([
+        ['a longer domain sharing the prefix', 'shop.com.evil.com'],
+        ['a domain sharing the suffix', 'evilshop.com'],
+        ['a subdomain', 'login.shop.com'],
+        ['the host in userinfo', 'shop.com@evil.com'],
+        ['the host in the path', 'evil.com/shop.com'],
+        ['the host in the query', 'evil.com?shop.com'],
+        ['the host in the fragment', 'evil.com#shop.com'],
+        ['the host after the port', 'evil.com:shop.com'],
+        ['the host as a scheme', 'shop.com://evil.com'],
+      ])('does not turn %s (%j) into shop.com', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).not.toBe('shop.com');
+      });
+
+      test('keeps inner characters as they are (only the edges and the parts above are stripped)', () => {
+        // Act & Assert
+        expect(normalizeHost('shop .com')).toBe('shop .com');
+        expect(normalizeHost('.shop.com')).toBe('.shop.com');
+        expect(normalizeHost('shop..com')).toBe('shop..com');
+        expect(normalizeHost('shop\\com')).toBe('shop\\com');
+      });
+    });
+
+    describe('properties, over every short string of the characters it handles', () => {
+      // Every string of 1 to 4 characters over these (21 + 441 + 9,261 + 194,481 = 204,204 strings): the separators it
+      // cuts at, the characters it trims, IPv6 brackets, and letters/digits that can form a scheme, host or port.
+      const ALPHABET = ['/', '?', '#', '@', ':', '[', ']', '.', ' ', '\t', 'a', 'A', '1', '+', '-', 'h', 's', 'p', 't', 'x', 'é'];
+      const allStrings = (maxLength: number) => {
+        let level = [''];
+        let all: string[] = [];
+        for (let length = 1; length <= maxLength; length++) {
+          level = level.flatMap(prefix => ALPHABET.map(ch => prefix + ch));
+          all = all.concat(level);
+        }
+        return all;
+      };
+      const STRINGS = allStrings(4);
+
+      test('is idempotent: normalizing twice gives the same result as once', () => {
+        // Act
+        const unstable = STRINGS.filter(value => normalizeHost(normalizeHost(value)) !== normalizeHost(value))
+          .map(value => JSON.stringify(value));
+
+        // Assert
+        expect(unstable).toEqual([]);
+      });
+
+      test('never leaves a separator, upper case, edge whitespace or a trailing dot in the result', () => {
+        // Act
+        const bad = STRINGS.map(value => [value, normalizeHost(value)] as const).filter(([, host]) => {
+          const outsideBrackets = host.startsWith('[') ? host.slice(host.indexOf(']') + 1) : host;
+          return /[/?#@]/.test(host)
+            || outsideBrackets.includes(':')
+            || host !== host.toLowerCase()
+            || host !== host.trim()
+            || host.endsWith('.');
+        }).map(([value, host]) => `${JSON.stringify(value)} → ${JSON.stringify(host)}`);
+
+        // Assert
+        expect(bad).toEqual([]);
+      });
+
+      test('the result is always a piece of the lowercased input (it only removes, never adds)', () => {
+        // Act
+        const added = STRINGS.filter(value => !value.toLowerCase().includes(normalizeHost(value)))
+          .map(value => JSON.stringify(value));
+
+        // Assert
+        expect(added).toEqual([]);
+      });
+    });
+  });
+  // #endregion normalizeHost Method Tests
 
   // #region getCookieValue Method Tests
   describe('getCookieValue', () => {

@@ -1845,7 +1845,7 @@ describe('request-helper handle', () => {
         mocks.getAction.mockReturnValue(Action.CHALLENGE);
         mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
         mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-e2e' }));
-        const siteverify = vi.fn().mockResolvedValue({ json: async () => ({ success: true }) });
+        const siteverify = vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) });
         vi.stubGlobal('fetch', siteverify);
 
         // Act 1: no token yet → challenge page
@@ -1888,7 +1888,7 @@ describe('request-helper handle', () => {
         mocks.getAction.mockReturnValue(Action.CHALLENGE);
         mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
         mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-page' }));
-        const siteverify = vi.fn().mockResolvedValue({ json: async () => ({ success: true }) });
+        const siteverify = vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) });
         vi.stubGlobal('fetch', siteverify);
 
         // Act 1: challenge page for a URL with a query string
@@ -1950,10 +1950,29 @@ describe('request-helper handle', () => {
         expect(result.headers?.['set-cookie']).toBeUndefined();
     });
 
+    it.each([
+        ['solved on another site', { hostname: 'evil.com', action: 'cheq-challenge' }],
+        ['solved on another widget of this site (no action)', { hostname: 'example.com' }],
+    ])('Turnstile end to end: a reply with a valid token %s gets no session', async (_, fields) => {
+        // Arrange
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const siteverify = realTurnstile({ json: async () => ({ success: true, ...fields }) });
+        const event = replyEvent();
+
+        // Act
+        const result = await handle(event, RequestType.VIEWER_REQUEST) as any;
+
+        // Assert: the reply path runs the same token checks as a challenged request
+        expect(siteverify).toHaveBeenCalledOnce();
+        expect(result).not.toBe(event.Records[0].cf.request);
+        expect(result.status).toBe('403');
+        expect(result.headers?.['set-cookie']).toBeUndefined();
+    });
+
     it('Turnstile end to end: RTI is down, the solved reply still gets the session and goes back to the original URL', async () => {
         // Arrange
         expectError = true;
-        realTurnstile({ json: async () => ({ success: true }) });
+        realTurnstile({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) });
         mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
 
         // Act
@@ -1969,7 +1988,7 @@ describe('request-helper handle', () => {
     it('Turnstile end to end: RTI is down and the CloudFront request id is unusable, the session still works', async () => {
         // Arrange
         expectError = true;
-        realTurnstile({ json: async () => ({ success: true }) });
+        realTurnstile({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) });
         mocks.callRTI.mockRejectedValue(new Error('RTI timeout'));
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const event = replyEvent();
