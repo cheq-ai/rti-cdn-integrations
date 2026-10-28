@@ -108,6 +108,8 @@ export interface TestAdapter {
     resetConfig(): void;
     assertDebugLogged(substring: string): void;
     assertNotDebugLogged(): void;
+    /** Fails if any debug log line contains `substring`, e.g. a cookie value or token that must be redacted. */
+    assertNotInDebugLogs(substring: string): void;
     assertErrorLogged(substring: string): void;
     wasTelemetryLogged(): boolean;
 }

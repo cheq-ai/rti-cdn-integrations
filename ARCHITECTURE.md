@@ -36,6 +36,7 @@ core.
    cloudflare/  ───────▶│  RTIHelperService           │
    cloudfront/  ───────▶│    decision pipeline        │
    akamai/      ───────▶│  RTIService / RTILogger     │
+                        │  RTIStatelessUtils (shared) │
                         │  models/ helpers/ testing/  │
    fastly/  (separate)  └─────────────────────────────┘
 ```
@@ -45,7 +46,8 @@ core.
 | Path | Responsibility |
 | --- | --- |
 | `core/models/` | Types only — `Config`, `RTIRequest`, `RTIResponse`, `Action`, `ActionStrategy`, `Mode`, `EventType` |
-| `core/services/rti-helper.service.ts` | The decision pipeline. All classification logic lives here |
+| `core/services/rti-helper.service.ts` | The decision pipeline: everything that reads `config` (ignore paths, event type, action, strategy, config validation). Extends `RTIStatelessUtils` |
+| `core/services/rti-stateless-utils.ts` | The config-free helpers every integration shares: cookie and header parsing, the `x-cheq-rti-result` header, `original_url` and host checks for challenges, debug-log redaction, `errorMessage`. No constructor arguments, no state, imports only models (its spec enforces this) |
 | `core/services/rti-service.base.ts` | Shared RTI request flow (config, status check, JSON parse, errors); subclasses only send |
 | `core/services/rti.service.ts` | `fetch()`-based RTI client (Cloudflare) |
 | `core/services/rti-https.service.ts` | `node:https`-based RTI client (CloudFront: avoids the `fetch` cold-start cost on 128 MB Lambda@Edge) |
@@ -147,7 +149,7 @@ Every error path passes the request to origin: RTI timeout, network failure, mal
 response, a throwing `validateChallenge`, a throwing `challenge`, an unrecognized action
 strategy. On CloudFront a throwing `isChallengeResponse` counts as "not a reply", and a reply whose RTI call failed
 is still passed to `challenge` (if that throws too, it is passed to origin). Logging in a catch uses
-`RTIHelperService.errorMessage()`, which never throws, whatever was thrown. A broken integration degrades to a no-op rather than taking the customer's site
+`errorMessage()` (from `RTIStatelessUtils`, called through `RTIHelperService`), which never throws, whatever was thrown. A broken integration degrades to a no-op rather than taking the customer's site
 down. Cloudflare reinforces this at the platform level with `passThroughOnException()`.
 
 ### Cookies
@@ -160,12 +162,24 @@ Session correlation accuracy depends on forwarding three CHEQ cookies:
 | `_cq_pvid` | `pvidCookie` | v4.0 |
 | `_cq_s` | `sCookie` | v4.1 |
 
-`RTIHelperService.parseCookies()` has two deliberate details worth preserving:
+`parseCookies()` (in `RTIStatelessUtils`, called through `RTIHelperService`) has two deliberate details worth
+preserving:
 
 - It extracts values with `substring`, not `split('=')`, so base64 padding (`abc==`) survives
   intact.
 - It matches on an exact `name=` prefix, so the challenge-session cookie `_cq_se` is never
   mistaken for `_cq_s`.
+
+### Debug logs never carry secrets
+
+With debug on, every integration logs the RTI payload, and CloudFront also logs the whole Lambda@Edge event. Both go
+through `RTIStatelessUtils` redaction first: a `cookie` header shows the cookie **names** only, and `x-cheq-challenge`
+(the challenge session token), `authorization` and `proxy-authorization` show `[REDACTED]`. CloudFront's event log
+also shows every origin custom header value (`customHeaders`, often a shared origin secret) as `[REDACTED]`. Only the log changes; the
+origin and RTI still receive the real headers. `duidCookie`, `pvidCookie` and `sCookie` stay in the payload log: they
+are CHEQ's own ids, needed to debug RTI. Akamai and Cloudflare send RTI a fixed header allowlist without those headers,
+so redaction there is a safety net for when the list grows. A shared test (`core/testing/shared-unit-tests.ts`) checks
+all three integrations.
 
 ### Challenge session cookie: `SameSite=Lax`, never `Strict`
 

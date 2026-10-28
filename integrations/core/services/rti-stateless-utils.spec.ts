@@ -21,6 +21,7 @@ describe('RTIStatelessUtils', () => {
       utils.getHeaderByName({ 'x-test': '1' }, 'X-Test');
       utils.isChallengeReplyAllowed(ActionStrategy.CAPTCHA);
       utils.errorMessage(new Error('boom'));
+      utils.stringifyRedactedPayload({ endUserParams: { headers: { cookie: 'a=1' } } } as any);
       utils.buildRtiResultHeader({
         metadata: { version: '4.1' },
         decision: { verdict: 'benign', ruleName: 'rule' },
@@ -1199,6 +1200,335 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion normalizeHost Method Tests
+
+  // #region Debug-log redaction Tests (cookieNames, redactHeaderValue, stringifyRedactedPayload)
+  describe('debug-log redaction', () => {
+    const utils = new RTIStatelessUtils();
+    const SECRET_HEADER_NAMES = ['x-cheq-challenge', 'authorization', 'proxy-authorization'];
+
+    // Every spelling of `name` in upper and lower case, letter by letter (2^letters of them).
+    const caseVariants = (name: string): string[] =>
+      [...name].reduce<string[]>((variants, ch) => {
+        const spellings = ch.toLowerCase() === ch.toUpperCase() ? [ch] : [ch.toLowerCase(), ch.toUpperCase()];
+        return variants.flatMap(prefix => spellings.map(s => prefix + s));
+      }, ['']);
+
+    test('REDACTED is "[REDACTED]"', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.REDACTED).toBe('[REDACTED]');
+    });
+
+    describe('cookieNames', () => {
+      describe('examples', () => {
+        test.each([
+          ['one cookie', 'a=1', 'a'],
+          ['several cookies', 'a=1; b=2; _cq_se=123.abc|ray', 'a, b, _cq_se'],
+          ['the CHEQ cookies', '_cq_duid=4.abc; _cq_pvid=4.def; _cq_s=eyJ==', '_cq_duid, _cq_pvid, _cq_s'],
+          ['no space after ";"', 'a=1;b=2', 'a, b'],
+          ['tabs around the cookies', '\ta=1\t;\tb=2\t', 'a, b'],
+          ['a value with "=" (base64 padding)', 'a=x==; b=y=', 'a, b'],
+          ['a value that looks like a cookie', 'a=b=c', 'a'],
+          ['an empty value', 'a=; b=2', 'a, b'],
+          ['spaces around the name', '  a =1;  b=2  ', 'a, b'],
+          ['empty segments', ';; a=1 ;; ', 'a'],
+          ['a cookie without "=" (all value)', 'a=1; justavalue', 'a, [REDACTED]'],
+          ['only a cookie without "="', 'secret', '[REDACTED]'],
+          ['an empty name', '=value; a=1', ', a'],
+          ['a quoted value', 'a="quoted"; b=2', 'a, b'],
+          ['a URL-encoded value', 'a=x%3D1%3B; b=2', 'a, b'],
+          ['two headers joined with ", " (the second header\'s first name is hidden in a value)', 'a=1, b=2; c=3', 'a, c'],
+          ['a JSON value', 'prefs={"theme":"dark","x":1}; b=2', 'prefs, b'],
+          ['nothing', '', ''],
+          ['only separators and spaces', ' ; ;  ', ''],
+        ])('lists the names of %s', (_, header, expected) => {
+          // Act & Assert
+          expect(utils.cookieNames(header)).toBe(expected);
+        });
+      });
+
+      describe('several headers (a client can split cookies over several Cookie headers)', () => {
+        test.each([
+          ['two header values', ['a=1; b=2', 'c=3'], 'a, b, c'],
+          ['cookies already split', ['a=1', 'b=2'], 'a, b'],
+          ['an empty list', [], ''],
+          ['empty header values', ['', ' ', ';'], ''],
+          ['a header value ending in ";"', ['a=1;', 'b=2'], 'a, b'],
+          ['a cookie without "=" in one of them', ['a=1', 'secret'], 'a, [REDACTED]'],
+        ])('handles %s', (_, headers, expected) => {
+          // Act & Assert
+          expect(utils.cookieNames(headers)).toBe(expected);
+        });
+
+        test('gives the same names for the headers as for them joined with "; "', () => {
+          // Arrange
+          const headers = ['a=1; b=2', 'c=3;d=4', ' e=5 '];
+
+          // Act & Assert
+          expect(utils.cookieNames(headers)).toBe(utils.cookieNames(headers.join('; ')));
+        });
+      });
+
+      describe('never a value: every cookie header of up to two cookies, names and values from separate alphabets', () => {
+        // Names use only a b _ - ; values only digits and % ! = (an "=" in a value only after the name's "="), so any
+        // value character in the result is a leak. The expected names come from how each header was BUILT, not from
+        // parsing it again.
+        type Cookie = { text: string; name: string | null }; // name null: no "=", so the cookie is all value
+        const NAMES = ['', 'a', 'b_', 'a-b'];
+        const VALUES_AFTER_EQ = ['', '0', '1=', '%!0', '=='];
+        const VALUES_WITHOUT_EQ = ['0', '%!0'];
+        const PADS = ['', ' ', '\t'];
+        const SEPARATORS = [';', '; ', ' ;', ';;'];
+
+        const cookies: Cookie[] = [];
+        for (const before of PADS) {
+          for (const after of PADS) {
+            for (const name of NAMES) {
+              for (const value of VALUES_AFTER_EQ) {
+                cookies.push({ text: `${before}${name}=${value}${after}`, name });
+              }
+            }
+            for (const value of VALUES_WITHOUT_EQ) {
+              cookies.push({ text: `${before}${value}${after}`, name: null });
+            }
+          }
+        }
+        const headers: { header: string; cookies: Cookie[] }[] = [
+          ...cookies.map(c => ({ header: c.text, cookies: [c] })),
+          ...cookies.flatMap(a => cookies.flatMap(b => SEPARATORS.map(sep => ({ header: `${a.text}${sep}${b.text}`, cookies: [a, b] })))),
+        ];
+        const expectedNames = (built: Cookie[]) => built.map(c => c.name === null ? '[REDACTED]' : c.name.trim()).join(', ');
+
+        test('covers more than 25,000 headers', () => {
+          // Act & Assert
+          expect(headers.length).toBeGreaterThan(25_000);
+        });
+
+        test('no value character ever appears in the result', () => {
+          // Act
+          const leaks = headers
+            .map(({ header }) => [header, utils.cookieNames(header)] as const)
+            .filter(([, names]) => /[^ab_\-, ]/.test(names.split('[REDACTED]').join('')))
+            .map(([header, names]) => `${JSON.stringify(header)} → ${JSON.stringify(names)}`);
+
+          // Assert
+          expect(leaks).toEqual([]);
+        });
+
+        test('returns exactly the names the header was built from, in order, with [REDACTED] for a cookie without "="', () => {
+          // Act
+          const wrong = headers
+            .filter(({ header, cookies: built }) => utils.cookieNames(header) !== expectedNames(built))
+            .map(({ header, cookies: built }) => `${JSON.stringify(header)}: expected ${JSON.stringify(expectedNames(built))}, got ${JSON.stringify(utils.cookieNames(header))}`);
+
+          // Assert
+          expect(wrong).toEqual([]);
+        });
+
+        test('gives the same result for the cookies passed as a list', () => {
+          // Act
+          const wrong = headers
+            .filter(({ header, cookies: built }) => built.length === 2 && utils.cookieNames(built.map(c => c.text)) !== utils.cookieNames(header))
+            .filter(({ header }) => !header.includes(';;')); // ";;" adds an empty segment, which the list form does not have
+          // Assert
+          expect(wrong).toEqual([]);
+        });
+      });
+    });
+
+    describe('redactHeaderValue', () => {
+      test.each(['cookie', 'Cookie', 'COOKIE'])('keeps only the cookie names of %s', (name) => {
+        // Act & Assert
+        expect(utils.redactHeaderValue(name, 'a=secret; b=secret')).toBe('a, b');
+      });
+
+      test('treats every upper/lower-case spelling of "cookie" as the Cookie header', () => {
+        // Act
+        const wrong = caseVariants('cookie').filter(name => utils.redactHeaderValue(name, 'a=secret; b=x') !== 'a, b');
+
+        // Assert
+        expect(caseVariants('cookie')).toHaveLength(64);
+        expect(wrong).toEqual([]);
+      });
+
+      test.each(SECRET_HEADER_NAMES)('redacts every upper/lower-case spelling of %s', (secretName) => {
+        // Act
+        const variants = caseVariants(secretName);
+        const kept = variants.filter(name => utils.redactHeaderValue(name, 'secret-value') !== '[REDACTED]');
+
+        // Assert
+        expect(variants.length).toBe(2 ** [...secretName].filter(ch => /[a-z]/.test(ch)).length);
+        expect(kept).toEqual([]);
+      });
+
+      test.each([
+        ['an empty value', ''],
+        ['only spaces', '   '],
+        ['a value that looks harmless', 'none'],
+        ['a very long value', 'x'.repeat(10_000)],
+      ])('redacts a secret header with %s too (the value is never judged)', (_, value) => {
+        // Act & Assert
+        for (const name of SECRET_HEADER_NAMES) {
+          expect(utils.redactHeaderValue(name, value)).toBe('[REDACTED]');
+        }
+      });
+
+      test.each([
+        ['an ordinary header', 'user-agent'],
+        ['host', 'host'],
+        ['the ray id (not a secret)', 'x-cheq-ray-id'],
+        ['the verdict header', 'x-cheq-rti-result'],
+        ['a plural of cookie', 'cookies'],
+        ['a header containing "cookie"', 'x-cookie-consent'],
+        ['set-cookie (a response header)', 'set-cookie'],
+        ['a header containing "authorization"', 'x-authorization-hint'],
+        ['a header starting with "authorization"', 'authorization-x'],
+        ['a header missing a letter', 'authorizatio'],
+        ['a header with a space before (not a valid header name)', ' authorization'],
+        ['a header with a space after (not a valid header name)', 'cookie '],
+        ['an empty name', ''],
+      ])('keeps %s (%j) as it is: only exact names, in any case, are secret', (_, name) => {
+        // Act & Assert
+        expect(utils.redactHeaderValue(name, 'a=1; b=2')).toBe('a=1; b=2');
+      });
+
+      test('returns an ordinary header\'s value unchanged, whatever it holds', () => {
+        // Arrange
+        const values = ['', ' ', 'a=1; b=2', '[REDACTED]', 'Bearer x', '\t\r\n', 'é😀', 'x'.repeat(10_000)];
+
+        // Act & Assert
+        for (const value of values) {
+          expect(utils.redactHeaderValue('user-agent', value)).toBe(value);
+        }
+      });
+
+      test('an empty Cookie header gives no names', () => {
+        // Act & Assert
+        expect(utils.redactHeaderValue('cookie', '')).toBe('');
+      });
+    });
+
+    describe('stringifyRedactedPayload', () => {
+      const buildPayload = (headers: Record<string, string | undefined>) => ({
+        tagHash: 'tag',
+        apiKey: 'key',
+        channel: 'test-channel',
+        endUserParams: { clientIp: '1.2.3.4', requestUrl: 'https://shop.com/', headerNames: 'x', method: 'GET', headers },
+        duidCookie: 'duid-1',
+        pvidCookie: 'pvid-1',
+        sCookie: 's-1',
+      }) as any;
+
+      test('redacts cookie values, the session token and credentials, matching header names case-insensitively', () => {
+        // Arrange
+        const payload = buildPayload({ Cookie: 'a=secret1; _cq_se=tok|ray', AUTHORIZATION: 'Bearer sk', 'x-cheq-challenge': 'tok', 'Proxy-Authorization': 'Basic pk', host: 'shop.com' });
+
+        // Act
+        const logged = JSON.parse(utils.stringifyRedactedPayload(payload));
+
+        // Assert
+        expect(logged.endUserParams.headers).toEqual({
+          Cookie: 'a, _cq_se', AUTHORIZATION: '[REDACTED]', 'x-cheq-challenge': '[REDACTED]', 'Proxy-Authorization': '[REDACTED]', host: 'shop.com',
+        });
+      });
+
+      test("keeps everything else, CHEQ's own ids included (duidCookie, pvidCookie, sCookie are needed to debug RTI)", () => {
+        // Arrange
+        const payload = buildPayload({ cookie: 'a=1' });
+
+        // Act
+        const logged = JSON.parse(utils.stringifyRedactedPayload(payload));
+
+        // Assert
+        expect(logged).toEqual({ ...payload, endUserParams: { ...payload.endUserParams, headers: { cookie: 'a' } } });
+        expect(logged.duidCookie).toBe('duid-1');
+        expect(logged.pvidCookie).toBe('pvid-1');
+        expect(logged.sCookie).toBe('s-1');
+      });
+
+      test('equals JSON.stringify when there is nothing to redact (same keys, same order)', () => {
+        // Arrange
+        const payload = buildPayload({ host: 'shop.com', 'user-agent': 'UA', cheq_ja3: undefined });
+
+        // Act & Assert
+        expect(utils.stringifyRedactedPayload(payload)).toBe(JSON.stringify(payload));
+      });
+
+      test('keeps the header order and drops undefined headers, like JSON.stringify', () => {
+        // Arrange
+        const payload = buildPayload({ z: '1', cookie: 'a=1', a: '2', cheq_ja4: undefined, authorization: 'x' });
+
+        // Act
+        const keys = Object.keys(JSON.parse(utils.stringifyRedactedPayload(payload)).endUserParams.headers);
+
+        // Assert
+        expect(keys).toEqual(['z', 'cookie', 'a', 'authorization']);
+      });
+
+      test('changes nothing but the logged string: the payload sent to RTI keeps the real values', () => {
+        // Arrange
+        const headers = { cookie: 'a=secret', authorization: 'Bearer sk' };
+        const payload = buildPayload(headers);
+        const before = JSON.stringify(payload);
+
+        // Act
+        utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(JSON.stringify(payload)).toBe(before);
+        expect(payload.endUserParams.headers).toBe(headers);
+        expect(headers.cookie).toBe('a=secret');
+      });
+
+      test('works without endUserParams or headers', () => {
+        // Act & Assert
+        expect(utils.stringifyRedactedPayload({ tagHash: 't' } as any)).toBe('{"tagHash":"t"}');
+        expect(utils.stringifyRedactedPayload({ endUserParams: { clientIp: 'x' } } as any)).toBe('{"endUserParams":{"clientIp":"x"}}');
+      });
+
+      test('works bound to an instance, as the integrations\' spec mocks call it', () => {
+        // Arrange
+        const bound = utils.stringifyRedactedPayload.bind(utils);
+
+        // Act & Assert
+        expect(JSON.parse(bound(buildPayload({ cookie: 'a=secret' }))).endUserParams.headers.cookie).toBe('a');
+      });
+
+      test('never leaks a secret: every combination of secret and ordinary headers, in several spellings', () => {
+        // Arrange: each secret value holds "TOPSECRET"; ordinary headers must come out unchanged
+        const SECRETS: [string, string][] = [
+          ['cookie', 'login=TOPSECRET-1; _cq_se=TOPSECRET-2|ray'],
+          ['Cookie', 'session=TOPSECRET-3'],
+          ['authorization', 'Bearer TOPSECRET-4'],
+          ['AUTHORIZATION', 'Basic TOPSECRET-5'],
+          ['x-cheq-challenge', 'TOPSECRET-6'],
+          ['X-Cheq-Challenge', 'TOPSECRET-7'],
+          ['proxy-authorization', 'Basic TOPSECRET-8'],
+        ];
+        const ORDINARY: [string, string][] = [['host', 'shop.com'], ['user-agent', 'UA/1'], ['x-cheq-ray-id', 'ray-1']];
+        const failures: string[] = [];
+
+        // Act: all 2^10 subsets of the 10 headers
+        const all = [...SECRETS, ...ORDINARY];
+        for (let mask = 0; mask < 2 ** all.length; mask++) {
+          const headers = Object.fromEntries(all.filter((_, i) => mask & (1 << i)));
+          const logged = utils.stringifyRedactedPayload(buildPayload(headers));
+          const loggedHeaders = JSON.parse(logged).endUserParams.headers;
+          if (logged.includes('TOPSECRET')) {
+            failures.push(`leak: ${logged}`);
+          }
+          for (const [name, value] of ORDINARY) {
+            if (name in headers && loggedHeaders[name] !== value) {
+              failures.push(`changed ${name}: ${logged}`);
+            }
+          }
+        }
+
+        // Assert
+        expect(failures).toEqual([]);
+      });
+    });
+  });
+  // #endregion Debug-log redaction Tests
 
   // #region getCookieValue Method Tests
   describe('getCookieValue', () => {

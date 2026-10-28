@@ -16,7 +16,7 @@
  *   Header absence   no x-cheq-rti-result on block or redirect responses
  *   Querystring      forwarded in endUserParams.requestUrl
  *   Error handling   RTI throws Error, RTI throws non-Error value
- *   Debug logging    payload logged when enabled, nothing when disabled
+ *   Debug logging    payload logged when enabled, nothing when disabled, never a cookie value or secret
  *   Telemetry        logged when enabled, not when disabled
  *   RTI payload      clientIp, channel non-empty, HTTP method, path in requestUrl
  *
@@ -863,6 +863,22 @@ export function registerSharedBehaviorTests(adapter: TestAdapter, mocks: SharedM
 
             // Assert
             adapter.assertNotDebugLogged();
+        });
+
+        it('never logs cookie values, the challenge session token or credentials, but keeps the CHEQ ids', async () => {
+            // Arrange: every secret holds "topsecret", so one check covers them all
+            adapter.setConfig({ debug: true });
+
+            // Act
+            await adapter.invoke({
+                cookies: 'login=topsecret-login; _cq_duid=duid-debug',
+                headers: { authorization: 'Bearer topsecret-auth', 'x-cheq-challenge': 'topsecret-token' },
+            });
+
+            // Assert
+            adapter.assertDebugLogged('payload');
+            adapter.assertDebugLogged('"duidCookie":"duid-debug"');
+            adapter.assertNotInDebugLogs('topsecret');
         });
 
         //#endregion Debug logging tests

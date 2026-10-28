@@ -155,6 +155,34 @@ describe('createTurnstileChallenge sessionTtlSeconds', () => {
         expect(result.headers['set-cookie'][0].value).toContain('Max-Age=60');
     });
 
+    // Above 400 days (the most browsers keep a cookie) the TTL is refused: 1e13 s pushed the expiry past
+    // Number.MAX_SAFE_INTEGER, so validateChallenge rejected every session and visitors looped on the CAPTCHA.
+    const MAX_TTL = 400 * 24 * 60 * 60;
+
+    it.each([MAX_TTL + 1, 10 * MAX_TTL, 1e13, Number.MAX_SAFE_INTEGER, Number.MAX_VALUE])(
+        'warns and uses the default 300 s when sessionTtlSeconds is %j, above the 400-day maximum', async (ttl) => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const callbacks = createTurnstileChallenge({ ...testSettings, sessionTtlSeconds: ttl });
+            expect(warn).toHaveBeenCalledOnce();
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining('at most 34560000 (400 days)'));
+
+            stubSiteverify(true);
+            const result = await callbacks.challenge!(buildTurnstileRequest(solvedQuery), buildRTIResponse()) as any;
+            expect(result.headers['set-cookie'][0].value).toContain('Max-Age=300');
+        });
+
+    it.each([1, 60, MAX_TTL])('issues a session with sessionTtlSeconds %j that validateChallenge then accepts', async (ttl) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const callbacks = build({ ...testSettings, sessionTtlSeconds: ttl });
+        expect(warn).not.toHaveBeenCalled();
+
+        stubSiteverify(true);
+        const result = await callbacks.challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse('ray-ttl')) as any;
+        const cookie = result.headers['set-cookie'][0].value.split(';')[0];
+        expect(result.headers['set-cookie'][0].value).toContain(`Max-Age=${ttl}`);
+        expect(await callbacks.validateChallenge(buildRequest(cookie), false)).toBe(true);
+    });
+
     it('still disables the CAPTCHA (one warning) when a secret is missing, whatever the TTL', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         expect(createTurnstileChallenge({ ...testSettings, secretKey: 'REPLACE_ME', sessionTtlSeconds: 0 })).toEqual({});
@@ -293,10 +321,224 @@ describe('validateChallenge', () => {
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('invalid sessionToken format'));
     });
 
-    it('logs debug info when isDebug=true and expiresAt is NaN', async () => {
+    it('logs debug info when isDebug=true and expiresAt is not a number', async () => {
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
         await validateChallenge(buildRequest('_cq_se=notanumber.abcdef|ray-abc'), true);
-        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('NaN'));
+        expect(consoleSpy).toHaveBeenCalledWith("[validateChallenge] invalid expiresAt format, returning 'false'");
+        expect(consoleSpy.mock.calls.flat().join('\n')).not.toContain('notanumber');
+    });
+
+    // --- Debug logs: cookie names only, never values (the site's own cookies, our session token) ---
+
+    describe('debug logs never contain cookie values or the session token', () => {
+        const loggedDuring = async (request: CloudFrontRequest) => {
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+            await validateChallenge(request, true);
+            const logged = consoleSpy.mock.calls.flat().join('\n');
+            consoleSpy.mockRestore();
+            return logged;
+        };
+
+        it('logs the cookie names, not their values, with the token in the _cq_se cookie', async () => {
+            const { cookie, token } = await issueSession('ray-names');
+            const logged = await loggedDuring(buildRequest(`a=secret1; ${cookie}`));
+
+            expect(logged).toContain('[validateChallenge] cookies: a, _cq_se');
+            expect(logged).toContain('sessionToken: present (cookie)');
+            expect(logged).not.toContain('secret1');
+            expect(logged).not.toContain(token);
+            expect(logged).not.toContain(token.split('.')[1]); // the signature on its own
+        });
+
+        it('logs only where the token came from when it arrives in the x-cheq-challenge header', async () => {
+            const { token } = await issueSession('ray-header');
+            const logged = await loggedDuring(buildRequest('a=secret1; _ga=GA1.2.3', 'ray-header', token));
+
+            expect(logged).toContain('[validateChallenge] cookies: a, _ga');
+            expect(logged).toContain('sessionToken: present (x-cheq-challenge header)');
+            expect(logged).toContain('rayId: ray-header');
+            expect(logged).not.toContain('secret1');
+            expect(logged).not.toContain('GA1.2.3');
+            expect(logged).not.toContain(token);
+            expect(logged).not.toContain(token.split('.')[1]);
+        });
+
+        it('takes names from several Cookie headers', async () => {
+            const request = buildRequest('a=secret1');
+            request.headers['cookie'].push({ key: 'Cookie', value: 'b=secret2; c=secret3' });
+            const logged = await loggedDuring(request);
+
+            expect(logged).toContain('[validateChallenge] cookies: a, b, c');
+            expect(logged).not.toMatch(/secret[123]/);
+        });
+
+        it('shows a cookie without "=" (all value, no name) as [REDACTED]', async () => {
+            const logged = await loggedDuring(buildRequest('a=1; justavalue'));
+            expect(logged).toContain('[validateChallenge] cookies: a, [REDACTED]');
+            expect(logged).not.toContain('justavalue');
+        });
+
+        it('says NOT PRESENT and NOT FOUND when there are no cookies and no token', async () => {
+            const logged = await loggedDuring(buildRequest());
+            expect(logged).toContain('[validateChallenge] cookies: NOT PRESENT');
+            expect(logged).toContain('sessionToken: NOT FOUND');
+        });
+
+        it('never logs a cookie value on any path (valid, expired, bad format, bad signature)', async () => {
+            const { cookie: valid } = await issueSession('ray-paths');
+            const { cookie: expired } = await issueSession('ray-paths', testSettings, Date.now() - 301_000);
+            for (const sessionCookie of [valid, expired, '_cq_se=123abc.deadbeef|ray-paths', '_cq_se=nodot|ray-paths', '_cq_se=9999999999999.0000|ray-paths']) {
+                const logged = await loggedDuring(buildRequest(`login=topsecret; ${sessionCookie}`));
+                const sessionValue = sessionCookie.slice('_cq_se='.length).split('|')[0];
+                expect(logged).not.toContain('topsecret');
+                expect(logged).not.toContain(sessionValue);
+            }
+        });
+    });
+
+    // --- Session format: exactly "{expiresAt}.{signature}", and only the expiry spelling sessionRedirect issues ---
+
+    describe('strict session format', () => {
+        // A correct signature for any expiry, so a rejection can only come from the format checks.
+        const sign = (expiresAt: number, rayId = 'ray-exp') =>
+            createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, rayId])).digest('hex').slice(0, 32);
+        const validateToken = (token: string, isDebug = false) =>
+            validateChallenge(buildRequest(`_cq_se=${token}|ray-exp`), isDebug);
+        const logsDuring = async (token: string) => {
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+            const accepted = await validateToken(token, true);
+            const lines = consoleSpy.mock.calls.map(call => String(call[0]));
+            consoleSpy.mockRestore();
+            return { accepted, lines };
+        };
+        const FORMAT = "[validateChallenge] invalid sessionToken format, returning 'false'";
+        const EXPIRY_FORMAT = "[validateChallenge] invalid expiresAt format, returning 'false'";
+
+        describe('the token: exactly two parts', () => {
+            it.each([
+                ['a third part', (e: number, s: string) => `${e}.${s}.junk`],
+                ['a trailing dot', (e: number, s: string) => `${e}.${s}.`],
+                ['a decimal expiry (splits into three parts)', (e: number, s: string) => `${e}.5.${s}`],
+                ['no dot', (e: number, s: string) => `${e}${s}`],
+                ['an empty expiry', (_: number, s: string) => `.${s}`],
+                ['an empty signature', (e: number) => `${e}.`],
+                ['only a dot', () => '.'],
+            ])('rejects a genuinely signed session with %s', async (_, spell) => {
+                // Arrange
+                const expiresAt = Date.now() + 60_000;
+                expect(await validateToken(`${expiresAt}.${sign(expiresAt)}`)).toBe(true);
+
+                // Act
+                const { accepted, lines } = await logsDuring(spell(expiresAt, sign(expiresAt)));
+
+                // Assert
+                expect(accepted).toBe(false);
+                expect(lines).toContain(FORMAT);
+            });
+        });
+
+        describe('the expiry: only `${expiresAt}` of a safe integer', () => {
+            it.each([
+                ['letters after the digits (parseInt reads 123)', '123abc'],
+                ['leading zeros', '0123'],
+                ['a single leading zero', '01730000000000'],
+                ['a leading space', ' 123'],
+                ['a trailing space', '123 '],
+                ['a leading tab', '\t123'],
+                ['a plus sign', '+1730000000000'],
+                ['negative zero', '-0'],
+                ['an exponent', '1e13'],
+                ['an upper-case exponent', '1E13'],
+                ['hex', '0x1F'],
+                ['octal', '0o17'],
+                ['binary', '0b101'],
+                ['digit separators', '1_730_000_000_000'],
+                ['Infinity', 'Infinity'],
+                ['NaN', 'NaN'],
+                ['a non-ASCII digit', '١٢٣'],
+                ['a full-width digit', '１２３'],
+                ['one above the largest safe integer', '9007199254740992'],
+                ['two above it (Number() rounds it)', '9007199254740993'],
+                ['20 digits', '99999999999999999999'],
+            ])('rejects %s (%j) with an "invalid expiresAt format" debug line', async (_, expiresAtStr) => {
+                // Act
+                const { accepted, lines } = await logsDuring(`${expiresAtStr}.${'a'.repeat(32)}`);
+
+                // Assert
+                expect(accepted).toBe(false);
+                expect(lines).toContain(EXPIRY_FORMAT);
+                expect(lines.join('\n')).not.toContain(expiresAtStr.trim() || '\u0000'); // the value is never logged
+            });
+
+            it.each([
+                ['minus one', '-1'],
+                ['zero', '0'],
+                ['an old timestamp', '1000000000000'],
+            ])('accepts the format of %s (%j), a real number as issued, and rejects it as expired', async (_, expiresAtStr) => {
+                // Act
+                const { accepted, lines } = await logsDuring(`${expiresAtStr}.${sign(Number(expiresAtStr))}`);
+
+                // Assert
+                expect(accepted).toBe(false);
+                expect(lines).not.toContain(EXPIRY_FORMAT);
+                expect(lines.some(line => line.includes('expired'))).toBe(true);
+            });
+
+            it('accepts a valid 13-digit expiry with a good signature', async () => {
+                // Arrange
+                const expiresAt = Date.now() + 60_000;
+
+                // Act & Assert
+                expect(String(expiresAt)).toMatch(/^\d{13}$/);
+                expect(await validateToken(`${expiresAt}.${sign(expiresAt)}`)).toBe(true);
+            });
+
+            it('accepts the largest safe integer, and rejects the next one even with a good signature', async () => {
+                // Arrange
+                const max = Number.MAX_SAFE_INTEGER;
+
+                // Act & Assert
+                expect(await validateToken(`${max}.${sign(max)}`)).toBe(true);
+                expect(await validateToken(`${max + 1}.${sign(max + 1)}`)).toBe(false);
+            });
+
+            it('accepts every issued spelling and rejects every other spelling of the same number, signatures all genuine', async () => {
+                // Arrange: future expiries of every length from 13 to 16 digits, round and not
+                const now = Date.now();
+                const expiries = [now + 1, now + 300_000, now + 86_400_000, 9_999_999_999_999, 10_000_000_000_000,
+                    123_456_789_012_345, 1_000_000_000_000_000, 8_000_000_000_000_001, Number.MAX_SAFE_INTEGER];
+                const respell = (s: string) => [
+                    `0${s}`, `00${s}`, `+${s}`, ` ${s}`, `${s} `, `\t${s}`, `${s}\n`, `${s}abc`, `${s}0x`, `${s}e0`, `${s}n`,
+                    `${Number(s).toExponential()}`, `0x${Number(s).toString(16)}`, s.replace(/^(\d)/, '$1_'),
+                ].filter(variant => variant !== s);
+                const wrong: string[] = [];
+
+                // Act
+                for (const expiresAt of expiries) {
+                    const issued = String(expiresAt);
+                    if (!(await validateToken(`${issued}.${sign(expiresAt)}`))) {
+                        wrong.push(`issued ${JSON.stringify(issued)} rejected`);
+                    }
+                    for (const variant of respell(issued)) {
+                        if (await validateToken(`${variant}.${sign(expiresAt)}`)) {
+                            wrong.push(`${JSON.stringify(variant)} accepted for ${issued}`);
+                        }
+                    }
+                }
+
+                // Assert
+                expect(wrong).toEqual([]);
+            });
+        });
+
+        it('accepts what sessionRedirect actually issues', async () => {
+            // Arrange
+            const { cookie, expiresAt } = await issueSession('ray-issued');
+
+            // Act & Assert
+            expect(cookie).toMatch(new RegExp(`^_cq_se=${expiresAt}\\.[0-9a-f]{32}\\|ray-issued$`));
+            expect(await validateChallenge(buildRequest(cookie), false)).toBe(true);
+        });
     });
 
     // --- Signature format and comparison ---

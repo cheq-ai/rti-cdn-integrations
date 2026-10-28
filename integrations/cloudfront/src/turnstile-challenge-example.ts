@@ -7,6 +7,9 @@ import type { CloudfrontConfig } from "./config";
 
 const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
 
+// For the instance helpers (e.g. cookieNames for the debug log). The class holds no state, so one instance serves all.
+const statelessUtils = new RTIStatelessUtils();
+
 /**
  * The Turnstile action of the CHEQ challenge widget: set as `data-action` on the challenge page and required in the
  * siteverify result, so a token solved on another widget (another site, or the site's own login form) is rejected.
@@ -32,6 +35,13 @@ export interface TurnstileSettings {
 const isPlaceholder = (value: string | undefined): boolean => !value || value.trim() === "" || value.trim() === "REPLACE_ME";
 
 const DEFAULT_SESSION_TTL_SECONDS = 300;
+
+/**
+ * The longest session: 400 days, the most browsers keep a cookie (RFC 6265bis caps Max-Age there; Chrome enforces it),
+ * so a longer TTL could not last longer anyway. It also keeps the expiry far below Number.MAX_SAFE_INTEGER: a TTL like
+ * 1e13 s made `${expiresAt}` unreadable to validateChallenge, so every session was rejected and visitors looped.
+ */
+const MAX_SESSION_TTL_SECONDS = 400 * 24 * 60 * 60;
 
 // Escapes a value for an HTML text node or a quoted attribute. Every value put into the challenge page goes
 // through it: the URI comes from the client, and a raw `"` there would otherwise close the attribute and
@@ -79,10 +89,13 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
         return {};
     }
     // A TTL of 0, a negative or fractional number, NaN or a string would issue sessions that are already expired
-    // (every visitor challenged again and again) or a broken Max-Age. Fall back to the default instead.
-    const ttlValid = Number.isInteger(settings.sessionTtlSeconds) && settings.sessionTtlSeconds > 0;
+    // (every visitor challenged again and again) or a broken Max-Age, and one above MAX_SESSION_TTL_SECONDS sessions
+    // that are never accepted. Fall back to the default instead.
+    const ttlValid = Number.isInteger(settings.sessionTtlSeconds)
+        && settings.sessionTtlSeconds > 0
+        && settings.sessionTtlSeconds <= MAX_SESSION_TTL_SECONDS;
     if (!ttlValid) {
-        console.warn(`[turnstile] invalid sessionTtlSeconds ${JSON.stringify(settings.sessionTtlSeconds)}, using ${DEFAULT_SESSION_TTL_SECONDS} (set a positive whole number of seconds in config.ts)`);
+        console.warn(`[turnstile] invalid sessionTtlSeconds ${JSON.stringify(settings.sessionTtlSeconds)}, using ${DEFAULT_SESSION_TTL_SECONDS} (set a positive whole number of seconds, at most ${MAX_SESSION_TTL_SECONDS} (400 days), in config.ts)`);
     }
     const resolved: TurnstileSettings = ttlValid ? settings : { ...settings, sessionTtlSeconds: DEFAULT_SESSION_TTL_SECONDS };
     return {
@@ -502,15 +515,20 @@ const turnstileValidateChallengeExample = async (settings: TurnstileSettings, re
 
     const shouldValidateChallenge = sessionToken && rayId;
     if (isDebug) {
-        console.log(`[validateChallenge] cookies: ${cookies.length > 0 ? cookies.join("; ") : "NOT PRESENT"}`);
-        console.log(`[validateChallenge] sessionToken: ${sessionToken ?? "NOT FOUND"}, rayId: ${rayId ?? "NOT FOUND"}, shouldValidateChallenge: ${shouldValidateChallenge ?? "NOTHING_TO_VALIDATE_CALL_RTI"}`);
+        // Cookie names only, and only where the session token came from: values (the site's own login cookies, our
+        // session token) must never reach the log.
+        const tokenSource = request.headers["x-cheq-challenge"]?.[0]?.value ? "x-cheq-challenge header" : "cookie";
+        console.log(`[validateChallenge] cookies: ${cookies.length > 0 ? statelessUtils.cookieNames(cookies) : "NOT PRESENT"}`);
+        console.log(`[validateChallenge] sessionToken: ${sessionToken ? `present (${tokenSource})` : "NOT FOUND"}, rayId: ${rayId ?? "NOT FOUND"}, shouldValidateChallenge: ${shouldValidateChallenge ?? "NOTHING_TO_VALIDATE_CALL_RTI"}`);
     }
 
     if (shouldValidateChallenge) {
         try {
-            const [expiresAtStr, signature] = sessionToken.split(".");
-            
-            if (!expiresAtStr || !signature) { 
+            // Exactly "{expiresAt}.{signature}": a third part ("{expiresAt}.{signature}.junk") is not a cookie we issued.
+            const parts = sessionToken.split(".");
+            const [expiresAtStr, signature] = parts;
+
+            if (parts.length !== 2 || !expiresAtStr || !signature) {
                 if (isDebug) {
                     console.log("[validateChallenge] invalid sessionToken format, returning 'false'");
                 }
@@ -518,13 +536,16 @@ const turnstileValidateChallengeExample = async (settings: TurnstileSettings, re
                 return false; 
             }
 
-            const expiresAt = parseInt(expiresAtStr, 10);
-            if (isNaN(expiresAt)) { 
+            // The only accepted spelling is the one sessionRedirect issues: `${expiresAt}` of a safe integer. Anything
+            // else reads as a number but is not what we wrote ("123abc" for parseInt, "0123", " 123", "+123", "1e13",
+            // "12.0" for Number), so the round trip rejects it; isSafeInteger rules out a value Number() rounded.
+            const expiresAt = Number(expiresAtStr);
+            if (!Number.isSafeInteger(expiresAt) || String(expiresAt) !== expiresAtStr) {
                 if (isDebug) {
-                    console.log("[validateChallenge] expiresAt is NaN, returning 'false'");
+                    console.log("[validateChallenge] invalid expiresAt format, returning 'false'");
                 }
 
-                return false; 
+                return false;
             }
 
             if (Date.now() > expiresAt) {

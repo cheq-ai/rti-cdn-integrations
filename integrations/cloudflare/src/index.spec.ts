@@ -45,6 +45,7 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 getEventType: mocks.getEventType,
                 validateConfig: mocks.validateConfig,
                 parseCookies: realInstance.parseCookies.bind(realInstance),
+                stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
                 buildRtiResultHeader: realInstance.buildRtiResultHeader.bind(realInstance),
             };
         }),
@@ -178,6 +179,11 @@ const cloudflareAdapter: TestAdapter = {
 
     assertNotDebugLogged() {
         expect(_lastConsoleLogs).toHaveLength(0);
+    },
+
+    assertNotInDebugLogs(substring: string) {
+        const leaked = _lastConsoleLogs.filter(msg => msg.includes(substring));
+        expect(leaked, `expected no debug log containing "${substring}"`).toEqual([]);
     },
 
     assertErrorLogged(substring: string) {

@@ -1,6 +1,6 @@
 // cspell:ignore duid pvid
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { CloudFrontRequestEvent } from 'aws-lambda';
+import type { CloudFrontRequest, CloudFrontRequestEvent } from 'aws-lambda';
 
 const mocks = vi.hoisted(() => ({
     callRTI: vi.fn(),
@@ -47,6 +47,9 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 getEventType: mocks.getEventType,
                 validateConfig: vi.fn().mockReturnValue([]),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
+                stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
+                cookieNames: realInstance.cookieNames.bind(realInstance),
+                redactHeaderValue: realInstance.redactHeaderValue.bind(realInstance),
                 buildRtiResultHeader: realInstance.buildRtiResultHeader.bind(realInstance),
                 isChallengeReplyAllowed: realInstance.isChallengeReplyAllowed.bind(realInstance),
                 errorMessage: realInstance.errorMessage.bind(realInstance),
@@ -229,6 +232,11 @@ const cloudfrontAdapter: TestAdapter = {
 
     assertNotDebugLogged() {
         expect(_lastConsoleLogs).toHaveLength(0);
+    },
+
+    assertNotInDebugLogs(substring: string) {
+        const leaked = _lastConsoleLogs.filter(msg => msg.includes(substring));
+        expect(leaked, `expected no debug log containing "${substring}"`).toEqual([]);
     },
 
     assertErrorLogged(substring: string) {
@@ -891,6 +899,124 @@ describe('request-helper handle', () => {
         consoleSpy.mockRestore();
     });
 
+    // --- Debug logs: cookie values, the session token and credentials are redacted (only what is logged) ---
+
+    describe('debug log redaction', () => {
+        const COOKIE = 'a=secret1; _cq_se=1730000000000.sigabcdef0123|ray-se; _cq_duid=duid-123';
+        const secretHeaders = { 'X-Cheq-Challenge': 'hdr-token-xyz', Authorization: 'Bearer sekret-auth' };
+        const SECRETS = ['secret1', '1730000000000.sigabcdef0123', 'sigabcdef0123', 'ray-se', 'hdr-token-xyz', 'sekret-auth'];
+
+        const debugLogs = async (event: CloudFrontRequestEvent) => {
+            (config as any).debug = true;
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+            const result = await handle(event, RequestType.VIEWER_REQUEST);
+            const lines = consoleSpy.mock.calls.map(call => call.join(' '));
+            consoleSpy.mockRestore();
+            const line = (prefix: string) => {
+                const found = lines.find(l => l.startsWith(prefix));
+                expect(found, `expected a "${prefix}" log line`).toBeDefined();
+                return found!;
+            };
+            return { result, lines, eventLog: line('Original CF Event'), payloadLog: line('RTI Request payload') };
+        };
+
+        it('logs the event and the RTI payload without cookie values, the session token or authorization', async () => {
+            // Act
+            const { lines, eventLog, payloadLog } = await debugLogs(buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE, { extraHeaders: secretHeaders }));
+
+            // Assert: no secret anywhere in the debug output
+            for (const secret of SECRETS) {
+                expect(lines.join('\n')).not.toContain(secret);
+            }
+            // the cookie names and the redaction marker are there, in both logs
+            expect(eventLog).toContain('"value":"a, _cq_se, _cq_duid"');
+            expect(eventLog).toContain('"x-cheq-challenge":[{"key":"X-Cheq-Challenge","value":"[REDACTED]"}]');
+            expect(eventLog).toContain('"authorization":[{"key":"Authorization","value":"[REDACTED]"}]');
+            expect(payloadLog).toContain('"cookie":"a, _cq_se, _cq_duid"');
+            expect(payloadLog).toContain('"x-cheq-challenge":"[REDACTED]"');
+            expect(payloadLog).toContain('"authorization":"[REDACTED]"');
+            // other headers are logged as they are
+            expect(eventLog).toContain('"value":"Mozilla/5.0"');
+            expect(payloadLog).toContain('"user-agent":"Mozilla/5.0"');
+        });
+
+        it("keeps CHEQ's own ids (duidCookie) in the payload log: they are needed to debug RTI", async () => {
+            // Act
+            const { payloadLog } = await debugLogs(buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE));
+
+            // Assert
+            expect(payloadLog).toContain('"duidCookie":"duid-123"');
+        });
+
+        it('takes the names from each of several Cookie headers', async () => {
+            // Arrange
+            const event = buildEvent('/page', 'example.com', '1.2.3.4', '', 'a=secret1');
+            event.Records[0].cf.request.headers['cookie'].push({ key: 'Cookie', value: 'b=secret2; c=secret3' });
+
+            // Act
+            const { lines, eventLog, payloadLog } = await debugLogs(event);
+
+            // Assert: the event keeps one entry per header, each with its names
+            expect(lines.join('\n')).not.toMatch(/secret[123]/);
+            expect(eventLog).toContain('[{"key":"Cookie","value":"a"},{"key":"Cookie","value":"b, c"}]');
+            // getHeaders joins the two Cookie headers with "; ", so the payload's cookie is "a=secret1; b=secret2; c=secret3"
+            expect(payloadLog).toContain('"cookie":"a, b, c"');
+        });
+
+        it('changes only the log: the origin and RTI still get the original headers', async () => {
+            // Arrange
+            const event = buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE, { extraHeaders: secretHeaders });
+            const before = JSON.stringify(event);
+
+            // Act
+            const { result } = await debugLogs(event);
+
+            // Assert: the forwarded request (RTI allows it) is untouched, apart from the x-cheq-rti-result header that
+            // handle always adds for the origin
+            expect(result).toBe(event.Records[0].cf.request);
+            const after = JSON.parse(JSON.stringify(event));
+            delete after.Records[0].cf.request.headers['x-cheq-rti-result'];
+            expect(after).toEqual(JSON.parse(before));
+            const forwarded = result as CloudFrontRequest;
+            expect(forwarded.headers['cookie'][0].value).toBe(COOKIE);
+            expect(forwarded.headers['x-cheq-challenge'][0].value).toBe('hdr-token-xyz');
+            expect(forwarded.headers['authorization'][0].value).toBe('Bearer sekret-auth');
+            // and RTI received the real values
+            const payload = mocks.callRTI.mock.calls[0][0];
+            expect(payload.endUserParams.headers.cookie).toBe(COOKIE);
+            expect(payload.endUserParams.headers['x-cheq-challenge']).toBe('hdr-token-xyz');
+            expect(payload.endUserParams.headers.authorization).toBe('Bearer sekret-auth');
+            expect(payload.duidCookie).toBe('duid-123');
+        });
+
+        it('redacts the origin custom headers of an origin-request event, and still forwards them', async () => {
+            // Arrange
+            const event = buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE);
+            const customHeaders = { 'x-origin-verify': [{ key: 'X-Origin-Verify', value: 'origin-shared-secret' }] };
+            (event.Records[0].cf.request as any).origin = { custom: { domainName: 'origin.example.com', customHeaders } };
+
+            // Act
+            const { result, lines, eventLog } = await debugLogs(event);
+
+            // Assert
+            expect(lines.join('\n')).not.toContain('origin-shared-secret');
+            expect(eventLog).toContain('"customHeaders":{"x-origin-verify":[{"key":"X-Origin-Verify","value":"[REDACTED]"}]}');
+            expect((result as any).origin.custom.customHeaders['x-origin-verify'][0].value).toBe('origin-shared-secret');
+        });
+
+        it('logs nothing of this when debug is off', async () => {
+            // Arrange
+            const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            // Act
+            await handle(buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE), RequestType.VIEWER_REQUEST);
+
+            // Assert
+            expect(consoleSpy).not.toHaveBeenCalled();
+            consoleSpy.mockRestore();
+        });
+    });
+
     it('logs "none (should not happen)" when debug enabled and action strategy is unrecognized', async () => {
         // Arrange
         (config as any).debug = true;
@@ -1186,6 +1312,50 @@ describe('request-helper handle', () => {
 
         // Assert
         expect(mocks.callRTI.mock.calls[0][0].endUserParams.headers['accept-language']).toBe('en, fr');
+    });
+
+    it('sends RTI several Cookie headers joined with "; ", so every cookie stays a cookie', async () => {
+        // Arrange: cookies split over two Cookie headers (allowed over HTTP/2)
+        const event = buildEvent();
+        event.Records[0].cf.request.headers['cookie'] = [
+            { key: 'Cookie', value: 'a=1; b=2' },
+            { key: 'Cookie', value: 'c=3' },
+        ];
+
+        // Act
+        await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert: not "a=1; b=2, c=3", where b's value would be "2, c=3" and cookie c would be gone
+        const cookie = mocks.callRTI.mock.calls[0][0].endUserParams.headers.cookie;
+        expect(cookie).toBe('a=1; b=2; c=3');
+        expect(cookie.split('; ').map((c: string) => c.split('=')[0])).toEqual(['a', 'b', 'c']);
+    });
+
+    it('joins Cookie with "; " also when keepHeadersNames lists it, and leaves other repeated headers with ", "', async () => {
+        // Arrange
+        (config as any).keepHeadersNames = ['cookie', 'accept'];
+        const event = buildEvent();
+        event.Records[0].cf.request.headers['cookie'] = [{ key: 'Cookie', value: 'a=1' }, { key: 'Cookie', value: 'b=2' }];
+        event.Records[0].cf.request.headers['accept'] = [{ key: 'Accept', value: 'text/html' }, { key: 'Accept', value: '*/*' }];
+
+        // Act
+        await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        const headers = mocks.callRTI.mock.calls[0][0].endUserParams.headers;
+        expect(headers.cookie).toBe('a=1; b=2');
+        expect(headers.accept).toBe('text/html, */*');
+    });
+
+    it('keeps a single Cookie header exactly as sent', async () => {
+        // Arrange
+        const event = buildEvent('/page', 'example.com', '1.2.3.4', '', 'a=1, x; b=2');
+
+        // Act
+        await handle(event, RequestType.VIEWER_REQUEST);
+
+        // Assert
+        expect(mocks.callRTI.mock.calls[0][0].endUserParams.headers.cookie).toBe('a=1, x; b=2');
     });
 
     it('checks ignorePaths against the pathname, without the query string', async () => {

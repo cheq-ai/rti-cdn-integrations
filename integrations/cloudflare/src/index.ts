@@ -61,7 +61,8 @@ export default {
             payload.endUserParams.headers.cheq_ja3 = request.cf?.botManagement?.ja3Hash || undefined;
 
             if (config.debug) { 
-                console.log(`request payload: ${JSON.stringify(payload)}`); 
+                // Redacted (cookie names only, no session token or credentials): see RTIStatelessUtils.stringifyRedactedPayload
+                console.log(`request payload: ${rtiHelperService.stringifyRedactedPayload(payload)}`);
             }
 
             const rtiResponse = await rtiService.callRTI(payload);

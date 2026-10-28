@@ -389,7 +389,7 @@ This one seems less important for rti v4 and kept in case it will be needed.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `debug` | `boolean` | `false` | Enables verbose `console.log` output: full CloudFront event, RTI request payload, RTI response, determined action, and action strategy. These appear in CloudWatch Logs. **Disable in production** — logs contain full request data. |
+| `debug` | `boolean` | `false` | Enables verbose `console.log` output: full CloudFront event, RTI request payload, RTI response, determined action, and action strategy. These appear in CloudWatch Logs. Cookie values, the challenge session token and `authorization` are redacted (cookie names are kept; see [Debug Mode](#debug-mode)). **Disable in production** — logs contain full request data. |
 | `telemetry` | `boolean` | — | Required. When `true`, sends RTI request duration (`rti_duration: {ms}`) to the logger endpoint after each RTI call. The handler waits for it (up to 1,000ms), so keep it `false` unless you are measuring. See [Telemetry](#telemetry). |
 | `logErrors` | `boolean` | `true` | When `true`, errors caught while handling a request (including challenge errors) are sent to the logger endpoint. Set to `false` to stop sending them; they are still written to `console.error` (CloudWatch Logs). |
 
@@ -526,7 +526,7 @@ CloudFront Event
        ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. DEBUG LOGGING                                                 │
-│    If config.debug: log full event + request type label          │
+│    If config.debug: log event, secrets redacted, + type label    │
 └─────────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -830,7 +830,7 @@ The settings live in the `turnstileConfig` block at the top of [`src/config.ts`]
 | `secretKey` | Turnstile dashboard → secret key (sent to Cloudflare's `siteverify`) |
 | `sessionSigningSecret` | A random string of at least 32 bytes: run `openssl rand -hex 32`, which prints 64 hex characters such as `4f8c2a9e61d07b35c9e2f4a18d6b03e7a5c1f9d2e8b47a06c3d5e1f9b2a84c7d` (generate your own; never reuse an example). Shorter or guessable values work but can be brute-forced, which lets anyone forge sessions. It signs the `_cq_se` session cookie. **Not the Turnstile secret.** Changing it ends every open session (visitors are challenged again). |
 
-`sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds; any other value (0, negative, fractional, a string) logs a warning and 300 is used.
+`sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds, at most 34,560,000 (400 days, the most browsers keep a cookie); any other value (0, negative, fractional, a string, or more than 400 days) logs a warning and 300 is used.
 
 `config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
@@ -890,6 +890,9 @@ Read _cq_se (from all Cookie headers) → parse _cq_se as {token}|{rayId}
      │
      ▼
 Split token → {expiresAt}.{signature}
+     │
+     ├── not exactly two parts, or expiresAt not spelled as issued → return false (challenged again)
+     │     (see Session Cookie Format)
      │
      ├── expired? (Date.now() > expiresAt) → return false (challenged again)
      │
@@ -952,7 +955,8 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
               │
               └── yes → config.challenge (the Turnstile example:)
                          Verified → 302 to original_url with a new _cq_se session (same sessionTtlSeconds)
-                         Failed (used, expired or forged token) → 403 "Verification failed" (see Troubleshooting)
+                         Failed (used, expired or forged token, or one solved on another site or widget:
+                                 see Token checks) → 403 "Verification failed" (see Troubleshooting)
 ```
 
 - **The challenge recognizes its own reply.** `config.isChallengeResponse` comes with the challenge (the Turnstile
@@ -991,6 +995,10 @@ _cq_se={expiresAtMs}.{hexSignature}|{rayId}
 ```
 
 - `expiresAtMs`: Unix timestamp in milliseconds (TTL default: 300 seconds)
+- **Only the exact form issued is accepted.** The token must be exactly two parts (`{expiresAtMs}.{hexSignature}`, so
+  `….junk` is rejected), and `expiresAtMs` must read back as itself: `String(Number(x)) === x` for a safe integer.
+  Leading zeros, spaces, `+`, exponents, hex or trailing letters (`parseInt` would read `123abc` as `123`) are rejected
+  before the signature is checked, even when they would name the same number.
 - `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId]`. Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
 - **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. A copied `_cq_se` cookie therefore works in another browser until it expires (`sessionTtlSeconds`).
 - `rayId`: the RTI ray ID of the request that was answered with the session, i.e. the reply to the challenge page (not
@@ -1143,6 +1151,14 @@ action upon response: ALLOW (0)
 
 > Never leave `debug: true` in production — logs contain full request data including headers and IP addresses.
 
+**Redacted in debug logs:** the event, the RTI payload and the Turnstile example's `[validateChallenge]` lines show
+cookie **names** only (`cookie: _ga, _cq_duid, _cq_se`), never their values, and `[REDACTED]` for the challenge
+session token (`x-cheq-challenge`) and `authorization` / `proxy-authorization`. On origin-request, every value of the
+origin's custom headers (`origin.custom.customHeaders` / `origin.s3.customHeaders`, often a shared secret for the
+origin) is `[REDACTED]` too; their names are kept. Only the log changes: the origin and RTI still receive the real
+headers. CHEQ's own ids in the payload (`duidCookie`, `pvidCookie`, `sCookie`) are kept, since they are needed to
+debug RTI.
+
 ### Telemetry
 
 Set `telemetry: true` to send the RTI call duration to the CHEQ RTI logger endpoint for centralized monitoring, as a log message like:
@@ -1238,6 +1254,11 @@ A second cause: the `_cq_session` cookie name starts with `_cq_se` — the examp
 **Symptom:** The visitor sees a plain `403 Verification failed. Please try again.` page with no widget, and refreshing shows it again.
 
 **Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example answers with the plain 403. Every refresh resends the same dead token. In `BLOCKING` mode this happens whether RTI allows the reply or asks for a CAPTCHA: either way it goes to `config.challenge` (see [The reply to the challenge page](#the-reply-to-the-challenge-page)).
+
+**Second cause, for every visitor and every token:** the token is genuine but fails the [token checks](#token-checks):
+the hostname does not match the request's `Host` (origin-request without the viewer's `Host` forwarded, or Cloudflare's
+test keys) or the action is not `cheq-challenge` (`data-action` removed from the challenge page). CloudWatch then shows
+a `[turnstile] token valid but …` warning naming the mismatch. Fix the setup as described there.
 
 **Fix:** The visitor can open the page without the query string (or navigate on), which gives a fresh challenge. To avoid the dead end, change the failure branch of `turnstileChallengeExample` to a `302` back to the same path **without** `cf-turnstile-response`, `original_url` and `request_id` (with `Cache-Control: no-store`), so the next request shows a fresh widget. This cannot loop by itself: the page only submits when the visitor clicks *Continue*. Log siteverify's `error-codes` when they are not `timeout-or-duplicate`; codes such as `invalid-input-secret` mean the `secretKey` in `config.ts` is wrong.
 

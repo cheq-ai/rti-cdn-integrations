@@ -3,11 +3,12 @@ import { RTIResponse } from "../models/rti-response.model";
 import { RTIParams } from "../models/rti-params.model";
 import { HeadersMap } from "../models/headers-map.model";
 import { ActionStrategy } from "../models/action-strategy.model";
+import { RequestHeaders, RTIRequest } from "../models/rti-request.model";
 
 /**
  * The RTI helpers that need no configuration: cookie and header parsing, comma-separated list
  * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the challenge return-path
- * check and safe error messages.
+ * check, host normalization, debug-log redaction and safe error messages.
  *
  * Every method works only on its arguments. The class takes no constructor arguments, holds no
  * instance state and imports nothing but models, so it can be used on its own wherever no config
@@ -229,6 +230,63 @@ export class RTIStatelessUtils {
     }
 
     return host.replace(/[\s.]+$/, '');
+  }
+
+  /** Logged in place of a secret value (see {@link redactHeaderValue}). */
+  static readonly REDACTED = '[REDACTED]';
+
+  /** Headers whose whole value is a secret: the challenge session token (`x-cheq-challenge`) and credentials. */
+  private static readonly SECRET_HEADERS = new Set(['x-cheq-challenge', 'authorization', 'proxy-authorization']);
+
+  /**
+   * The names of the cookies in one or more Cookie header values, for logging: `"_ga, _cq_duid, _cq_se"`. Debug logs
+   * must never show a value: the site's own login and session cookies, or the challenge session token.
+   *
+   * Split at `;` only. A cookie without `=` is all value (browsers read it as a cookie with an empty name), so it shows
+   * as {@link REDACTED}. Two Cookie headers joined with `", "` (as some header maps do) hide the second header's first
+   * name inside the first value: that name is not shown, and neither is any value.
+   *
+   * @param cookieHeaders one Cookie header value, several (a client can split cookies over several headers), or the
+   *   already split cookies
+   */
+  cookieNames(cookieHeaders: string | string[]): string {
+    return [cookieHeaders].flat().join(';').split(';')
+      .map(cookie => cookie.trim())
+      .filter(Boolean)
+      .map(cookie => cookie.includes('=') ? cookie.substring(0, cookie.indexOf('=')).trim() : RTIStatelessUtils.REDACTED)
+      .join(', ');
+  }
+
+  /**
+   * A header value as it may be logged: cookie names only for `cookie` ({@link cookieNames}), {@link REDACTED} for
+   * `x-cheq-challenge`, `authorization` and `proxy-authorization`, any other header unchanged. The name is matched
+   * case-insensitively: CDNs and header maps spell it differently.
+   */
+  redactHeaderValue(name: string, value: string): string {
+    const lower = name.toLowerCase();
+    if (lower === 'cookie') {
+      return this.cookieNames(value);
+    }
+    return RTIStatelessUtils.SECRET_HEADERS.has(lower) ? RTIStatelessUtils.REDACTED : value;
+  }
+
+  /**
+   * `JSON.stringify(payload)` for a debug log, with `endUserParams.headers` redacted ({@link redactHeaderValue}).
+   * Only the log changes: `payload` is neither changed nor copied deeply, and the real one is still sent to RTI.
+   * `duidCookie`, `pvidCookie` and `sCookie` are kept: they are CHEQ's own ids, needed to debug RTI.
+   *
+   * @param payload the RTI request about to be sent
+   */
+  stringifyRedactedPayload(payload: RTIRequest): string {
+    const headers = payload.endUserParams?.headers;
+    if (!headers) {
+      return JSON.stringify(payload);
+    }
+    const redacted: RequestHeaders = {};
+    for (const [name, value] of Object.entries(headers)) {
+      redacted[name] = typeof value === 'string' ? this.redactHeaderValue(name, value) : value;
+    }
+    return JSON.stringify({ ...payload, endUserParams: { ...payload.endUserParams, headers: redacted } });
   }
 
   /**
