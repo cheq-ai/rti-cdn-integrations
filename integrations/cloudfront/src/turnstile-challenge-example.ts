@@ -2,6 +2,7 @@
 import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult, CloudFrontResultResponse } from "aws-lambda";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { RTIResponse } from "../../core/models/rti-response.model";
+import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
 import type { CloudfrontConfig } from "./config";
 
 const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
@@ -23,20 +24,6 @@ export interface TurnstileSettings {
 }
 
 const isPlaceholder = (value: string | undefined): boolean => !value || value.trim() === "" || value.trim() === "REPLACE_ME";
-
-/**
- * Accepts `original_url` only when it is a same-site absolute path (as Akamai's reCAPTCHA challenge does).
- * It arrives as a query parameter, so any link can carry any value. Reflected into `Location` it would turn a
- * PASSED challenge into an open redirect: a strong phishing tool, since the victim really did just prove they
- * are human on the genuine site. `//host` and `/\host` are rejected too: browsers read both as protocol-relative.
- * Returns undefined so the caller falls back to the request URI.
- */
-function safeReturnPath(raw: string | null | undefined): string | undefined {
-    if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/\\")) {
-        return undefined;
-    }
-    return raw;
-}
 
 const DEFAULT_SESSION_TTL_SECONDS = 300;
 
@@ -424,12 +411,13 @@ async function verifyTurnstileToken(settings: TurnstileSettings, token: string, 
 
 /**
  * Where the visitor goes after the challenge, on THIS site. The host comes from the request (CloudFront only routes
- * hosts of this distribution), never from the query string, and original_url must be a path (see safeReturnPath).
- * Without a Host header the Location stays relative, which the browser resolves against the current site.
+ * hosts of this distribution), never from the query string, and original_url must be a path (see
+ * RTIStatelessUtils.safeReturnPath, shared with Akamai's reCAPTCHA challenge). Without a Host header the Location
+ * stays relative, which the browser resolves against the current site - so the path check is all that keeps it there.
  */
 function returnLocation(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
     const host = request.headers["host"]?.[0]?.value;
-    const returnPath = safeReturnPath(queryStringData.get("original_url")) ?? request.uri;
+    const returnPath = RTIStatelessUtils.safeReturnPath(queryStringData.get("original_url")) ?? request.uri;
     return host ? `https://${host}${returnPath}` : returnPath;
 }
 

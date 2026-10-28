@@ -582,6 +582,16 @@ describe('challenge', () => {
         expect(result.headers.location[0].value).toBe('/page');
     });
 
+    // Browsers delete tab, LF and CR from a URL before parsing it, so "/\t/evil.com" passed the leading-slash checks
+    // yet resolved to "//evil.com". With no Host header the Location is relative, which made it an open redirect.
+    it.each(['/\t/evil.com', '/\n/evil.com', '/\r/evil.com', '/\t\\evil.com', '/page\r\nSet-Cookie: a=1'])(
+        'rejects original_url %j without a Host header, so the relative Location cannot leave the site', async (originalUrl) => {
+            stubSiteverify(true);
+            const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': originalUrl }).toString();
+            const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+            expect(result.headers.location[0].value).toBe('/page');
+        });
+
     it('does not put a viewer_host field in the challenge form', async () => {
         const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
         expect(result.body).not.toContain('viewer_host');
