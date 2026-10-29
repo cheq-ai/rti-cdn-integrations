@@ -832,6 +832,10 @@ The settings live in the `turnstileConfig` block at the top of [`src/config.ts`]
 
 `sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds, at most 34,560,000 (400 days, the most browsers keep a cookie); any other value (0, negative, fractional, a string, or more than 400 days) logs a warning and 300 is used.
 
+`sessionBinding` (default `{ ip: "exact", userAgent: true }`) binds the session to the client that solved the challenge,
+so a copied cookie does not work elsewhere; see [Session binding](#session-binding). `ip` is `"exact"` or `"none"`,
+`userAgent` is `true` or `false`; any other value logs a warning and the default is used.
+
 `config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
 ### How the Challenge Flow Works
@@ -861,8 +865,8 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
           Verification passes
                │
                ▼
-          Generate signed session token:
-          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId])[0:32 hex]}"
+          Generate signed session token, bound to this client (IP + User-Agent, see Session binding):
+          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId, bindingKey])[0:32 hex]}"
                │
                ▼
           Return HTTP 302 redirect to original URL
@@ -898,10 +902,11 @@ Split token → {expiresAt}.{signature}
      │
      ├── expired? (Date.now() > expiresAt) → return false (challenged again)
      │
-     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId]), constant-time compare
+     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId, bindingKey]), constant-time compare,
+         with bindingKey from THIS request's IP and User-Agent (see Session binding)
               │
          Matches? → return true (CAPTCHA waived: forwarded with x-cheq-rti-result, real verdict)
-         No match? → return false (challenged again)
+         No match? → return false (challenged again: forged, tampered, or another client)
 ```
 
 A valid session waives only the `CAPTCHA` strategy (with `blockingStrategy: CAPTCHA` that includes blocked traffic). An `ACCESS_DENIED`, `NOT_FOUND` or `REDIRECT` response is enforced as usual, and a benign verdict is forwarded
@@ -932,7 +937,8 @@ missing from the challenge page?)`.
 - **Origin-request trigger:** CloudFront sets `Host` to the **origin's** domain unless the origin request policy forwards
   the viewer's `Host` (`OriginRequestPolicy` does, `OriginRequestPolicyNoHost` does not). Then every token fails the
   hostname check. Forward `Host`, or run the challenge on viewer-request. The redirect after the challenge depends on the
-  same header (it is built from `Host`). A request with no `Host` at all is rejected.
+  same header (it is built from `Host`). A request with no `Host` at all is rejected. Forward the viewer's `User-Agent`
+  too, for the [session binding](#session-binding).
 - **Test keys:** Cloudflare's dummy secret keys answer with fixed values, not your host or `cheq-challenge` (their
   [testing docs](https://developers.cloudflare.com/turnstile/troubleshooting/testing/) show `hostname: "localhost"`,
   `action: "test"`), so both checks reject every test token. Use real keys to test the whole flow end to end.
@@ -1005,11 +1011,63 @@ _cq_se={expiresAtMs}.{hexSignature}|{rayId}
   `….junk` is rejected), and `expiresAtMs` must read back as itself: `String(Number(x)) === x` for a safe integer.
   Leading zeros, spaces, `+`, exponents, hex or trailing letters (`parseInt` would read `123abc` as `123`) are rejected
   before the signature is checked, even when they would name the same number.
-- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId]`. Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
-- **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. A copied `_cq_se` cookie therefore works in another browser until it expires (`sessionTtlSeconds`).
+- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId, bindingKey]`, where `bindingKey` is `JSON.stringify([ip, userAgent])` of the client (see [Session binding](#session-binding)). Without the secret nobody can make a valid cookie. Cookies issued by earlier versions (the unkeyed SHA-256 of `{expiresAtMs}:{rayId}`, or the HMAC over `["se", expiresAtMs, rayId]` without a binding) fail validation, so those visitors are challenged once more after the upgrade.
+- **The cookie carries no IP and no User-Agent.** `bindingKey` is only part of the HMAC input; validation recomputes it from the request.
+- **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. The IP and User-Agent are there from the first request, so the session is bound to those instead.
 - `rayId`: the RTI ray ID of the request that was answered with the session, i.e. the reply to the challenge page (not
   the request that showed the page). When RTI was down, the CloudFront request id or a random `cf-fallback-<uuid>` (see
   the **RTI down** item in [The reply to the challenge page](#the-reply-to-the-challenge-page)).
+
+### Session binding
+
+A `_cq_se` session works only from the client that solved the challenge, like Cloudflare's `cf_clearance`, which is tied
+to the visitor and device. Without a binding, a copied cookie worked from any client until it expired. It is bound to:
+
+- **The User-Agent, exactly** (all `User-Agent` headers of the request, joined). Another browser, or the same browser
+  after an update that changes its User-Agent, needs a new CAPTCHA.
+- **The client IP, exactly** (`request.clientIp`). An IPv6 address is first written in Node's standard spelling
+  (`2001:0DB8:0:0:0:0:0:1` → `2001:db8::1`), so every spelling of it is the same client. An IPv4-mapped IPv6
+  (`::ffff:203.0.113.7`) is another client than `203.0.113.7`.
+
+```ts
+sessionBinding: { ip: "exact", userAgent: true }, // in turnstileConfig, config.ts (the default)
+```
+
+| `ip` | Bound to | A new CAPTCHA when |
+|------|----------|--------------------|
+| `"exact"` (default) | the address | the address changes at all |
+| `"none"` | nothing | never because of the IP |
+
+`userAgent: false` stops binding the User-Agent. With `{ ip: "none", userAgent: false }` a session works from any
+client again, as before binding.
+
+**Visitors whose address changes** are challenged again each time it does: IPv6 privacy addresses that rotate,
+carrier-grade NAT, corporate proxies, VPNs and iCloud Private Relay that hand out a different address from a pool,
+Wi-Fi ↔ cellular, and dual-stack (IPv4 on one connection, IPv6 on the next). If that traffic matters, use `ip: "none"`
+(the session is then bound by User-Agent only).
+
+**A mismatch is never a block:** `validateChallenge` returns `false`, so RTI's CAPTCHA strategy shows the widget again,
+and the visitor gets a new session for their new address or browser once they solve it.
+
+**Never stored.** The IP and User-Agent are only inside the HMAC input (`bindingKey`, see
+[Session Cookie Format](#session-cookie-format)); the cookie looks the same as before, and validation recomputes
+`bindingKey` from the request. The debug log of a failed check says
+`signature match: false (session binding mismatch (ip or user-agent), or a forged or tampered session)`: it cannot
+tell which, because the cookie has no binding to compare, and it never logs the IP or User-Agent.
+
+**The session in headers** (`x-cheq-challenge` + `x-cheq-ray-id`) is bound the same way: the request carrying it must
+come from the same User-Agent and IP.
+
+**Rollout:** the HMAC input changed, so every session issued before this version fails after the deploy, and those
+visitors are challenged once more (with a 5-minute TTL, at most for those 5 minutes). Changing `sessionBinding` later does
+the same, since the binding key changes. There is no backwards-compatible path.
+
+**Origin-request trigger: forward the viewer's `User-Agent`.** On origin-request CloudFront replaces `User-Agent` with
+`Amazon CloudFront` unless the origin request policy forwards the viewer's. Then every client has the same User-Agent and
+that half of the binding means nothing (sessions still work, bound by IP only). All the policies in `template.yaml`
+forward `user-agent` (`OriginRequestPolicy`, `OriginRequestPolicyNoHost`, the `TrustedIP` variants and
+`OriginRequestPolicyAllHeadersAllowed`); a custom policy must too. The example logs a warning once per cold start when it
+sees `User-Agent: Amazon CloudFront`. `request.clientIp` is the viewer's address on both triggers.
 
 ### Implementing a Custom Challenge
 
@@ -1253,7 +1311,12 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 
 **Fix:** Verify the `Set-Cookie` header in the 302 response. Check that the cookie `Path=/` is correct for your URL structure. Make sure the cookie uses `SameSite=Lax` (the shipped example does). `SameSite=Strict` breaks visitors coming from other sites: the cookie is not sent on the cross-site navigation, so they are challenged again.
 
-A second cause: the `_cq_session` cookie name starts with `_cq_se` — the example matches `_cq_se=` (with the `=`) to avoid this collision. Verify this is the case in your implementation.
+**Another cause, the session binding:** the session only works from the same User-Agent and IP
+(see [Session binding](#session-binding)). A visitor whose address changes (a rotating IPv6 privacy address, a NAT or
+proxy pool, IPv4 ↔ IPv6, Wi-Fi ↔ cellular), or whose browser changes its User-Agent, is challenged again. Turn on
+`debug` and look for `signature match: false (session binding mismatch ...`. Use `ip: "none"` for such traffic.
+
+A third cause: the `_cq_session` cookie name starts with `_cq_se` — the example matches `_cq_se=` (with the `=`) to avoid this collision. Verify this is the case in your implementation.
 
 ### "Verification failed" after a refresh, Back, or a long wait
 

@@ -2047,6 +2047,140 @@ describe('request-helper handle', () => {
         expect(mocks.callRTI).toHaveBeenCalledTimes(3);
     });
 
+    describe('Turnstile end to end: the session is bound to the client that solved the challenge', () => {
+        const CLIENT_A = { ip: '1.2.3.4', ua: 'Mozilla/5.0 (client A)' };
+        const requestFrom = (client: { ip: string; ua: string }, querystring = '', cookie = '') =>
+            buildEvent('/page', 'example.com', client.ip, querystring, cookie, { extraHeaders: { 'User-Agent': client.ua } });
+
+        const solveAsClientA = async () => {
+            const turnstile = createTurnstileChallenge({
+                siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+            });
+            (config as any).challenge = turnstile.challenge;
+            (config as any).validateChallenge = turnstile.validateChallenge;
+            mocks.getAction.mockReturnValue(Action.CHALLENGE);
+            mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+            mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-bind' }));
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) }));
+            const solved = await handle(requestFrom(CLIENT_A, 'cf-turnstile-response=tok'), RequestType.VIEWER_REQUEST) as any;
+            expect(solved.status).toBe('302');
+            return solved.headers['set-cookie'][0].value.split(';')[0] as string;
+        };
+
+        it('waives the CAPTCHA for client A itself', async () => {
+            const cookie = await solveAsClientA();
+            const event = requestFrom(CLIENT_A, '', cookie);
+            expect(await handle(event, RequestType.VIEWER_REQUEST)).toBe(event.Records[0].cf.request);
+        });
+
+        it('binds a session issued while RTI is down (stand-in rayId) the same way', async () => {
+            // Arrange: the reply is solved while RTI fails, from 1.2.3.4 with buildEvent's User-Agent
+            expectError = true;
+            realTurnstile({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) });
+            mocks.callRTI.mockRejectedValueOnce(new Error('RTI timeout'));
+            const solved = await handle(replyEvent(), RequestType.VIEWER_REQUEST) as any;
+            expect(solved.headers['set-cookie'][0].value).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|req-123;/);
+            const cookie: string = solved.headers['set-cookie'][0].value.split(';')[0];
+
+            // RTI is back and asks for a CAPTCHA
+            mocks.getAction.mockReturnValue(Action.CHALLENGE);
+            mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+            mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-next' }));
+
+            // Act & Assert: the same client is waived, another network gets the CAPTCHA
+            const same = buildEvent('/landing', 'example.com', '1.2.3.4', '', cookie);
+            expect(await handle(same, RequestType.VIEWER_REQUEST)).toBe(same.Records[0].cf.request);
+            const other = await handle(buildEvent('/landing', 'example.com', '5.6.7.8', '', cookie), RequestType.VIEWER_REQUEST) as any;
+            expect(other.status).toBe('403');
+        });
+
+        it('on origin-request without the viewer\'s User-Agent: still bound by IP, and warns once', async () => {
+            // Arrange: CloudFront sent its own User-Agent on both requests
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const viaOrigin = (ip: string, querystring = '', cookie = '') =>
+                buildEvent('/page', 'example.com', ip, querystring, cookie, { extraHeaders: { 'User-Agent': 'Amazon CloudFront' } });
+            const turnstile = createTurnstileChallenge({
+                siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+            });
+            (config as any).challenge = turnstile.challenge;
+            (config as any).validateChallenge = turnstile.validateChallenge;
+            mocks.getAction.mockReturnValue(Action.CHALLENGE);
+            mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+            mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-origin' }));
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) }));
+            const solved = await handle(viaOrigin('1.2.3.4', 'cf-turnstile-response=tok'), RequestType.ORIGIN_REQUEST) as any;
+            const cookie: string = solved.headers['set-cookie'][0].value.split(';')[0];
+
+            // Act
+            const same = viaOrigin('1.2.3.4', '', cookie);
+            const sameResult = await handle(same, RequestType.ORIGIN_REQUEST);
+            const otherResult = await handle(viaOrigin('5.6.7.8', '', cookie), RequestType.ORIGIN_REQUEST) as any;
+
+            // Assert
+            expect(sameResult).toBe(same.Records[0].cf.request);
+            expect(otherResult.status).toBe('403');
+            const userAgentWarnings = warn.mock.calls.filter(call => String(call[0]).includes("User-Agent is 'Amazon CloudFront'"));
+            expect(userAgentWarnings).toHaveLength(1);
+        });
+
+        it.each([
+            ['another browser on the same address', { ip: '1.2.3.4', ua: 'Mozilla/5.0 (client B)' }],
+            ['the same browser string from another network', { ip: '5.6.7.8', ua: CLIENT_A.ua }],
+            ['another client altogether', { ip: '5.6.7.8', ua: 'curl/8.0' }],
+        ])('shows the CAPTCHA again to %s with client A\'s cookie', async (_, client) => {
+            const cookie = await solveAsClientA();
+            const result = await handle(requestFrom(client, '', cookie), RequestType.VIEWER_REQUEST) as any;
+            expect(result.status).toBe('403');
+            expect(result.body).toContain('data-sitekey="site-key"');
+        });
+    });
+
+    describe.each([
+        { ip: 'exact', userAgent: true },
+        { ip: 'exact', userAgent: false },
+        { ip: 'none', userAgent: true },
+        { ip: 'none', userAgent: false },
+    ] as const)('Turnstile end to end with sessionBinding %j', (sessionBinding) => {
+        const CLIENT_A = { ip: '1.2.3.4', ua: 'Mozilla/5.0 (client A)' };
+        const requestFrom = (client: { ip: string; ua: string }, querystring = '', cookie = '') =>
+            buildEvent('/page', 'example.com', client.ip, querystring, cookie, { extraHeaders: { 'User-Agent': client.ua } });
+
+        it.each([
+            ['client A itself', CLIENT_A, true],
+            ['client A, another network', { ip: '5.6.7.8', ua: CLIENT_A.ua }, sessionBinding.ip === 'none'],
+            ['client A, now over IPv6', { ip: '2001:db8::4', ua: CLIENT_A.ua }, sessionBinding.ip === 'none'],
+            ['another browser, same address', { ip: '1.2.3.4', ua: 'Mozilla/5.0 (client B)' }, !sessionBinding.userAgent],
+            ['another client altogether', { ip: '5.6.7.8', ua: 'curl/8.0' }, sessionBinding.ip === 'none' && !sessionBinding.userAgent],
+        ])('client A solves the challenge; %s with its cookie is %s', async (_, client, waived) => {
+            // Arrange: client A solves the challenge
+            const turnstile = createTurnstileChallenge({
+                siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+                sessionBinding: { ...sessionBinding },
+            });
+            (config as any).challenge = turnstile.challenge;
+            (config as any).validateChallenge = turnstile.validateChallenge;
+            mocks.getAction.mockReturnValue(Action.CHALLENGE);
+            mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+            mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-bind' }));
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) }));
+            const solved = await handle(requestFrom(CLIENT_A, 'cf-turnstile-response=tok'), RequestType.VIEWER_REQUEST) as any;
+            const cookie: string = solved.headers['set-cookie'][0].value.split(';')[0];
+
+            // Act: the next challenged request carries client A's cookie
+            const event = requestFrom(client, '', cookie);
+            const result = await handle(event, RequestType.VIEWER_REQUEST) as any;
+
+            // Assert: forwarded (CAPTCHA waived) or the challenge page again, never a block
+            if (waived) {
+                expect(result).toBe(event.Records[0].cf.request);
+                expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=suspicious');
+            } else {
+                expect(result.status).toBe('403');
+                expect(result.body).toContain('data-sitekey="site-key"');
+            }
+        });
+    });
+
     it('Turnstile end to end: RTI allows the reply, which still gets the session and goes back to the original query string', async () => {
         // Arrange
         const turnstile = createTurnstileChallenge({

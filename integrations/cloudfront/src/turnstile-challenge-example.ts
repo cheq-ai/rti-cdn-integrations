@@ -1,6 +1,7 @@
 // cspell:ignore cheq siteverify duid unkeyed
 import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult, CloudFrontResultResponse } from "aws-lambda";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { isIPv6, SocketAddress } from "node:net";
 import { RTIResponse } from "../../core/models/rti-response.model";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
 import type { CloudfrontConfig } from "./config";
@@ -30,7 +31,35 @@ export interface TurnstileSettings {
     sessionSigningSecret: string;
     /** How long a solved challenge is remembered, in seconds. */
     sessionTtlSeconds: number;
+    /**
+     * What the `_cq_se` session is bound to, so a copied cookie does not work from another client. Optional: the
+     * default is `{ ip: "exact", userAgent: true }`. A session that no longer matches only means a new CAPTCHA.
+     */
+    sessionBinding?: SessionBinding;
 }
+
+/** See {@link sessionBindingKey}. */
+export interface SessionBinding {
+    /** `"exact"`: the client's address. `"none"`: not bound to the IP. */
+    ip: "exact" | "none";
+    /** Bind to the exact User-Agent. */
+    userAgent: boolean;
+}
+
+/** The settings once createTurnstileChallenge has checked them: every optional setting has its value. */
+type ResolvedTurnstileSettings = TurnstileSettings & { sessionBinding: SessionBinding };
+
+const DEFAULT_SESSION_BINDING: SessionBinding = { ip: "exact", userAgent: true };
+
+const SESSION_BINDING_IP_MODES: readonly string[] = ["exact", "none"];
+
+const isSessionBinding = (value: unknown): value is SessionBinding =>
+    typeof value === "object" && value !== null
+    && SESSION_BINDING_IP_MODES.includes((value as SessionBinding).ip)
+    && typeof (value as SessionBinding).userAgent === "boolean";
+
+/** On origin-request, CloudFront sends this User-Agent unless the origin request policy forwards the viewer's. */
+const CLOUDFRONT_USER_AGENT = "Amazon CloudFront";
 
 const isPlaceholder = (value: string | undefined): boolean => !value || value.trim() === "" || value.trim() === "REPLACE_ME";
 
@@ -58,20 +87,48 @@ const cookieValue = (cookies: string[], name: string): string | undefined =>
     cookies.find(c => c.startsWith(`${name}=`))?.substring(name.length + 1);
 
 /**
- * Signs a challenge session: HMAC-SHA256 over the expiry and rayId, keyed with `secret`, as 32 hex characters.
- * Without the key nobody can produce a valid `_cq_se` cookie (the old unkeyed SHA-256 could be computed by anyone).
- * Deliberately NOT bound to the visitor's `_cq_duid`: on a first visit the challenge is solved before the CHEQ tag
- * has set that cookie, so a bound session broke as soon as it appeared and the visitor had to solve the CAPTCHA twice.
+ * Signs a challenge session: HMAC-SHA256 over the expiry, the rayId and the client binding ({@link sessionBindingKey}),
+ * keyed with `secret`, as 32 hex characters. Without the key nobody can produce a valid `_cq_se` cookie (the old unkeyed
+ * SHA-256 could be computed by anyone), and a copied cookie fails from a client with another User-Agent or IP.
+ * The binding is only in the HMAC input, never in the cookie: validation recomputes it from the request.
+ * Deliberately NOT bound to the visitor's `_cq_duid` (tried and reverted): on a first visit the challenge is solved
+ * before the CHEQ tag has set that cookie, so a bound session broke as soon as it appeared and the visitor had to solve
+ * the CAPTCHA twice. The IP and User-Agent are there from the first request.
  */
-function signSession(secret: string, expiresAt: number, rayId: string): string {
-    return createHmac("sha256", secret).update(JSON.stringify(["se", expiresAt, rayId])).digest("hex").slice(0, 32);
+function signSession(secret: string, expiresAt: number, rayId: string, bindingKey: string): string {
+    return createHmac("sha256", secret).update(JSON.stringify(["se", expiresAt, rayId, bindingKey])).digest("hex").slice(0, 32);
 }
 
 /** Checks a session signature in constant time. The secret is never a placeholder: createTurnstileChallenge refuses one. */
-function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, signature: string): boolean {
-    const expected = Buffer.from(signSession(secret, expiresAt, rayId));
+function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, bindingKey: string, signature: string): boolean {
+    const expected = Buffer.from(signSession(secret, expiresAt, rayId, bindingKey));
     const actual = Buffer.from(signature);
     return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+/**
+ * What a session is bound to: the client's IP (per `sessionBinding.ip`) and User-Agent (`sessionBinding.userAgent`), as
+ * one unambiguous string for the HMAC input (`JSON.stringify([ip, userAgent])`, "" for a part that is not bound).
+ * Recomputed from each request, never stored: the cookie carries neither the IP nor the User-Agent.
+ */
+export function sessionBindingKey(settings: { sessionBinding: SessionBinding }, request: CloudFrontRequest): string {
+    const { ip, userAgent } = settings.sessionBinding;
+    return JSON.stringify([sessionBindingIp(ip, request.clientIp), userAgent ? requestUserAgent(request) : ""]);
+}
+
+// All User-Agent headers, joined; "" without one.
+const requestUserAgent = (request: CloudFrontRequest): string =>
+    (request.headers["user-agent"] ?? []).map(h => h.value).join(", ");
+
+/**
+ * The client IP as bound into the session. An IPv6 in Node's standard spelling (`2001:0DB8:0:0:0:0:0:1` → `2001:db8::1`),
+ * so every spelling of an address is the same client; anything else as given.
+ */
+function sessionBindingIp(mode: SessionBinding["ip"], clientIp: string): string {
+    if (mode === "none") {
+        return "";
+    }
+    return isIPv6(clientIp) ? new SocketAddress({ address: clientIp, family: "ipv6" }).address : clientIp;
 }
 
 /**
@@ -97,10 +154,31 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
     if (!ttlValid) {
         console.warn(`[turnstile] invalid sessionTtlSeconds ${JSON.stringify(settings.sessionTtlSeconds)}, using ${DEFAULT_SESSION_TTL_SECONDS} (set a positive whole number of seconds, at most ${MAX_SESSION_TTL_SECONDS} (400 days), in config.ts)`);
     }
-    const resolved: TurnstileSettings = ttlValid ? settings : { ...settings, sessionTtlSeconds: DEFAULT_SESSION_TTL_SECONDS };
+    // A sessionBinding with an unknown ip mode or a non-boolean userAgent would bind to something nobody chose.
+    const bindingValid = settings.sessionBinding === undefined || isSessionBinding(settings.sessionBinding);
+    if (!bindingValid) {
+        console.warn(`[turnstile] invalid sessionBinding ${JSON.stringify(settings.sessionBinding)}, using ${JSON.stringify(DEFAULT_SESSION_BINDING)} (ip: "exact" or "none"; userAgent: true or false, in config.ts)`);
+    }
+    const binding = bindingValid && settings.sessionBinding ? settings.sessionBinding : DEFAULT_SESSION_BINDING;
+    const resolved: ResolvedTurnstileSettings = {
+        ...settings,
+        sessionTtlSeconds: ttlValid ? settings.sessionTtlSeconds : DEFAULT_SESSION_TTL_SECONDS,
+        sessionBinding: { ip: binding.ip, userAgent: binding.userAgent },
+    };
+
+    // Once per cold start (config.ts calls this factory once): on origin-request without the viewer's User-Agent
+    // forwarded, every client has CloudFront's, so the User-Agent binding means nothing.
+    let cloudFrontUserAgentWarned = false;
+    const warnCloudFrontUserAgent = () => {
+        if (!cloudFrontUserAgentWarned) {
+            cloudFrontUserAgentWarned = true;
+            console.warn(`[turnstile] User-Agent is '${CLOUDFRONT_USER_AGENT}': the session is not bound to the browser's User-Agent (on origin-request, forward the viewer's User-Agent in the origin request policy)`);
+        }
+    };
+
     return {
         challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, request, response, addRtiResultHeader),
-        validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug),
+        validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug, warnCloudFrontUserAgent),
         isChallengeResponse: turnstileIsChallengeResponseExample,
     };
 }
@@ -113,7 +191,7 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
 const turnstileIsChallengeResponseExample = (request: CloudFrontRequest): boolean =>
     !!new URLSearchParams(request.querystring).get(TURNSTILE_RESPONSE_QUERY_PARAM);
 
-const turnstileChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
+const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
     let queryStringData = new URLSearchParams(request.querystring);
     // TURNSTILE_RESPONSE_QUERY_PARAM is not set by this code: once the visitor solves the challenge, the Turnstile
     // widget (api.js) injects a hidden input with this name into the enclosing <form>. The form submits via GET,
@@ -496,11 +574,14 @@ function ownUriReturnPath(request: CloudFrontRequest, originalUrl: string | null
     return rest.startsWith("?") || rest.startsWith("#") ? originalUrl : undefined;
 }
 
-/** The 302 back to where the visitor was, with a new `_cq_se` session. Only sent once the token is verified. */
-function sessionRedirect(settings: TurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): CloudFrontResultResponse {
+/**
+ * The 302 back to where the visitor was, with a new `_cq_se` session bound to this client (IP and User-Agent of the
+ * reply, see sessionBindingKey). Only sent once the token is verified.
+ */
+function sessionRedirect(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): CloudFrontResultResponse {
     const ttl = settings.sessionTtlSeconds;
     const expiresAt = Date.now() + (ttl * 1000);
-    const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId);
+    const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId, sessionBindingKey(settings, request));
 
     const sessionToken = `${expiresAt}.${signature}`;
 
@@ -525,8 +606,11 @@ function sessionRedirect(settings: TurnstileSettings, request: CloudFrontRequest
     };
 }
 
-const turnstileValidateChallengeExample = async (settings: TurnstileSettings, request: CloudFrontRequest, isDebug: boolean | undefined = false): Promise<boolean> => {
+const turnstileValidateChallengeExample = async (settings: ResolvedTurnstileSettings, request: CloudFrontRequest, isDebug: boolean | undefined = false, warnCloudFrontUserAgent?: () => void): Promise<boolean> => {
     // Validate session token (if the validation already happened in a previous request and the client has a valid session cookie or header, allow the request to proceed without triggering another challenge)
+    if (settings.sessionBinding.userAgent && requestUserAgent(request) === CLOUDFRONT_USER_AGENT) {
+        warnCloudFrontUserAgent?.();
+    }
     const cookies = requestCookies(request);
     const [cookieToken, cookieRayId] = cookieValue(cookies, "_cq_se")?.split("|") ?? [];
     const rayId = request.headers["x-cheq-ray-id"]?.[0]?.value || cookieRayId;
@@ -575,11 +659,16 @@ const turnstileValidateChallengeExample = async (settings: TurnstileSettings, re
                 return false; 
             }
             
-            // Verify signature (keyed HMAC, constant-time compare)
-            const match = isValidSessionSignature(settings.sessionSigningSecret, expiresAt, rayId, signature);
+            // Verify signature (keyed HMAC, constant-time compare), with the binding of THIS request: a session (cookie or
+            // x-cheq-challenge header) from another client fails like a forged one.
+            const match = isValidSessionSignature(settings.sessionSigningSecret, expiresAt, rayId, sessionBindingKey(settings, request), signature);
 
             if (isDebug) {
-                console.log(`[validateChallenge] signature match: ${match}`);
+                // Never the IP or User-Agent. A mismatch cannot tell a changed client from a forged or tampered
+                // signature (the cookie carries no binding to compare), so it names all three.
+                console.log(match
+                    ? "[validateChallenge] signature match: true"
+                    : "[validateChallenge] signature match: false (session binding mismatch (ip or user-agent), or a forged or tampered session)");
             }
 
             return match;

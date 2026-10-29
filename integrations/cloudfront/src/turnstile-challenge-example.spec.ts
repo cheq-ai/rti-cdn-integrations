@@ -1,8 +1,10 @@
 // cspell:ignore cheq
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challenge-example';
+import { createTurnstileChallenge, sessionBindingKey, SessionBinding, TurnstileSettings } from './turnstile-challenge-example';
+import { isIPv4, isIPv6 } from 'node:net';
 import type { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
+import { RTIStatelessUtils } from '../../core/services/rti-stateless-utils';
 import type { RTIResponse } from '../../core/models/rti-response.model';
 
 // Pass-through spy on timingSafeEqual, so a test can check the signature compare is constant-time.
@@ -76,6 +78,9 @@ function buildRTIResponse(rayId = 'ray-123'): RTIResponse {
 }
 
 const solvedQuery = new URLSearchParams({ 'cf-turnstile-response': 'valid-token' }).toString();
+
+/** The session binding key of buildRequest and buildTurnstileRequest (clientIp 1.2.3.4, no User-Agent), default binding. */
+const BUILD_REQUEST_BINDING = '["1.2.3.4",""]';
 
 /** Stubs siteverify with this exact result (it is what `verifyResponse.json()` resolves to). */
 const stubSiteverifyResult = (result: Record<string, unknown>) => {
@@ -401,7 +406,7 @@ describe('validateChallenge', () => {
     describe('strict session format', () => {
         // A correct signature for any expiry, so a rejection can only come from the format checks.
         const sign = (expiresAt: number, rayId = 'ray-exp') =>
-            createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, rayId])).digest('hex').slice(0, 32);
+            createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, rayId, BUILD_REQUEST_BINDING])).digest('hex').slice(0, 32);
         const validateToken = (token: string, isDebug = false) =>
             validateChallenge(buildRequest(`_cq_se=${token}|ray-exp`), isDebug);
         const logsDuring = async (token: string) => {
@@ -546,10 +551,11 @@ describe('validateChallenge', () => {
     it.each([
         ['without a _cq_duid cookie', undefined],
         ['with a _cq_duid cookie', '_cq_duid=dev-A'],
-    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId]), first 32 hex (known answer)', async (_label, cookie) => {
+    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId, bindingKey]), first 32 hex (known answer)', async (_label, cookie) => {
         const now = 1_700_000_000_000;
         const { signature, expiresAt } = await issueSession('ray-1', testSettings, now, cookie);
-        const signed = JSON.stringify(['se', now + 300_000, 'ray-1']);
+        // The binding key of the issuing request (clientIp 1.2.3.4, no User-Agent) with the default binding
+        const signed = JSON.stringify(['se', now + 300_000, 'ray-1', '["1.2.3.4",""]']);
         const expected = createHmac('sha256', testSettings.sessionSigningSecret).update(signed).digest('hex').slice(0, 32);
         expect(expiresAt).toBe(now + 300_000);
         expect(signature).toBe(expected);
@@ -1177,5 +1183,762 @@ describe('challenge token checks (hostname and action)', () => {
         const accepted = await challenge(reply, buildRTIResponse('ray-checks')) as any;
         expectSession(accepted);
         expect(accepted.headers.location[0].value).toBe('https://shop.com/landing?gclid=abc');
+    });
+});
+
+// --- Session binding: the session works only from the client that solved the challenge (IP + User-Agent) ---
+
+describe('sessionBindingKey', () => {
+    const key = (clientIp: string, binding: SessionBinding, userAgents?: string[]) => {
+        const request = buildRequest();
+        (request as any).clientIp = clientIp;
+        if (userAgents) {
+            request.headers['user-agent'] = userAgents.map(value => ({ key: 'User-Agent', value }));
+        }
+        return sessionBindingKey({ sessionBinding: binding }, request);
+    };
+    const ipPart = (clientIp: string, ip: SessionBinding['ip']) => JSON.parse(key(clientIp, { ip, userAgent: false }))[0];
+
+    it.each([
+        // [client IP, as bound with "exact"]
+        // IPv4: as given
+        ['1.2.3.4', '1.2.3.4'],
+        ['255.255.255.255', '255.255.255.255'],
+        ['0.0.0.0', '0.0.0.0'],
+        // IPv6: Node's standard spelling (lowercase, no leading zeros, the longest run of zero groups as ::)
+        ['2001:db8:85a3:8d3:1319:8a2e:370:7348', '2001:db8:85a3:8d3:1319:8a2e:370:7348'],
+        ['2001:DB8:85A3:8D3:1319:8A2E:370:7348', '2001:db8:85a3:8d3:1319:8a2e:370:7348'],
+        ['2001:DB8::1', '2001:db8::1'],
+        ['2001:0db8:0000:0000:0000:0000:0000:0001', '2001:db8::1'],
+        ['2001:db8:1:2::', '2001:db8:1:2::'],
+        ['0:0:0:0:0:0:0:0', '::'],
+        ['::1', '::1'],
+        ['1::', '1::'],
+        ['1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8'],
+        // an IPv4-mapped IPv6 in any spelling is one client, but not that IPv4
+        ['::ffff:1.2.3.4', '::ffff:1.2.3.4'],
+        ['::FFFF:1.2.3.4', '::ffff:1.2.3.4'],
+        ['::ffff:102:304', '::ffff:1.2.3.4'],
+        // other dotted tails are written in hex
+        ['64:ff9b::1.2.3.4', '64:ff9b::102:304'],
+        // a zone id is dropped: it names a network interface of the server, not the client
+        ['fe80::1%eth0', 'fe80::1'],
+        // anything that is not an IP is bound exactly as given
+        ['01.2.3.4', '01.2.3.4'],
+        ['1.2.3', '1.2.3'],
+        ['not-an-ip', 'not-an-ip'],
+        ['', ''],
+    ])('binds %j as %j with "exact", and as "" with "none"', (clientIp, exact) => {
+        expect(ipPart(clientIp, 'exact')).toBe(exact);
+        expect(ipPart(clientIp, 'none')).toBe('');
+    });
+
+    it('is JSON [ip, userAgent], with "" for a part that is not bound', () => {
+        expect(key('1.2.3.4', { ip: 'exact', userAgent: true }, ['UA 1'])).toBe('["1.2.3.4","UA 1"]');
+        expect(key('1.2.3.4', { ip: 'none', userAgent: true }, ['UA 1'])).toBe('["","UA 1"]');
+        expect(key('1.2.3.4', { ip: 'exact', userAgent: false }, ['UA 1'])).toBe('["1.2.3.4",""]');
+        expect(key('1.2.3.4', { ip: 'none', userAgent: false }, ['UA 1'])).toBe('["",""]');
+    });
+
+    it('takes the User-Agent exactly, all entries joined, and "" without one', () => {
+        expect(key('1.2.3.4', { ip: 'none', userAgent: true }, ['Mozilla/5.0  (X)'])).toBe('["","Mozilla/5.0  (X)"]');
+        expect(key('1.2.3.4', { ip: 'none', userAgent: true }, ['a', 'b'])).toBe('["","a, b"]');
+        expect(key('1.2.3.4', { ip: 'none', userAgent: true })).toBe('["",""]');
+    });
+
+    it('cannot be made ambiguous by quotes or commas in the User-Agent', () => {
+        const a = key('1.2.3.4', { ip: 'exact', userAgent: true }, ['x","y']);
+        const b = key('1.2.3.4', { ip: 'exact', userAgent: true }, ['x', 'y']);
+        expect(a).not.toBe(b);
+        expect(JSON.parse(a)).toEqual(['1.2.3.4', 'x","y']);
+    });
+});
+
+describe('session binding (validateChallenge)', () => {
+    const UA_A = 'Mozilla/5.0 (Windows NT 10.0) Chrome/130';
+    const UA_B = 'Mozilla/5.0 (Macintosh) Safari/17';
+    const settingsWith = (sessionBinding?: SessionBinding): TurnstileSettings => ({ ...testSettings, sessionBinding });
+
+    const fromClient = (request: CloudFrontRequest, ip: string, ua?: string) => {
+        (request as any).clientIp = ip;
+        if (ua !== undefined) {
+            request.headers['user-agent'] = [{ key: 'User-Agent', value: ua }];
+        }
+        return request;
+    };
+
+    /** Solves the challenge as the client (ip, ua) and returns the `_cq_se=...` cookie and the full Set-Cookie value. */
+    const solveAs = async (ip: string, ua: string | undefined, settings: TurnstileSettings = testSettings) => {
+        stubSiteverify(true);
+        const result = await build(settings).challenge(fromClient(buildTurnstileRequest(solvedQuery), ip, ua), buildRTIResponse('ray-bind')) as any;
+        vi.unstubAllGlobals();
+        const setCookie: string = result.headers['set-cookie'][0].value;
+        return { cookie: setCookie.split(';')[0], setCookie };
+    };
+
+    const validFrom = (cookie: string, ip: string, ua: string | undefined, settings: TurnstileSettings = testSettings, isDebug = false) =>
+        build(settings).validateChallenge(fromClient(buildRequest(cookie), ip, ua), isDebug);
+
+    it('accepts the same IP and User-Agent', async () => {
+        const { cookie } = await solveAs('203.0.113.7', UA_A);
+        expect(await validFrom(cookie, '203.0.113.7', UA_A)).toBe(true);
+    });
+
+    it.each([
+        ['another User-Agent', UA_B],
+        ['no User-Agent', undefined],
+        ['the same User-Agent with different spacing', UA_A.replace(' ', '  ')],
+        ['the same User-Agent in another case', UA_A.toLowerCase()],
+    ])('rejects %s from the same IP', async (_, ua) => {
+        const { cookie } = await solveAs('203.0.113.7', UA_A);
+        expect(await validFrom(cookie, '203.0.113.7', ua)).toBe(false);
+    });
+
+    it('rejects a User-Agent where the session was issued without one', async () => {
+        const { cookie } = await solveAs('203.0.113.7', undefined);
+        expect(await validFrom(cookie, '203.0.113.7', undefined)).toBe(true);
+        expect(await validFrom(cookie, '203.0.113.7', UA_A)).toBe(false);
+    });
+
+    it.each([
+        // [issued from, validated from, valid with "exact"]
+        ['the same IPv4', '203.0.113.7', '203.0.113.7', true],
+        ['another IPv4 in the same /24', '203.0.113.7', '203.0.113.250', false],
+        ['the same IPv6, spelled differently', '2001:db8:1:2::7', '2001:0DB8:1:2:0:0:0:7', true],
+        ['another IPv6 in the same /64 (privacy address rotation)', '2001:db8:1:2::7', '2001:db8:1:2:aaaa:bbbb:cccc:dddd', false],
+        ['an IPv4-mapped IPv6 of the same IPv4 (another family)', '203.0.113.7', '::ffff:203.0.113.7', false],
+        ['an IPv6 after IPv4 (dual-stack switch)', '203.0.113.7', '2001:db8:1:2::7', false],
+    ])('%s: valid with "exact" = %s', async (_, issuedIp, validatedIp, expected) => {
+        const settings = settingsWith({ ip: 'exact', userAgent: true });
+        const { cookie } = await solveAs(issuedIp, UA_A, settings);
+        expect(await validFrom(cookie, validatedIp, UA_A, settings)).toBe(expected);
+    });
+
+    it('ip "none" accepts any IP (dual-stack included) but still binds the User-Agent', async () => {
+        const settings = settingsWith({ ip: 'none', userAgent: true });
+        const { cookie } = await solveAs('203.0.113.7', UA_A, settings);
+        expect(await validFrom(cookie, '198.51.100.1', UA_A, settings)).toBe(true);
+        expect(await validFrom(cookie, '2001:db8::1', UA_A, settings)).toBe(true);
+        expect(await validFrom(cookie, '203.0.113.7', UA_B, settings)).toBe(false);
+    });
+
+    it('userAgent false accepts any User-Agent but still binds the IP', async () => {
+        const settings = settingsWith({ ip: 'exact', userAgent: false });
+        const { cookie } = await solveAs('203.0.113.7', UA_A, settings);
+        expect(await validFrom(cookie, '203.0.113.7', UA_B, settings)).toBe(true);
+        expect(await validFrom(cookie, '203.0.113.7', undefined, settings)).toBe(true);
+        expect(await validFrom(cookie, '198.51.100.1', UA_A, settings)).toBe(false);
+    });
+
+    it('ip "none" and userAgent false: the session works from any client (as before binding)', async () => {
+        const settings = settingsWith({ ip: 'none', userAgent: false });
+        const { cookie } = await solveAs('203.0.113.7', UA_A, settings);
+        expect(await validFrom(cookie, '198.51.100.1', UA_B, settings)).toBe(true);
+    });
+
+    it('binds the session in headers (x-cheq-challenge + x-cheq-ray-id) the same way', async () => {
+        const { cookie } = await solveAs('203.0.113.7', UA_A);
+        const [token, rayId] = cookie.slice('_cq_se='.length).split('|');
+        const headerSession = (ip: string, ua: string) =>
+            validateChallenge(fromClient(buildRequest(undefined, rayId, token), ip, ua), false);
+        expect(await headerSession('203.0.113.7', UA_A)).toBe(true);
+        expect(await headerSession('203.0.113.7', UA_B)).toBe(false);
+        expect(await headerSession('198.51.100.1', UA_A)).toBe(false);
+    });
+
+    it('rejects a session signed the pre-binding way (HMAC over ["se", expiresAt, rayId], no binding key)', async () => {
+        const expiresAt = Date.now() + 60_000;
+        const legacy = createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, 'ray-old'])).digest('hex').slice(0, 32);
+        expect(await validFrom(`_cq_se=${expiresAt}.${legacy}|ray-old`, '1.2.3.4', undefined)).toBe(false);
+        // the same expiry and rayId signed with the binding key are accepted: only the missing key is rejected
+        const bound = createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, 'ray-old', BUILD_REQUEST_BINDING])).digest('hex').slice(0, 32);
+        expect(await validFrom(`_cq_se=${expiresAt}.${bound}|ray-old`, '1.2.3.4', undefined)).toBe(true);
+    });
+
+    it('ends open sessions when sessionBinding changes (the binding key changes)', async () => {
+        const { cookie } = await solveAs('203.0.113.7', UA_A, settingsWith({ ip: 'exact', userAgent: true }));
+        expect(await validFrom(cookie, '203.0.113.7', UA_A, settingsWith({ ip: 'none', userAgent: true }))).toBe(false);
+        expect(await validFrom(cookie, '203.0.113.7', UA_A, settingsWith({ ip: 'exact', userAgent: false }))).toBe(false);
+    });
+
+    it('still rejects a tampered expiry or rayId from the right client', async () => {
+        const { cookie } = await solveAs('203.0.113.7', UA_A);
+        const [, expiresAt, signature, rayId] = cookie.match(/^_cq_se=(\d+)\.([0-9a-f]+)\|(.+)$/)!;
+        expect(await validFrom(cookie, '203.0.113.7', UA_A)).toBe(true);
+        expect(await validFrom(`_cq_se=${Number(expiresAt) + 1}.${signature}|${rayId}`, '203.0.113.7', UA_A)).toBe(false);
+        expect(await validFrom(`_cq_se=${expiresAt}.${signature}|${rayId}x`, '203.0.113.7', UA_A)).toBe(false);
+    });
+
+    it('never puts the IP or the User-Agent in the cookie', async () => {
+        const ua = 'Mozilla/5.0 (UniqueBrowser/42)';
+        for (const ip of ['203.0.113.7', '2001:db8:1:2::7']) {
+            const { setCookie } = await solveAs(ip, ua, settingsWith({ ip: 'exact', userAgent: true }));
+            expect(setCookie).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|ray-bind; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=300$/);
+            expect(setCookie).not.toContain(ip);
+            expect(setCookie).not.toContain('UniqueBrowser');
+        }
+    });
+
+    it('logs a mismatch in debug without the IP or the User-Agent', async () => {
+        const ua = 'Mozilla/5.0 (UniqueBrowser/42)';
+        const { cookie } = await solveAs('203.0.113.7', ua);
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        expect(await validFrom(cookie, '198.51.100.99', 'Mozilla/5.0 (OtherBrowser/1)', testSettings, true)).toBe(false);
+
+        const lines = [...log.mock.calls, ...warn.mock.calls].map(call => call.map(String).join(' '));
+        expect(lines).toContain('[validateChallenge] signature match: false (session binding mismatch (ip or user-agent), or a forged or tampered session)');
+        for (const secret of ['203.0.113', '198.51.100', 'UniqueBrowser', 'OtherBrowser']) {
+            expect(lines.join('\n')).not.toContain(secret);
+        }
+    });
+
+    describe('the User-Agent "Amazon CloudFront" (origin-request without the viewer\'s User-Agent forwarded)', () => {
+        it('warns once per instance (cold start), and the session still validates', async () => {
+            const settings = settingsWith({ ip: 'exact', userAgent: true });
+            const { cookie } = await solveAs('203.0.113.7', 'Amazon CloudFront', settings);
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const callbacks = build(settings);
+            const validate = () => callbacks.validateChallenge(fromClient(buildRequest(cookie), '203.0.113.7', 'Amazon CloudFront'), false);
+
+            expect(await validate()).toBe(true);
+            expect(await validate()).toBe(true);
+            expect(await callbacks.validateChallenge(fromClient(buildRequest(), '203.0.113.7', 'Amazon CloudFront'), false)).toBe(false);
+
+            expect(warn).toHaveBeenCalledOnce();
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("User-Agent is 'Amazon CloudFront'"));
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("forward the viewer's User-Agent"));
+        });
+
+        it.each([
+            ['userAgent binding is off', { ip: 'exact', userAgent: false } as SessionBinding, 'Amazon CloudFront'],
+            ['the User-Agent is only similar', { ip: 'exact', userAgent: true } as SessionBinding, 'Amazon CloudFront/1.0'],
+            ['the User-Agent is a browser', { ip: 'exact', userAgent: true } as SessionBinding, UA_A],
+        ])('does not warn when %s', async (_, sessionBinding, ua) => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            await build(settingsWith(sessionBinding)).validateChallenge(fromClient(buildRequest(), '203.0.113.7', ua), false);
+            expect(warn).not.toHaveBeenCalled();
+        });
+    });
+});
+
+describe('createTurnstileChallenge sessionBinding', () => {
+    // The default binds the exact IP and the User-Agent: what every check below expects of a fallback.
+    const behavesAsDefault = async (callbacks: Callbacks) => {
+        stubSiteverify(true);
+        const request = buildTurnstileRequest(solvedQuery);
+        request.headers['user-agent'] = [{ key: 'User-Agent', value: 'UA' }];
+        const result = await callbacks.challenge(request, buildRTIResponse('ray-default')) as any;
+        vi.unstubAllGlobals();
+        const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+        const from = (ip: string, ua: string) => {
+            const next = buildRequest(cookie);
+            (next as any).clientIp = ip;
+            next.headers['user-agent'] = [{ key: 'User-Agent', value: ua }];
+            return callbacks.validateChallenge(next, false);
+        };
+        return {
+            sameClient: await from('1.2.3.4', 'UA'),
+            otherIp: await from('1.2.3.5', 'UA'),
+            otherUserAgent: await from('1.2.3.4', 'UA2'),
+        };
+    };
+    const DEFAULT_BEHAVIOR = { sameClient: true, otherIp: false, otherUserAgent: false };
+
+    it('uses the default { ip: "exact", userAgent: true } without warning when sessionBinding is not set', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(await behavesAsDefault(build({ ...testSettings, sessionBinding: undefined }))).toEqual(DEFAULT_BEHAVIOR);
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['null', null],
+        ['a string', 'exact'],
+        ['an array', ['exact', true]],
+        ['an unknown ip mode', { ip: 'subnet', userAgent: true }],
+        ['an ip mode in another case', { ip: 'EXACT', userAgent: true }],
+        ['no ip', { userAgent: true }],
+        ['no userAgent', { ip: 'exact' }],
+        ['a userAgent that is not a boolean', { ip: 'none', userAgent: 'yes' }],
+        ['an empty object', {}],
+    ])('warns once and uses the default for %s', async (_, sessionBinding) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const callbacks = build({ ...testSettings, sessionBinding: sessionBinding as unknown as SessionBinding });
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('[turnstile] invalid sessionBinding'));
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('using {"ip":"exact","userAgent":true}'));
+        expect(await behavesAsDefault(callbacks)).toEqual(DEFAULT_BEHAVIOR);
+    });
+
+    it.each([
+        [{ ip: 'exact', userAgent: true }, { sameClient: true, otherIp: false, otherUserAgent: false }],
+        [{ ip: 'exact', userAgent: false }, { sameClient: true, otherIp: false, otherUserAgent: true }],
+        [{ ip: 'none', userAgent: true }, { sameClient: true, otherIp: true, otherUserAgent: false }],
+        [{ ip: 'none', userAgent: false }, { sameClient: true, otherIp: true, otherUserAgent: true }],
+    ] as [SessionBinding, object][])('keeps a valid %j without warning', async (sessionBinding, expected) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(await behavesAsDefault(build({ ...testSettings, sessionBinding }))).toEqual(expected);
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('is not affected by a later change to the settings object', async () => {
+        const sessionBinding: SessionBinding = { ip: 'exact', userAgent: true };
+        const callbacks = build({ ...testSettings, sessionBinding });
+        sessionBinding.ip = 'none';
+        expect(await behavesAsDefault(callbacks)).toEqual(DEFAULT_BEHAVIOR);
+    });
+});
+
+// --- Every sessionBinding setting × every kind of client change ---
+
+describe('session binding: every setting', () => {
+    const UA_A = 'Mozilla/5.0 (Windows NT 10.0) Chrome/130';
+    const UA_B = 'Mozilla/5.0 (Macintosh) Safari/17';
+
+    const ALL_BINDINGS: SessionBinding[] = [
+        { ip: 'exact', userAgent: true },
+        { ip: 'exact', userAgent: false },
+        { ip: 'none', userAgent: true },
+        { ip: 'none', userAgent: false },
+    ];
+
+    const fromClient = (request: CloudFrontRequest, ip: string, ua: string | undefined) => {
+        (request as any).clientIp = ip;
+        if (ua !== undefined) {
+            request.headers['user-agent'] = [{ key: 'User-Agent', value: ua }];
+        }
+        return request;
+    };
+    const solveAs = async (ip: string, ua: string | undefined, sessionBinding: SessionBinding) => {
+        stubSiteverify(true);
+        const result = await build({ ...testSettings, sessionBinding }).challenge(fromClient(buildTurnstileRequest(solvedQuery), ip, ua), buildRTIResponse('ray-all')) as any;
+        vi.unstubAllGlobals();
+        return result.headers['set-cookie'][0].value.split(';')[0] as string;
+    };
+    const validFrom = (cookie: string, ip: string, ua: string | undefined, sessionBinding: SessionBinding) =>
+        build({ ...testSettings, sessionBinding }).validateChallenge(fromClient(buildRequest(cookie), ip, ua), false);
+
+    // Each change of client, from the client that solved the challenge (always UA_A). Whether the IP change is accepted
+    // depends on the ip mode only ("none" accepts every IP); a User-Agent change is accepted only with userAgent: false.
+    const CHANGES: { name: string; issuedIp: string; ip: string; ua: string | undefined; exact: boolean }[] = [
+        { name: 'nothing (the same client)', issuedIp: '203.0.113.7', ip: '203.0.113.7', ua: UA_A, exact: true },
+        { name: 'another IPv4 in the same /24', issuedIp: '203.0.113.7', ip: '203.0.113.250', ua: UA_A, exact: false },
+        { name: 'the same IPv4 as IPv4-mapped IPv6', issuedIp: '203.0.113.7', ip: '::ffff:203.0.113.7', ua: UA_A, exact: false },
+        { name: 'IPv4 → IPv6 (dual-stack)', issuedIp: '203.0.113.7', ip: '2001:db8:1:2::7', ua: UA_A, exact: false },
+        { name: 'the same IPv6, spelled differently', issuedIp: '2001:db8:1:2::7', ip: '2001:0DB8:0001:0002:0:0:0:7', ua: UA_A, exact: true },
+        { name: 'another IPv6 in the same /64', issuedIp: '2001:db8:1:2::7', ip: '2001:db8:1:2:ffff:1:2:3', ua: UA_A, exact: false },
+        { name: 'another User-Agent', issuedIp: '203.0.113.7', ip: '203.0.113.7', ua: UA_B, exact: true },
+        { name: 'no User-Agent', issuedIp: '203.0.113.7', ip: '203.0.113.7', ua: undefined, exact: true },
+        { name: 'another User-Agent and another IP', issuedIp: '203.0.113.7', ip: '198.51.100.7', ua: UA_B, exact: false },
+    ];
+
+    describe.each(ALL_BINDINGS)('with %j', (sessionBinding) => {
+        it.each(CHANGES)('a session from the same client after $name', async (change) => {
+            const ipAccepted = sessionBinding.ip === 'none' || change.exact;
+            const uaAccepted = !sessionBinding.userAgent || change.ua === UA_A;
+            const cookie = await solveAs(change.issuedIp, UA_A, sessionBinding);
+            expect(await validFrom(cookie, change.ip, change.ua, sessionBinding)).toBe(ipAccepted && uaAccepted);
+        });
+
+        it('binds the header session (x-cheq-challenge + x-cheq-ray-id) exactly like the cookie', async () => {
+            const cookie = await solveAs('203.0.113.7', UA_A, sessionBinding);
+            const [token, rayId] = cookie.slice('_cq_se='.length).split('|');
+            const callbacks = build({ ...testSettings, sessionBinding });
+            for (const change of CHANGES.filter(c => c.issuedIp === '203.0.113.7')) {
+                const viaCookie = await callbacks.validateChallenge(fromClient(buildRequest(cookie), change.ip, change.ua), false);
+                const viaHeaders = await callbacks.validateChallenge(fromClient(buildRequest(undefined, rayId, token), change.ip, change.ua), false);
+                expect(viaHeaders).toBe(viaCookie);
+            }
+        });
+
+        it('rejects a session issued before session binding existed (one more CAPTCHA after the deploy)', async () => {
+            const expiresAt = Date.now() + 60_000;
+            const legacy = createHmac('sha256', testSettings.sessionSigningSecret).update(JSON.stringify(['se', expiresAt, 'ray-old'])).digest('hex').slice(0, 32);
+            expect(await validFrom(`_cq_se=${expiresAt}.${legacy}|ray-old`, '203.0.113.7', UA_A, sessionBinding)).toBe(false);
+            expect(await validFrom(`_cq_se=${expiresAt}.${legacy}|ray-old`, '203.0.113.7', undefined, sessionBinding)).toBe(false);
+        });
+
+        it('still rejects a tampered expiry, rayId or signature from the same client', async () => {
+            const cookie = await solveAs('203.0.113.7', UA_A, sessionBinding);
+            const [, expiresAt, signature, rayId] = cookie.match(/^_cq_se=(\d+)\.([0-9a-f]{32})\|(.+)$/)!;
+            const flipped = `${signature.slice(0, -1)}${signature.endsWith('0') ? '1' : '0'}`;
+            expect(await validFrom(cookie, '203.0.113.7', UA_A, sessionBinding)).toBe(true);
+            expect(await validFrom(`_cq_se=${Number(expiresAt) + 1}.${signature}|${rayId}`, '203.0.113.7', UA_A, sessionBinding)).toBe(false);
+            expect(await validFrom(`_cq_se=${expiresAt}.${signature}|other-ray`, '203.0.113.7', UA_A, sessionBinding)).toBe(false);
+            expect(await validFrom(`_cq_se=${expiresAt}.${flipped}|${rayId}`, '203.0.113.7', UA_A, sessionBinding)).toBe(false);
+        });
+
+        it('rejects an expired session from the same client', async () => {
+            const cookie = await solveAs('203.0.113.7', UA_A, sessionBinding);
+            const later = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 301_000);
+            expect(await validFrom(cookie, '203.0.113.7', UA_A, sessionBinding)).toBe(false);
+            later.mockRestore();
+        });
+
+        it('keeps the cookie format and puts neither the IP nor the User-Agent in it', async () => {
+            stubSiteverify(true);
+            const ua = 'Mozilla/5.0 (UniqueBrowser/42)';
+            const result = await build({ ...testSettings, sessionBinding }).challenge(fromClient(buildTurnstileRequest(solvedQuery), '203.0.113.7', ua), buildRTIResponse('ray-all')) as any;
+            const setCookie: string = result.headers['set-cookie'][0].value;
+            expect(setCookie).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|ray-all; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=300$/);
+            expect(setCookie).not.toContain('203.0.113');
+            expect(setCookie).not.toContain('UniqueBrowser');
+        });
+
+        it(`${sessionBinding.userAgent ? 'warns once' : 'does not warn'} about the User-Agent "Amazon CloudFront"`, async () => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const callbacks = build({ ...testSettings, sessionBinding });
+            for (let i = 0; i < 3; i++) {
+                await callbacks.validateChallenge(fromClient(buildRequest(), '203.0.113.7', 'Amazon CloudFront'), false);
+            }
+            expect(warn).toHaveBeenCalledTimes(sessionBinding.userAgent ? 1 : 0);
+        });
+    });
+
+    // A session is bound under the setting it was issued with: any other setting computes another key, so changing
+    // sessionBinding (on, off, or between modes) ends open sessions: a new CAPTCHA once.
+    describe.each(ALL_BINDINGS)('issued with %j', (issuedWith) => {
+        it.each(ALL_BINDINGS)('is valid with %j only when it is the same setting', async (validatedWith) => {
+            const cookie = await solveAs('203.0.113.7', UA_A, issuedWith);
+            const same = issuedWith.ip === validatedWith.ip && issuedWith.userAgent === validatedWith.userAgent;
+            expect(await validFrom(cookie, '203.0.113.7', UA_A, validatedWith)).toBe(same);
+        });
+    });
+
+    it('{ ip: "none", userAgent: false } turns binding off: any client, any IP version, with or without a User-Agent', async () => {
+        const off: SessionBinding = { ip: 'none', userAgent: false };
+        const cookie = await solveAs('203.0.113.7', UA_A, off);
+        for (const [ip, ua] of [['198.51.100.7', UA_B], ['2001:db8::1', undefined], ['not-an-ip', 'curl/8.0'], ['', '']] as const) {
+            expect(await validFrom(cookie, ip, ua, off)).toBe(true);
+        }
+    });
+});
+
+// --- Session binding: edge cases ---
+
+describe('session binding: edge cases', () => {
+    const DEFAULT: SessionBinding = { ip: 'exact', userAgent: true };
+    const requestWith = (clientIp: unknown, userAgents?: string[], cookie?: string) => {
+        const request = buildRequest(cookie);
+        (request as any).clientIp = clientIp;
+        if (userAgents) {
+            request.headers['user-agent'] = userAgents.map(value => ({ key: 'User-Agent', value }));
+        }
+        return request;
+    };
+    const keyOf = (clientIp: unknown, userAgents?: string[], binding: SessionBinding = DEFAULT) =>
+        sessionBindingKey({ sessionBinding: binding }, requestWith(clientIp, userAgents));
+    const sameKey = (a: [unknown, string[]?], b: [unknown, string[]?], binding: SessionBinding = DEFAULT) =>
+        keyOf(a[0], a[1], binding) === keyOf(b[0], b[1], binding);
+
+    /** Solves as (clientIp, userAgents) and validates the cookie from (clientIp2, userAgents2), each with a fresh instance. */
+    const roundTrip = async (issued: [unknown, string[]?], validated: [unknown, string[]?], binding: SessionBinding = DEFAULT) => {
+        stubSiteverify(true);
+        const reply = buildTurnstileRequest(solvedQuery);
+        (reply as any).clientIp = issued[0];
+        if (issued[1]) {
+            reply.headers['user-agent'] = issued[1].map(value => ({ key: 'User-Agent', value }));
+        }
+        const result = await build({ ...testSettings, sessionBinding: binding }).challenge(reply, buildRTIResponse('ray-edge')) as any;
+        vi.unstubAllGlobals();
+        const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+        return build({ ...testSettings, sessionBinding: binding }).validateChallenge(requestWith(validated[0], validated[1], cookie), false);
+    };
+
+    describe('neighbouring addresses are other clients', () => {
+        it.each([
+            ['the next IPv4 address', '203.0.113.7', '203.0.113.8'],
+            ['the next IPv6 address', '2001:db8:1:2::7', '2001:db8:1:2::8'],
+            ['two IPv6 that differ only in the last bit', '2001:db8:1:2:3:4:5:6', '2001:db8:1:2:3:4:5:7'],
+            ['two IPv6 that differ only in the first bit', '2001:db8:1:2:3:4:5:6', 'a001:db8:1:2:3:4:5:6'],
+            ['IPv4 and an IPv6 whose groups spell the same digits', '1.2.3.4', '1:2:3:4::'],
+            ['IPv4 and an IPv6 that ends in the same digits', '1.2.3.4', '::102:304'],
+        ])('%s', async (_, a, b) => {
+            expect(sameKey([a], [b])).toBe(false);
+            expect(await roundTrip([a, ['UA']], [b, ['UA']])).toBe(false);
+            expect(await roundTrip([a, ['UA']], [a, ['UA']])).toBe(true);
+        });
+    });
+
+    describe('IPv6 spellings', () => {
+        it.each([
+            ['upper and lower case', '2001:DB8::ABCD', '2001:db8::abcd'],
+            ['leading zeros', '2001:0db8::0001', '2001:db8::1'],
+            ['a mapped IPv4 in hex, compressed and written out', '::FFFF:CB00:7107', '0000:0000:0000:0000:0000:ffff:cb00:7107'],
+            ['a mapped IPv4 with a dotted tail and in hex', '::ffff:203.0.113.7', '::ffff:cb00:7107'],
+            ['with and without a zone id', 'fe80::1%eth0', 'fe80::1'],
+            ['zero groups written out vs compressed', '2001:db8:0:0:1:0:0:1', '2001:db8::1:0:0:1'],
+            ['the compression in another place', '2001:db8:0:0:1::1', '2001:db8::1:0:0:1'],
+        ])('%s is the same client (exact)', (_, a, b) => {
+            expect(sameKey([a], [b], { ip: 'exact', userAgent: false })).toBe(true);
+        });
+
+        it.each([
+            ['an IPv4-mapped IPv6 in hex is not that IPv4', '::ffff:cb00:7107', '203.0.113.7'],
+            ['an IPv4-mapped IPv6 with a dotted tail is not that IPv4', '::ffff:203.0.113.7', '203.0.113.7'],
+            ['IPv4-translated (::ffff:0:a.b.c.d) is not IPv4-mapped', '::ffff:0:203.0.113.7', '203.0.113.7'],
+            ['IPv4-compatible (::a.b.c.d) is not IPv4-mapped', '::203.0.113.7', '203.0.113.7'],
+            ['NAT64 (64:ff9b::a.b.c.d) is not IPv4-mapped', '64:ff9b::203.0.113.7', '203.0.113.7'],
+        ])('%s', (_, a, b) => {
+            expect(sameKey([a], [b], { ip: 'exact', userAgent: false })).toBe(false);
+        });
+    });
+
+    describe('IPs that do not parse are bound exactly as given', () => {
+        it.each([
+            ['with a port', '203.0.113.7:443'],
+            ['in brackets', '[2001:db8::1]'],
+            ['with spaces', ' 203.0.113.7 '],
+            ['an octet above 255', '203.0.113.256'],
+            ['JSON-like', '"],["x'],
+        ])('%s (%j): only the identical string matches, and it does not throw', async (_, ip) => {
+            expect(JSON.parse(keyOf(ip, undefined, { ip: 'exact', userAgent: false }))).toEqual([ip, '']);
+            expect(await roundTrip([ip, ['UA']], [ip, ['UA']])).toBe(true);
+            expect(await roundTrip([ip, ['UA']], ['203.0.113.7', ['UA']])).toBe(false);
+        });
+
+        it('a missing clientIp binds consistently and is not the same as an IP of "" or ip "none"', async () => {
+            expect(await roundTrip([undefined, ['UA']], [undefined, ['UA']])).toBe(true);
+            expect(await roundTrip([undefined, ['UA']], ['203.0.113.7', ['UA']])).toBe(false);
+            expect(keyOf(undefined, ['UA'])).not.toBe(keyOf('', ['UA']));
+            expect(keyOf(undefined, ['UA'])).not.toBe(keyOf('203.0.113.7', ['UA'], { ip: 'none', userAgent: true }));
+        });
+    });
+
+    describe('User-Agent', () => {
+        it('keeps the order of several User-Agent headers', () => {
+            expect(sameKey(['1.2.3.4', ['a', 'b']], ['1.2.3.4', ['b', 'a']])).toBe(false);
+        });
+
+        it('treats two headers like one header with ", " (how HTTP combines repeated headers)', () => {
+            expect(sameKey(['1.2.3.4', ['a', 'b']], ['1.2.3.4', ['a, b']])).toBe(true);
+        });
+
+        it('treats an empty User-Agent like a missing one', async () => {
+            expect(sameKey(['1.2.3.4', ['']], ['1.2.3.4'])).toBe(true);
+            expect(await roundTrip(['1.2.3.4'], ['1.2.3.4', ['']])).toBe(true);
+        });
+
+        it('compares exactly: trailing space, case and Unicode count', () => {
+            expect(sameKey(['1.2.3.4', ['UA']], ['1.2.3.4', ['UA ']])).toBe(false);
+            expect(sameKey(['1.2.3.4', ['UA']], ['1.2.3.4', ['ua']])).toBe(false);
+            expect(sameKey(['1.2.3.4', ['Café']], ['1.2.3.4', ['Café']])).toBe(false); // é vs e + combining accent
+        });
+
+        it.each([
+            ['a long User-Agent (8 KB)', 'Mozilla/5.0 '.repeat(700)],
+            ['Unicode', 'Mozilla/5.0 (ünïcödé; 测试) 🚀'],
+            ['quotes, backslashes and brackets', 'a"b\\c]["d'],
+            ['CloudFront\'s own User-Agent', 'Amazon CloudFront'],
+        ])('works with %s', async (_, ua) => {
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            expect(await roundTrip(['1.2.3.4', [ua]], ['1.2.3.4', [ua]])).toBe(true);
+            expect(await roundTrip(['1.2.3.4', [ua]], ['1.2.3.4', [`${ua}x`]])).toBe(false);
+        });
+    });
+
+    describe('settings', () => {
+        it('ignores extra properties of sessionBinding, without a warning', async () => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const binding = { ip: 'none', userAgent: false, extra: 1 } as SessionBinding;
+            expect(await roundTrip(['1.2.3.4', ['A']], ['5.6.7.8', ['B']], binding)).toBe(true);
+            expect(warn).not.toHaveBeenCalled();
+        });
+
+        it('accepts a sessionBinding without a prototype', async () => {
+            const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const binding = Object.assign(Object.create(null), { ip: 'exact', userAgent: true }) as SessionBinding;
+            expect(await roundTrip(['1.2.3.4', ['A']], ['1.2.3.5', ['A']], binding)).toBe(false);
+            expect(await roundTrip(['1.2.3.4', ['A']], ['1.2.3.4', ['A']], binding)).toBe(true);
+            expect(warn).not.toHaveBeenCalled();
+        });
+
+        it('a session issued by one Lambda container validates in another with the same settings', async () => {
+            // roundTrip already signs and validates with two separate instances; make it explicit with the default too
+            expect(await roundTrip(['203.0.113.7', ['UA']], ['203.0.113.7', ['UA']])).toBe(true);
+            expect(await roundTrip(['2001:db8:1:2::7', ['UA']], ['2001:DB8:1:2:0:0:0:7', ['UA']])).toBe(true);
+        });
+
+        it('a different sessionSigningSecret rejects the session even from the same client', async () => {
+            stubSiteverify(true);
+            const result = await build(testSettings).challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse('ray-edge')) as any;
+            const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+            expect(await build(testSettings).validateChallenge(buildRequest(cookie), false)).toBe(true);
+            expect(await build({ ...testSettings, sessionSigningSecret: 'another-secret' }).validateChallenge(buildRequest(cookie), false)).toBe(false);
+        });
+    });
+
+    describe('validation', () => {
+        it('never throws on a binding mismatch, with or without debug', async () => {
+            vi.spyOn(console, 'log').mockImplementation(() => {});
+            for (const isDebug of [false, true]) {
+                await expect(roundTrip(['1.2.3.4', ['A']], ['9.9.9.9', ['B']])).resolves.toBe(false);
+                await expect(build(testSettings).validateChallenge(requestWith('9.9.9.9', ['B'], '_cq_se=1.2|r'), isDebug)).resolves.toBe(false);
+            }
+        });
+
+        it('checks the expiry before the binding: an expired session is logged as expired, not as a mismatch', async () => {
+            stubSiteverify(true);
+            const result = await build(testSettings).challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse('ray-edge')) as any;
+            const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+            vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 301_000);
+
+            expect(await build(testSettings).validateChallenge(requestWith('9.9.9.9', ['B'], cookie), true)).toBe(false);
+
+            const lines = log.mock.calls.map(call => String(call[0]));
+            expect(lines.some(line => line.includes('session token expired'))).toBe(true);
+            expect(lines.some(line => line.includes('session binding mismatch'))).toBe(false);
+        });
+
+        it('logs "signature match: true" without the IP or User-Agent for a valid session', async () => {
+            const ua = 'Mozilla/5.0 (UniqueBrowser/42)';
+            stubSiteverify(true);
+            const reply = buildTurnstileRequest(solvedQuery);
+            reply.headers['user-agent'] = [{ key: 'User-Agent', value: ua }];
+            (reply as any).clientIp = '203.0.113.7';
+            const result = await build(testSettings).challenge(reply, buildRTIResponse('ray-edge')) as any;
+            const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            expect(await build(testSettings).validateChallenge(requestWith('203.0.113.7', [ua], cookie), true)).toBe(true);
+
+            const text = log.mock.calls.map(call => call.map(String).join(' ')).join('\n');
+            expect(text).toContain('[validateChallenge] signature match: true');
+            expect(text).not.toContain('203.0.113');
+            expect(text).not.toContain('UniqueBrowser');
+        });
+
+        it('compares the signature in constant time with the bound key (timingSafeEqual)', async () => {
+            stubSiteverify(true);
+            const result = await build(testSettings).challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse('ray-edge')) as any;
+            const cookie: string = result.headers['set-cookie'][0].value.split(';')[0];
+            vi.mocked(timingSafeEqual).mockClear();
+            expect(await build(testSettings).validateChallenge(requestWith('9.9.9.9', ['B'], cookie), false)).toBe(false);
+            expect(timingSafeEqual).toHaveBeenCalledOnce();
+        });
+    });
+});
+
+// --- The relative Location fallback of returnLocation (no Host header) ---
+
+// Unreachable through the public flow today: without a Host header verifyTurnstileToken always rejects the token, so no
+// redirect is built. The branch stays as a fallback (8b's retry redirect reaches it), so test it by letting the host
+// check pass without a Host header.
+describe('returnLocation without a Host header (fallback)', () => {
+    const verifiedWithoutHost = async (querystring: string, uri = '/page') => {
+        vi.spyOn(RTIStatelessUtils, 'normalizeHost').mockReturnValue('example.com');
+        stubSiteverify(true);
+        const request = buildTurnstileRequest(querystring, null);
+        (request as any).uri = uri;
+        return await challenge(request, buildRTIResponse()) as any;
+    };
+
+    it.each([
+        ['original_url, path and query', { original_url: '/landing?x=1' }, '/page', '/landing?x=1'],
+        ['original_url with a fragment', { original_url: '/landing#top' }, '/page', '/landing#top'],
+        ['the request URI when there is no original_url', {}, '/page', '/page'],
+        ['the request URI for a hostile original_url', { original_url: '//evil.com/x' }, '/page', '/page'],
+        ['the request URI for an original_url with CR/LF', { original_url: '/a\r\nSet-Cookie: x=1' }, '/page', '/page'],
+    ])('uses a relative Location: %s', async (_, fields, uri, location) => {
+        const qs = new URLSearchParams({ 'cf-turnstile-response': 'tok', ...fields }).toString();
+        const result = await verifiedWithoutHost(qs, uri);
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe(location);
+        expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=/);
+    });
+});
+
+// --- Randomized (seeded, so every run is the same): every valid spelling of an address binds to the same client ---
+
+describe('session binding: every spelling of an address (seeded random)', () => {
+    // mulberry32: a tiny deterministic PRNG, so a failure always reproduces.
+    const prng = (seed: number) => () => {
+        seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const ITERATIONS = 3000;
+
+    const bind = (clientIp: string, ip: SessionBinding['ip']) => {
+        const request = buildRequest();
+        (request as any).clientIp = clientIp;
+        return JSON.parse(sessionBindingKey({ sessionBinding: { ip, userAgent: false } }, request))[0] as string;
+    };
+
+    /** A random valid spelling of 8 groups: random case, leading zeros, :: over a random run of zero groups. */
+    const spellIpv6 = (groups: number[], random: () => number): string => {
+        const caseOf = (hex: string) => {
+            const mode = Math.floor(random() * 3);
+            return mode === 0 ? hex : mode === 1 ? hex.toUpperCase() : [...hex].map(c => (random() < 0.5 ? c.toUpperCase() : c)).join('');
+        };
+        const words = groups.map(g => caseOf(g.toString(16).padStart(1 + Math.floor(random() * 4), '0')));
+        // the zero-group runs among the hex groups; maybe compress one (any sub-run of it)
+        const runs: [number, number][] = [];
+        for (let i = 0; i < words.length; i++) {
+            if (groups[i] === 0) {
+                let j = i;
+                while (j + 1 < words.length && groups[j + 1] === 0) j++;
+                runs.push([i, j]);
+                i = j;
+            }
+        }
+        if (runs.length > 0 && random() < 0.8) {
+            const [start, end] = runs[Math.floor(random() * runs.length)];
+            const from = start + Math.floor(random() * (end - start + 1));
+            const to = from + Math.floor(random() * (end - from + 1));
+            return `${words.slice(0, from).join(':')}::${words.slice(to + 1).join(':')}`;
+        }
+        return words.join(':');
+    };
+    // The fully written form: eight groups, no compression, every spelling must bind like it
+    const fullForm = (groups: number[]) => groups.map(g => g.toString(16)).join(':');
+
+    it(`IPv6: ${ITERATIONS} random addresses, each in 4 random spellings, all bind to the same client`, () => {
+        const random = prng(0xC0FFEE);
+        for (let n = 0; n < ITERATIONS; n++) {
+            // groups with many zeros, so :: shows up in every form
+            const groups = Array.from({ length: 8 }, () => (random() < 0.4 ? 0 : Math.floor(random() * 0x10000)));
+            const exact = bind(fullForm(groups), 'exact');
+            expect(isIPv6(exact), exact).toBe(true);
+            for (let s = 0; s < 4; s++) {
+                const spelled = spellIpv6(groups, random);
+                expect(isIPv6(spelled), spelled).toBe(true);
+                expect(bind(spelled, 'exact'), spelled).toBe(exact);
+            }
+        }
+    });
+
+    it(`IPv4: ${ITERATIONS} random addresses bind as given`, () => {
+        const random = prng(0xFACE);
+        for (let n = 0; n < ITERATIONS; n++) {
+            const ip = Array.from({ length: 4 }, () => Math.floor(random() * 256)).join('.');
+            expect(isIPv4(ip)).toBe(true);
+            expect(bind(ip, 'exact')).toBe(ip);
+        }
+    });
+
+    it(`never binds an IPv4 and an IPv6 to the same client, even ::a.b.c.d: ${ITERATIONS} random pairs`, () => {
+        const random = prng(0xABBA);
+        for (let n = 0; n < ITERATIONS; n++) {
+            const o = Array.from({ length: 4 }, () => Math.floor(random() * 256));
+            // half the IPv6 are ::a.b.c.d (the IPv4 inside an IPv6), half are random
+            const groups = random() < 0.5
+                ? [0, 0, 0, 0, 0, 0, (o[0] << 8) | o[1], (o[2] << 8) | o[3]]
+                : Array.from({ length: 8 }, () => Math.floor(random() * 0x10000));
+            expect(bind(o.join('.'), 'exact')).not.toBe(bind(spellIpv6(groups, random), 'exact'));
+        }
+    });
+
+    it(`ip "none" binds every address to "": ${ITERATIONS} random IPv4 and IPv6`, () => {
+        const random = prng(0x5EED);
+        for (let n = 0; n < ITERATIONS; n++) {
+            const v4 = Array.from({ length: 4 }, () => Math.floor(random() * 256)).join('.');
+            const v6 = spellIpv6(Array.from({ length: 8 }, () => Math.floor(random() * 0x10000)), random);
+            expect(bind(v4, 'none')).toBe('');
+            expect(bind(v6, 'none')).toBe('');
+        }
     });
 });

@@ -3,7 +3,7 @@ import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfro
 import { Config } from '../../core/models/config.interface';
 import { RTIResponse } from '../../core/models/rti-response.model';
 import { Mode } from '../../core/models/mode.model';
-import { createTurnstileChallenge } from './turnstile-challenge-example';
+import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challenge-example';
 
 /**
  * See {@link https://cheq-ai.github.io/cheq-rti-client-core-js/interfaces/Config.html | Config}
@@ -66,7 +66,7 @@ export interface CloudfrontConfig extends Config {
 
 // Cloudflare Turnstile + CHEQ challenge-session settings (used by the example challenge).
 // Until all three secrets are replaced, the CAPTCHA is disabled: challenged traffic is forwarded with x-cheq-rti-result.
-const turnstileConfig = {
+const turnstileConfig: TurnstileSettings = {
     siteKey: "REPLACE_ME", // Turnstile dashboard → site key
     secretKey: "REPLACE_ME", // Turnstile dashboard → secret key (sent to Cloudflare siteverify)
     
@@ -74,6 +74,11 @@ const turnstileConfig = {
     // Example of the format (generate your own, never use this one): "4f8c2a9e61d07b35c9e2f4a18d6b03e7a5c1f9d2e8b47a06c3d5e1f9b2a84c7d"
     
     sessionTtlSeconds: 300, // how long a solved challenge is remembered (5 minutes)
+
+    // The session only works from the client that solved the challenge: its User-Agent and IP. A mismatch shows the
+    // CAPTCHA again (no block). ip: "exact" | "none". On origin-request, forward the viewer's User-Agent in the origin
+    // request policy (the shipped policies do).
+    sessionBinding: { ip: "exact", userAgent: true },
 };
 
 // The three callbacks are undefined until the three secrets above are set.
