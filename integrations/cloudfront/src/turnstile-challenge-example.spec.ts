@@ -673,7 +673,6 @@ describe('challenge', () => {
         (request as any).uri = '/page"><script>alert(1)</script>';
         const result = await challenge(request, buildRTIResponse()) as any;
         expect(result.body).not.toContain('<script>alert(1)</script>');
-        expect(result.body).toContain('action="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
         expect(result.body).toContain('name="original_url" value="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
     });
 
@@ -687,27 +686,114 @@ describe('challenge', () => {
 
     it('leaves a normal URI and rayId unchanged', async () => {
         const result = await challenge(buildTurnstileRequest(), buildRTIResponse('ray-abc-123')) as any;
-        expect(result.body).toContain('action="/page"');
         expect(result.body).toContain('value="ray-abc-123"');
     });
 
-    it('puts the request query string into original_url, not into the form action', async () => {
+    it('puts the request query string into original_url, and gives the form no action', async () => {
         const result = await challenge(buildTurnstileRequest('gclid=abc&utm_source=x'), buildRTIResponse()) as any;
         expect(result.body).toContain('name="original_url" value="/page?gclid=abc&amp;utm_source=x"');
-        expect(result.body).toContain('action="/page"');
+        // No action: the browser submits to the page's own URL. One built from the request URI would send a path like
+        // "//evil.com/" (a protocol-relative URL) and the token to another site.
+        expect(result.body).toMatch(/<form id="captcha-form" method="GET">/);
+        expect(result.body).not.toMatch(/<form[^>]*\saction=/);
     });
 
-    it('returns the visitor to the original query string after solving the challenge', async () => {
-        const originalQuery = 'q=a%20b&tag=c%2Bd&gclid=abc';
-        const page = await challenge(buildTurnstileRequest(originalQuery), buildRTIResponse()) as any;
+    it.each(['//evil.com/', '/\\evil.com', '//evil.com/path?x=1'])(
+        'never puts the request URI %j where the browser would read it as a link to another site', async (uri) => {
+            const request = buildTurnstileRequest();
+            (request as any).uri = uri;
+            const result = await challenge(request, buildRTIResponse()) as any;
+            expect(result.body).not.toMatch(/\saction=/i);
+            expect(result.body).not.toMatch(/\shref="\/[\/\\]/);
+        });
+
+    it('repeats the request URI only inside the escaped original_url field', async () => {
+        const request = buildTurnstileRequest('x=1');
+        (request as any).uri = '//evil.com/';
+        const result = await challenge(request, buildRTIResponse()) as any;
+        expect(result.body.split('//evil.com/')).toHaveLength(2); // exactly one occurrence
+        expect(result.body).toContain('name="original_url" value="//evil.com/?x=1"');
+    });
+
+    // The whole trip, as a browser makes it: the challenge page for the original URL, then the form submitted to the
+    // page's own URL (no action) with its fields URL-encoded in place of the query. The visitor must come back to
+    // exactly the original URL.
+    describe('returns the visitor to exactly the original URL', () => {
         const entities: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
-        const fieldValue: string = page.body.match(/name="original_url" value="([^"]*)"/)[1]
+        const fieldOf = (body: string): string => body.match(/name="original_url" value="([^"]*)"/)![1]
             .replace(/&(amp|lt|gt|quot|#39);/g, (_: string, e: string) => entities[e]);
-        // What the browser sends: the form fields, URL-encoded, replacing any query of the action.
-        const submitted = new URLSearchParams({ original_url: fieldValue, request_id: 'ray-123', 'cf-turnstile-response': 'valid-token' }).toString();
-        stubSiteverify(true);
-        const result = await challenge(buildTurnstileRequest(submitted, 'example.com'), buildRTIResponse()) as any;
-        expect(result.headers.location[0].value).toBe(`https://example.com/page?${originalQuery}`);
+
+        it.each([
+            ['plain parameters', '/page', 'gclid=abc&utm_source=x'],
+            ['+, %2B, %20 and %25 (never re-encoded)', '/page', 'q=a+b&tag=c%2Bd&s=%20&p=%25'],
+            ['repeated, valueless and empty parameters', '/page', 'a&a&b=1&b=2&e=&=x&&'],
+            ['the form field names in the visitor\'s own query', '/page', 'original_url=/x&request_id=1&cf-turnstile-response='],
+            ['non-ASCII, encoded and raw', '/page', 'u=%E2%9C%93&raw=✓'],
+            ['invalid UTF-8 escapes', '/page', 'q=%FF%FE'],
+            ['quotes and angle brackets', '/page', `q='"<>`],
+            ['an encoded newline', '/page', 'q=a%0Ab'],
+            ['a long query', '/page', `q=${'a'.repeat(3000)}`],
+            ['an encoded path with a semicolon', '/caf%C3%A9/a;b', 'x=1'],
+            ['a path starting with //', '//page', 'x=1'],
+            ['a path starting with /\\', '/\\page', 'x=1'],
+            ['no query', '/page', ''],
+        ])('%s', async (_, uri, querystring) => {
+            const original = buildTurnstileRequest(querystring);
+            (original as any).uri = uri;
+            const page = await challenge(original, buildRTIResponse()) as any;
+            const submitted = new URLSearchParams({ original_url: fieldOf(page.body), request_id: 'ray-123', 'cf-turnstile-response': 'tok' }).toString();
+            const reply = buildTurnstileRequest(submitted);
+            (reply as any).uri = uri; // the page's own path: the form has no action
+
+            stubSiteverify(true);
+            const verified = await challenge(reply, buildRTIResponse()) as any;
+            expect(verified.headers.location[0].value).toBe(`https://example.com${querystring ? `${uri}?${querystring}` : uri}`);
+        });
+
+        // The fragment never reaches the server: the page's submit handler adds location.hash to original_url. Run it
+        // against a minimal fake DOM (no DOM library in this project).
+        const submitWith = (pageScript: string, originalUrl: string, hash: string): string => {
+            let onSubmit: (this: unknown) => void = () => {};
+            const field = { value: originalUrl };
+            const form = { elements: { original_url: field }, addEventListener: (_: string, fn: () => void) => { onSubmit = fn; } };
+            const elements: Record<string, unknown> = { 'captcha-form': form, 'submit-btn': { disabled: false }, loading: { classList: { add: () => {} } } };
+            new Function('document', 'location', pageScript)({ getElementById: (id: string) => elements[id] }, { hash });
+            onSubmit.call(form);
+            return field.value;
+        };
+
+        it('adds the #fragment in the browser, and the redirect keeps it', async () => {
+            const page = await challenge(buildTurnstileRequest('x=1'), buildRTIResponse()) as any;
+            const pageScript: string = page.body.match(/<script>([\s\S]*?)<\/script>/)[1];
+
+            expect(submitWith(pageScript, '/page?x=1', '#reviews')).toBe('/page?x=1#reviews');
+            expect(submitWith(pageScript, '/page?x=1', '')).toBe('/page?x=1');
+            expect(submitWith(pageScript, '/page?x=1#reviews', '#reviews')).toBe('/page?x=1#reviews'); // a second submit adds nothing
+
+            stubSiteverify(true);
+            const qs = new URLSearchParams({ original_url: '/page?x=1#reviews', 'cf-turnstile-response': 'tok' }).toString();
+            const verified = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+            expect(verified.headers.location[0].value).toBe('https://example.com/page?x=1#reviews');
+        });
+
+        it.each([
+            ['a normal path', '/page', 'x=1'],
+            ['a path starting with //', '//page', 'x=1'],
+            ['no query', '/page', ''],
+        ])('keeps the #fragment through the whole trip, for %s', async (_, uri, querystring) => {
+            // Page → its script on submit (location.hash) → the reply → the redirect
+            const original = buildTurnstileRequest(querystring);
+            (original as any).uri = uri;
+            const page = await challenge(original, buildRTIResponse()) as any;
+            const pageScript: string = page.body.match(/<script>([\s\S]*?)<\/script>/)[1];
+            const field = submitWith(pageScript, fieldOf(page.body), '#reviews');
+            const reply = buildTurnstileRequest(new URLSearchParams({ original_url: field, request_id: 'ray-123', 'cf-turnstile-response': 'tok' }).toString());
+            (reply as any).uri = uri;
+
+            stubSiteverify(true);
+            const verified = await challenge(reply, buildRTIResponse()) as any;
+            expect(verified.headers.location[0].value).toBe(`https://example.com${uri}${querystring ? `?${querystring}` : ''}#reviews`);
+        });
     });
 
     // --- Token present: verify with Turnstile ---
@@ -835,6 +921,44 @@ describe('challenge', () => {
             const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
             expect(result.headers.location[0].value).toBe('https://example.com/page');
         });
+
+    // A request path that safeReturnPath rejects ("//page", "/\page") still gets its own query and fragment back:
+    // original_url is that same path plus "?..." or "#...", and behind https://{host} the host cannot change.
+    describe('an original_url on the request\'s own path that safeReturnPath rejects', () => {
+        const verifiedOn = (uri: string, originalUrl: string) => {
+            stubSiteverify(true);
+            const request = buildTurnstileRequest(new URLSearchParams({ 'cf-turnstile-response': 'tok', original_url: originalUrl }).toString());
+            (request as any).uri = uri;
+            return challenge(request, buildRTIResponse()) as Promise<any>;
+        };
+
+        it.each([
+            ['a query', '//page', '//page?x=1&y=%2B'],
+            ['a fragment', '//page', '//page#reviews'],
+            ['a query and a fragment', '//page', '//page?x=1#reviews'],
+            ['an empty query', '//page', '//page?'],
+            ['a backslash path', '/\\page', '/\\page?x=1'],
+            ['a path that looks like another host', '//evil.com/x', '//evil.com/x?y=1'],
+        ])('keeps %s', async (_, uri, originalUrl) => {
+            const location: string = (await verifiedOn(uri, originalUrl)).headers.location[0].value;
+            expect(location).toBe(`https://example.com${originalUrl}`);
+            expect(new URL(location).host).toBe('example.com'); // the path never changes the host
+        });
+
+        it.each([
+            ['another path', '//page', '//other?x=1'],
+            ['a longer path with the same start', '//page', '//pagex?x=1'],
+            ['a sub-path', '//page', '//page/x?y=1'],
+            ['CR/LF (would split the Location header)', '//page', '//page?x=1\r\nSet-Cookie: a=1'],
+            ['a tab', '//page', '//page?x=\t1'],
+            ['DEL', '//page', '//page?x=\x7F'],
+            ['a control character in the path part', '//pa\tge', '//pa\tge?x=1'],
+            ['exactly the path, nothing after it', '//page', '//page'],
+            ['nothing at all', '//page', ''],
+        ])('falls back to the bare request path for %s', async (_, uri, originalUrl) => {
+            expect((await verifiedOn(uri, originalUrl)).headers.location[0].value).toBe(`https://example.com${uri}`);
+        });
+    });
 
     it('does not put a viewer_host field in the challenge form', async () => {
         const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;

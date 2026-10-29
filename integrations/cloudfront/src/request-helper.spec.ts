@@ -2091,7 +2091,43 @@ describe('request-helper handle', () => {
         expect(siteverify).toHaveBeenCalledOnce();
     });
 
-    const realTurnstile = (siteverifyResult: unknown) => {
+    it('Turnstile end to end: a challenged link to https://example.com//evil.com/ is solved on this site and comes back to it', async () => {
+        // Arrange: an attacker's link whose path reads as another host in a relative URL
+        const turnstile = createTurnstileChallenge({
+            siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
+        });
+        (config as any).challenge = turnstile.challenge;
+        (config as any).validateChallenge = turnstile.validateChallenge;
+        mocks.getAction.mockReturnValue(Action.CHALLENGE);
+        mocks.getActionStrategy.mockReturnValue(ActionStrategy.CAPTCHA);
+        mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious', rayId: 'ray-page' }));
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ json: async () => ({ success: true, hostname: 'example.com', action: 'cheq-challenge' }) }));
+        const pageUrl = 'https://example.com//evil.com/?x=1';
+
+        // Act 1: the challenge page
+        const page = await handle(buildEvent('//evil.com/', 'example.com', '1.2.3.4', 'x=1'), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert 1: the form has no action, so the browser submits it to the page's own URL, on this host. The old
+        // action (the request URI) would have resolved to evil.com and taken the token there.
+        expect(page.status).toBe('403');
+        expect(page.body).not.toMatch(/\saction=/);
+        expect(new URL(pageUrl).host).toBe('example.com');
+        expect(new URL('//evil.com/', pageUrl).host).toBe('evil.com');
+        const originalUrl = page.body.match(/name="original_url" value="([^"]*)"/)[1].replace(/&amp;/g, '&');
+        expect(originalUrl).toBe('//evil.com/?x=1');
+
+        // Act 2: the solved form comes back to the same path
+        const replyQuery = new URLSearchParams({ original_url: originalUrl, request_id: 'ray-page', 'cf-turnstile-response': 'tok' }).toString();
+        const solved = await handle(buildEvent('//evil.com/', 'example.com', '1.2.3.4', replyQuery), RequestType.VIEWER_REQUEST) as any;
+
+        // Assert 2: a session, and back to exactly the original URL, on this host
+        expect(solved.status).toBe('302');
+        expect(solved.headers.location[0].value).toBe(pageUrl);
+        expect(new URL(solved.headers.location[0].value).host).toBe('example.com');
+        expect(solved.headers['set-cookie'][0].value).toMatch(/^_cq_se=/);
+    });
+
+    const realTurnstile =(siteverifyResult: unknown) => {
         const turnstile = createTurnstileChallenge({
             siteKey: 'site-key', secretKey: 'turnstile-secret', sessionSigningSecret: 'e2e-signing-secret', sessionTtlSeconds: 300,
         });

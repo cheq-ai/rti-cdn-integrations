@@ -347,7 +347,7 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
                         <p class="subtitle">
                             Please complete the verification below to confirm you're human and continue to the website.
                         </p>
-                        <form id="captcha-form" action="${escapeHtml(request.uri)}" method="GET">
+                        <form id="captcha-form" method="GET">${/* No action: the form goes back to this page's own URL, exactly as the browser requested it. An action built from request.uri would send a path like "//evil.com/" (with the token) to another site. */ ""}
                             <input type="hidden" name="original_url" value="${escapeHtml(originalUrl)}">
                             <input type="hidden" name="request_id" value="${escapeHtml(response.ids.rayId)}">
                             
@@ -386,6 +386,9 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
                         }
                         
                         document.getElementById('captcha-form').addEventListener('submit', function() {
+                        // The #fragment never reaches the server, so only the browser can add it to the return URL.
+                        var originalUrl = this.elements['original_url'];
+                        if (location.hash && originalUrl.value.indexOf('#') === -1) originalUrl.value += location.hash;
                         document.getElementById('submit-btn').disabled = true;
                         document.getElementById('loading').classList.add('show');
                         });
@@ -473,8 +476,24 @@ async function verifyTurnstileToken(settings: TurnstileSettings, token: string, 
  */
 function returnLocation(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
     const host = request.headers["host"]?.[0]?.value;
-    const returnPath = RTIStatelessUtils.safeReturnPath(queryStringData.get("original_url")) ?? request.uri;
+    const originalUrl = queryStringData.get("original_url");
+    const returnPath = RTIStatelessUtils.safeReturnPath(originalUrl) ?? ownUriReturnPath(request, originalUrl) ?? request.uri;
     return host ? `https://${host}${returnPath}` : returnPath;
+}
+
+/**
+ * original_url when it is the request's own URI plus a query and/or fragment, so those are kept for a path that
+ * safeReturnPath rejects: "//page?x=1" is what the challenge page sends for https://site//page?x=1. safeReturnPath
+ * guards a RELATIVE Location, where "//page" would be another host. Behind https://{host} the host comes first and the
+ * path cannot change it (a "\" reads as "/", still path), and the path is the one this request already has. Control
+ * characters are still refused: CR/LF would split the Location header.
+ */
+function ownUriReturnPath(request: CloudFrontRequest, originalUrl: string | null): string | undefined {
+    if (!originalUrl?.startsWith(request.uri) || /[\x00-\x1F\x7F]/.test(originalUrl)) {
+        return undefined;
+    }
+    const rest = originalUrl.slice(request.uri.length);
+    return rest.startsWith("?") || rest.startsWith("#") ? originalUrl : undefined;
 }
 
 /** The 302 back to where the visitor was, with a new `_cq_se` session. Only sent once the token is verified. */

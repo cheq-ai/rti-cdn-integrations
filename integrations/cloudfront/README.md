@@ -848,8 +848,9 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
         │       (Turnstile widget + hidden form; `original_url` holds the path and query string)
         │       User solves the CAPTCHA
         │       Turnstile widget injects hidden `cf-turnstile-response` input into the form
-        │       Form submits (GET) to the same path: the query becomes original_url, request_id
-        │       and cf-turnstile-response (the visitor's own query travels inside original_url)
+        │       Form (no action) submits (GET) to the page's own URL: the query becomes original_url,
+        │       request_id and cf-turnstile-response (the visitor's own query travels inside
+        │       original_url; the page's script adds the #fragment, which never reaches the server)
         │
    YES ──► POST token to Cloudflare siteverify API (server-side)
                │
@@ -866,7 +867,8 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
                ▼
           Return HTTP 302 redirect to original URL
           (host from the Host header, never the query string; original_url must be a
-           same-site path, otherwise the request URI is used)
+           same-site path, or the request's own path plus ?query / #fragment (kept even
+           for a path like //page), otherwise the request URI is used)
           Set-Cookie: _cq_se={token}|{rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=300
           x-cheq-rti-result: version=…;verdict=…;threat-type-code=…;ids={…}
 ```
@@ -923,6 +925,10 @@ missing from the challenge page?)`.
 - **Do not remove `data-action="cheq-challenge"`** from the challenge page (or change `CHALLENGE_ACTION` on one side
   only). Without it every token is rejected, and visitors loop on the CAPTCHA. An empty or missing action is never
   accepted as a fallback: the site's other widgets usually have none, so that would let exactly those tokens through.
+- **Do not give the challenge form an `action` built from the request URI.** The example leaves `action` out, so the
+  browser submits to the page's own URL. A path like `//evil.com/` in an `action` is a link to another site, and the
+  solved form (and its token) would go there. To keep a `#fragment`, which never reaches the server, add `location.hash`
+  to `original_url` on submit, as the example does.
 - **Origin-request trigger:** CloudFront sets `Host` to the **origin's** domain unless the origin request policy forwards
   the viewer's `Host` (`OriginRequestPolicy` does, `OriginRequestPolicyNoHost` does not). Then every token fails the
   hostname check. Forward `Host`, or run the challenge on viewer-request. The redirect after the challenge depends on the
