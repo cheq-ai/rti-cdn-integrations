@@ -24,6 +24,13 @@ const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIHttpsService(config);
 
+// On origin-request CloudFront can cache what the Lambda returns, so one bot's block page could be served to
+// real visitors of the same URL. Our block, 404 and redirect answers must never be cached.
+const noStore = (): CloudFrontHeaders => ({ 'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }] });
+
+// Methods that can get the CAPTCHA page without losing the request.
+const CHALLENGEABLE_METHODS = ["GET", "HEAD"];
+
 // Once per cold start: without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING
 // mode it is handled like any request (e.g. forwarded with the form fields when RTI allows it).
 if (config.challenge && !config.isChallengeResponse) {
@@ -144,13 +151,13 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                 case ActionStrategy.ACCESS_DENIED:
                     return {
                         status: '403',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
+                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore() },
                         body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.NOT_FOUND:
                     return {
                         status: '404',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
+                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore() },
                         body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.REDIRECT:
@@ -159,12 +166,21 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
                         'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
+                        ...noStore(),
                     };
                     return {
                         status: '302',
                         headers,
                     };
                 case ActionStrategy.CAPTCHA:
+                    // A challenge can't carry a POST body through the redirect (login, payment, the bank's 3DS
+                    // return). Only GET and HEAD are challenged; other methods go on with the verdict header.
+                    if (!CHALLENGEABLE_METHODS.includes(cfRequest.method)) {
+                        if (isDebugEnabled) {
+                            console.log(`${cfRequest.method} request: CAPTCHA not applicable, forwarding with x-cheq-rti-result`);
+                        }
+                        break;
+                    }
                     try {
                         if (config.challenge) {
                             // A visitor who already solved the challenge (valid _cq_se session) is not challenged

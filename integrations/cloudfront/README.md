@@ -747,22 +747,24 @@ That leaves one case: the server's close and our next request can cross on the w
 
 ### Origin Request Policy Resources
 
-Three CloudFront origin request policies are always created, plus two more (`…TrustedIP`) when `TrustedIPHeader` is set. They control which viewer headers CloudFront forwards to the origin-request Lambda.
+Four CloudFront origin request policies are always created, plus two more (`…TrustedIP`) when `TrustedIPHeader` is set. They control which headers CloudFront forwards to the origin (and, on origin-request, to the Lambda).
 
-| Resource | Includes host | Includes `TrustedIPHeader` | Use case |
-|----------|-------------|---------------------------|----------|
-| `OriginRequestPolicy` | ✅ | ❌ | Origin supports the CloudFront distribution hostname |
-| `OriginRequestPolicyNoHost` | ❌ | ❌ | Origin expects its own hostname (e.g. S3 REST API, own-domain origins) |
-| `OriginRequestPolicyTrustedIP` | ✅ | ✅ | Same as `OriginRequestPolicy` + the custom header specified by `TrustedIPHeader` |
-| `OriginRequestPolicyNoHostTrustedIP` | ❌ | ✅ | Same as `OriginRequestPolicyNoHost` + the custom header specified by `TrustedIPHeader` |
-| `OriginRequestPolicyAllHeadersAllowed` | ✅ all viewer | N/A | Maximum header coverage (all viewer + CloudFront geo/device headers) |
+| Resource | Headers | Use case |
+|----------|---------|----------|
+| `OriginRequestPolicy` (**default**) | All viewer headers + `cloudfront-viewer-tls`, `-ja3-fingerprint`, `-ja4-fingerprint` | Most origins. `x-cheq-rti-result`, `true-client-ip`, `x-forwarded-for` and any trusted IP header all reach the origin |
+| `OriginRequestPolicyAllExceptHost` | All viewer headers except `host` | Origins that expect their own domain in `host`: API Gateway, Lambda function URLs, S3. No TLS/JA3/JA4 (this mode can't add CloudFront headers) |
+| `OriginRequestPolicyAllHeadersAllowed` | All viewer headers + CloudFront TLS, JA3/JA4, geo and device headers | When RTI or the origin should also get country, city and device type |
+| `OriginRequestPolicyNoHost` | Header list, no `host` | Origin expects its own hostname and you want only named headers (and TLS/JA3/JA4 on origin-request) |
+| `OriginRequestPolicyNoHostTrustedIP` | Header list, no `host`, + `TrustedIPHeader` | As above, plus your trusted IP header |
+| `OriginRequestPolicyTrustedIP` | Header list with `host`, + `TrustedIPHeader` | 11 headers: needs a raised quota (see below) |
+
+**Why "all viewer headers" is the default.** A header list holds at most 10 headers (AWS quota "Headers per origin request policy", which can be raised with a Service Quotas request), and only listed headers reach the origin. The old default list was full, so adding the `x-cheq-rti-result` verdict header meant dropping one that some customer needs. With all viewer headers nothing is picked, and the limit only counts the CloudFront headers. It's the same approach as AWS's managed `AllViewerAndCloudFrontHeaders-2022-06` policy (all viewer headers), but with only the TLS, JA3 and JA4 CloudFront headers (AWS's has every CloudFront header up to June 2022, so no JA4). It doesn't change caching: the cache key comes from the cache policy, not this one.
+
+**The header-list policies** forward all cookies, all query strings and `cloudfront-viewer-tls`, `cloudfront-viewer-ja3-fingerprint`, `cloudfront-viewer-ja4-fingerprint`, `accept`, `accept-language`, `referer`, `user-agent`, `x-forwarded-for`, `true-client-ip` (plus `host` or `TrustedIPHeader` as in the table). They don't forward `x-cheq-rti-result`: add it to the list (within the quota) if the origin needs the verdict.
+
+> **Updating an existing stack** changes `OriginRequestPolicy` in place from the old header list to all viewer headers, for every behavior that uses it.
 
 > The exact use case for `TrustedIPHeader` is unclear — it was carried over from the old repo without documentation. It adds a custom header name to the origin request policy whitelist.
-
-All policies forward:
-- All cookies
-- All query strings
-- Whitelisted headers: `cloudfront-viewer-tls`, `cloudfront-viewer-ja3-fingerprint`, `cloudfront-viewer-ja4-fingerprint`, `accept`, `accept-language`, `referer`, `user-agent`, `x-forwarded-for`, `true-client-ip`
 
 ### Outputs
 
@@ -770,7 +772,8 @@ All policies forward:
 |-----------|-------------|
 | `OriginRequestVersionARN` | Version ARN to attach as origin-request Lambda@Edge trigger |
 | `ViewerRequestVersionARN` | Version ARN to attach as viewer-request Lambda@Edge trigger |
-| `OriginRequestPolicy` | Policy name for custom origins (with host header) |
+| `OriginRequestPolicy` | Default policy name: all viewer headers (with host) + TLS/JA3/JA4 |
+| `OriginRequestPolicyAllExceptHost` | Policy name: all viewer headers except host (API Gateway, Lambda URLs, S3) |
 | `OriginRequestPolicyNoHost` | Policy name for S3/own-domain origins |
 | `OriginRequestPolicyNoHostTrustedIP` | *(if TrustedIPHeader set)* Policy name without host, with trusted IP |
 | `OriginRequestPolicyTrustedIP` | *(if TrustedIPHeader set)* Policy name with host and trusted IP |
@@ -781,9 +784,9 @@ All policies forward:
 
 ## Origin Request Policies
 
-Origin request policies are only relevant for the **origin-request** trigger. They tell CloudFront which viewer headers to pass to the Lambda (CloudFront does not forward all viewer headers by default).
+An origin request policy decides which headers reach the **origin**. On the **origin-request** trigger it also decides which viewer headers the Lambda (and so RTI) gets.
 
-> The viewer-request trigger always receives all viewer headers — no origin request policy is needed.
+> The viewer-request Lambda always receives all viewer headers. The policy still matters there: it decides whether the `x-cheq-rti-result` header the Lambda adds reaches the origin.
 
 ### Decision Guide
 
@@ -799,11 +802,11 @@ Which origin request policy should I use?
        │           Origin resolves           Origin needs
        │           by its own host?          CloudFront host?
        │                │                        │
-  NoHost policy    NoHost policy            Default policy
-  (no host header)  (no host header)        (includes host header)
+  AllExceptHost     AllExceptHost            Default policy
+  (no host header)  (no host header)        (all viewer headers)
 
-Add TrustedIP variant if you need an additional custom header forwarded (set via TrustedIPHeader parameter).
-Use AllHeadersAllowed during development/testing for maximum visibility. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
+Want only named headers to reach the origin? Use the header-list policies (NoHost, TrustedIP variants) and add
+x-cheq-rti-result to them. Use AllHeadersAllowed for CloudFront's geo and device headers too.
 ```
 
 ### Why Policies Matter for RTI
@@ -836,6 +839,19 @@ The settings live in the `turnstileConfig` block at the top of [`src/config.ts`]
 so a copied cookie does not work elsewhere; see [Session binding](#session-binding). `ip` is `"exact"` or `"none"`,
 `userAgent` is `true` or `false`; any other value logs a warning and the default is used.
 
+`siteverifyErrorsToPause` (default 5) and `siteverifyPauseSeconds` (default 60): when Cloudflare's siteverify fails that
+many times in a row (timeout, network error, 5xx or a body that is not JSON), the CAPTCHA is paused for that many
+seconds and challenged traffic is forwarded with `x-cheq-rti-result`. A siteverify answer (even a rejected token) resets
+the count. A 4xx (e.g. a 429 rate limit) never counts: it is shown as a failed check, so flooding junk tokens can't
+switch the CAPTCHA off. Counted per Lambda instance. `siteverifyErrorsToPause: 0` turns the pause off: during a Cloudflare
+outage visitors get the CAPTCHA again and again, but it is never skipped. `siteverifyErrorsToPause` must be a whole number
+from 0, `siteverifyPauseSeconds` from 1; any other value logs a warning and the default is used.
+
+**Only `GET` and `HEAD` are challenged.** A challenge page can't carry a request body through its redirect, so a `POST`,
+`PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict is forwarded with `x-cheq-rti-result` instead (login, checkout,
+a bank's 3D Secure return). Blocks, 404s and redirects still apply to every method. To protect form submits, challenge
+the page that shows the form, or act on `x-cheq-rti-result` in the origin.
+
 `config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
 ### How the Challenge Flow Works
@@ -856,10 +872,14 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
         │       request_id and cf-turnstile-response (the visitor's own query travels inside
         │       original_url; the page's script adds the #fragment, which never reaches the server)
         │
-   YES ──► POST token to Cloudflare siteverify API (server-side)
+   YES ──► POST token to Cloudflare siteverify API (server-side, 1.5 s timeout)
                │
-          Verification fails ──► Return 403 "Verification failed" (plain text, no widget;
-          (or hostname / action        see Troubleshooting: "Verification failed" after refresh)
+          siteverify error ──► 302 back to original_url, no session (the token never reaches
+          (timeout, network,      the origin). Enough errors in a row pause the CAPTCHA
+           5xx, not JSON)         (siteverifyErrorsToPause / siteverifyPauseSeconds)
+               │
+          Verification fails ──► Return 403 with the widget again and "Verification failed. Please try again."
+          (or hostname / action
            do not match: Token checks)
                │
           Verification passes
@@ -968,7 +988,8 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
               └── yes → config.challenge (the Turnstile example:)
                          Verified → 302 to original_url with a new _cq_se session (same sessionTtlSeconds)
                          Failed (used, expired or forged token, or one solved on another site or widget:
-                                 see Token checks) → 403 "Verification failed" (see Troubleshooting)
+                                 see Token checks) → 403 with the widget again and an error message
+                         siteverify error → 302 to original_url, no session
 ```
 
 - **The challenge recognizes its own reply.** `config.isChallengeResponse` comes with the challenge (the Turnstile
@@ -998,7 +1019,8 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
   - **Cost:** while RTI is failing, each reply makes a siteverify call that a plain fail-open forward would not.
 - It never lengthens a session or skips RTI: a new `_cq_se` still needs a token that Cloudflare verifies, and the
   redirected request is checked by RTI again. `MONITORING` mode forwards replies unchanged, like everything else.
-- If `config.challenge` throws (e.g. the siteverify call fails), the reply is forwarded (fail-open).
+- A siteverify error is handled by the example itself: a 302 back to `original_url` without a session, so the token
+  never reaches the origin. If a custom `config.challenge` throws, the reply is forwarded (fail-open).
 
 ### Session Cookie Format
 
@@ -1269,9 +1291,9 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 
 **Symptom:** CloudWatch shows `Task timed out after X seconds`.
 
-**Cause:** The whole handler took longer than the Lambda limit (5 s for viewer-request, 30 s for origin-request). A slow RTI call alone does not cause this: it is aborted after `config.timeout` and the request passes through. The handler's time is `config.timeout` + up to 1,000ms per awaited logger call (telemetry, errors, and the challenge-reply logs: usually at most two in one request, up to four when several things fail) + the challenge's own time. The Turnstile example verifies tokens with global `fetch` and **no timeout**, so a slow siteverify is not bounded, and the first verification in a cold container also pays the `fetch` (undici) load cost.
+**Cause:** The whole handler took longer than the Lambda limit (5 s for viewer-request, 30 s for origin-request). A slow RTI call alone does not cause this: it is aborted after `config.timeout` and the request passes through. The handler's time is `config.timeout` + up to 1,000ms per awaited logger call (telemetry, errors, and the challenge-reply logs: usually at most two in one request, up to four when several things fail) + the challenge's own time. The Turnstile example verifies tokens with the same HTTPS client as the RTI call, with a 1.5 s timeout.
 
-**Fix:** When `config.timeout` is not set, the RTI call times out after 2000ms. Increase it if your network latency to the RTI endpoint is higher. For viewer-request, keep it at or below about 2,500ms so the RTI call, two logger calls (1,000ms each, the usual maximum) and the challenge fit in the 5 s limit. Use the origin-request approach if you need more time. If you use the Turnstile example on viewer-request, add a timeout to its siteverify call (e.g. `signal: AbortSignal.timeout(1000)`). Consider checking `rti_duration` logs to understand your P99 latency.
+**Fix:** When `config.timeout` is not set, the RTI call times out after 2000ms. Increase it if your network latency to the RTI endpoint is higher. For viewer-request, keep it at or below about 2,500ms so the RTI call, two logger calls (1,000ms each, the usual maximum) and the challenge fit in the 5 s limit. Use the origin-request approach if you need more time. Consider checking `rti_duration` logs to understand your P99 latency.
 
 ### RTI call aborted due to timeout
 
@@ -1289,7 +1311,7 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 
 **Cause (origin-request):** The header is not whitelisted in the origin request policy attached to the behavior.
 
-**Fix:** Check which policy is attached to the CloudFront behavior. Add the missing header to your policy or switch to `OriginRequestPolicyAllHeadersAllowed` for testing.
+**Fix:** Check which policy is attached to the CloudFront behavior. Use the default `OriginRequestPolicy` (all viewer headers), or add the missing header to your header-list policy.
 
 **Cause (viewer-request):** `keepHeadersNames` is set and the header name is not in the list.
 
@@ -1320,16 +1342,16 @@ A third cause: the `_cq_session` cookie name starts with `_cq_se` — the exampl
 
 ### "Verification failed" after a refresh, Back, or a long wait
 
-**Symptom:** The visitor sees a plain `403 Verification failed. Please try again.` page with no widget, and refreshing shows it again.
+**Symptom:** The visitor sees the challenge page again with "Verification failed. Please try again." above the widget.
 
-**Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example answers with the plain 403. Every refresh resends the same dead token. In `BLOCKING` mode this happens whether RTI allows the reply or asks for a CAPTCHA: either way it goes to `config.challenge` (see [The reply to the challenge page](#the-reply-to-the-challenge-page)).
+**Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example shows the widget again with the error message. In `BLOCKING` mode this happens whether RTI allows the reply or asks for a CAPTCHA: either way it goes to `config.challenge` (see [The reply to the challenge page](#the-reply-to-the-challenge-page)).
 
 **Second cause, for every visitor and every token:** the token is genuine but fails the [token checks](#token-checks):
 the hostname does not match the request's `Host` (origin-request without the viewer's `Host` forwarded, or Cloudflare's
 test keys) or the action is not `cheq-challenge` (`data-action` removed from the challenge page). CloudWatch then shows
 a `[turnstile] token valid but …` warning naming the mismatch. Fix the setup as described there.
 
-**Fix:** The visitor can open the page without the query string (or navigate on), which gives a fresh challenge. To avoid the dead end, change the failure branch of `turnstileChallengeExample` to a `302` back to the same path **without** `cf-turnstile-response`, `original_url` and `request_id` (with `Cache-Control: no-store`), so the next request shows a fresh widget. This cannot loop by itself: the page only submits when the visitor clicks *Continue*. Log siteverify's `error-codes` when they are not `timeout-or-duplicate`; codes such as `invalid-input-secret` mean the `secretKey` in `config.ts` is wrong.
+**Fix:** The visitor solves the widget again; the new token works. If it fails for every visitor, look for the token-check warnings above, or siteverify `error-codes` such as `invalid-input-secret` (the `secretKey` in `config.ts` is wrong).
 
 ### SAM deploy fails with `CAPABILITY_NAMED_IAM`
 

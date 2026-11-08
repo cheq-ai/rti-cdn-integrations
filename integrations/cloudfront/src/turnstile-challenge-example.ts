@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { isIPv6, SocketAddress } from "node:net";
 import { RTIResponse } from "../../core/models/rti-response.model";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
+import { HttpsClient } from "../../core/services/https-client";
 import type { CloudfrontConfig } from "./config";
 
 const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
@@ -36,6 +37,13 @@ export interface TurnstileSettings {
      * default is `{ ip: "exact", userAgent: true }`. A session that no longer matches only means a new CAPTCHA.
      */
     sessionBinding?: SessionBinding;
+    /**
+     * siteverify errors in a row (timeout, network, 5xx) before the CAPTCHA is paused. A 4xx doesn't count. Default 5.
+     * 0 turns the pause off: during a Cloudflare outage visitors get the CAPTCHA again, but it is never skipped.
+     */
+    siteverifyErrorsToPause?: number;
+    /** How long the CAPTCHA is paused, in seconds. During the pause challenged traffic is forwarded with x-cheq-rti-result. Default 60. */
+    siteverifyPauseSeconds?: number;
 }
 
 /** See {@link sessionBindingKey}. */
@@ -47,7 +55,7 @@ export interface SessionBinding {
 }
 
 /** The settings once createTurnstileChallenge has checked them: every optional setting has its value. */
-type ResolvedTurnstileSettings = TurnstileSettings & { sessionBinding: SessionBinding };
+type ResolvedTurnstileSettings = TurnstileSettings & { sessionBinding: SessionBinding; siteverifyErrorsToPause: number; siteverifyPauseSeconds: number };
 
 const DEFAULT_SESSION_BINDING: SessionBinding = { ip: "exact", userAgent: true };
 
@@ -64,6 +72,63 @@ const CLOUDFRONT_USER_AGENT = "Amazon CloudFront";
 const isPlaceholder = (value: string | undefined): boolean => !value || value.trim() === "" || value.trim() === "REPLACE_ME";
 
 const DEFAULT_SESSION_TTL_SECONDS = 300;
+
+const SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+// RTI already used part of the viewer-request 5 s budget.
+const SITEVERIFY_TIMEOUT_MS = 1500;
+const DEFAULT_SITEVERIFY_ERRORS_TO_PAUSE = 5;
+const DEFAULT_SITEVERIFY_PAUSE_SECONDS = 60;
+
+// Same client as the RTI call: no fetch cold-start cost, a real timeout, and a stale pooled connection is retried once.
+let siteverifyClient: HttpsClient | undefined;
+const getSiteverifyClient = (): HttpsClient => (siteverifyClient ??= new HttpsClient(SITEVERIFY_URL, 50000));
+
+/**
+ * Pauses the CAPTCHA when siteverify keeps failing, so visitors don't loop on a check that can't pass.
+ * Counts errors in a row, per Lambda instance. After the pause it needs the same number of errors to pause again.
+ */
+export class SiteverifyPause {
+    private errorsInRow = 0;
+    private pausedUntil = 0;
+
+    constructor(private readonly errorsToPause: number, private readonly pauseSeconds: number) {}
+
+    isPaused(): boolean {
+        return Date.now() < this.pausedUntil;
+    }
+
+    recordSuccess(): void {
+        this.errorsInRow = 0;
+    }
+
+    recordError(): void {
+        this.errorsInRow++;
+        // 0 = pause turned off: never skip the CAPTCHA.
+        if (this.errorsToPause === 0) {
+            return;
+        }
+        if (this.errorsInRow >= this.errorsToPause) {
+            this.errorsInRow = 0;
+            this.pausedUntil = Date.now() + this.pauseSeconds * 1000;
+            console.error(`[turnstile] siteverify failed ${this.errorsToPause} times in a row: CAPTCHA paused for ${this.pauseSeconds}s`);
+        }
+    }
+}
+
+/** siteverify answered 4xx: it refused this call (bad request, rate limit). Cloudflare is up, so it is no outage. */
+class SiteverifyRefusedError extends Error {}
+
+// A whole number from `min` up, else the default (with a warning).
+function integerSetting(name: string, value: number | undefined, min: number, fallback: number): number {
+    if (value === undefined) {
+        return fallback;
+    }
+    if (Number.isInteger(value) && value >= min) {
+        return value;
+    }
+    console.warn(`[turnstile] invalid ${name} ${JSON.stringify(value)}, using ${fallback} (set a whole number of at least ${min} in config.ts)`);
+    return fallback;
+}
 
 /**
  * The longest session: 400 days, the most browsers keep a cookie (RFC 6265bis caps Max-Age there; Chrome enforces it),
@@ -164,7 +229,10 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
         ...settings,
         sessionTtlSeconds: ttlValid ? settings.sessionTtlSeconds : DEFAULT_SESSION_TTL_SECONDS,
         sessionBinding: { ip: binding.ip, userAgent: binding.userAgent },
+        siteverifyErrorsToPause: integerSetting("siteverifyErrorsToPause", settings.siteverifyErrorsToPause, 0, DEFAULT_SITEVERIFY_ERRORS_TO_PAUSE),
+        siteverifyPauseSeconds: integerSetting("siteverifyPauseSeconds", settings.siteverifyPauseSeconds, 1, DEFAULT_SITEVERIFY_PAUSE_SECONDS),
     };
+    const pause = new SiteverifyPause(resolved.siteverifyErrorsToPause, resolved.siteverifyPauseSeconds);
 
     // Once per cold start (config.ts calls this factory once): on origin-request without the viewer's User-Agent
     // forwarded, every client has CloudFront's, so the User-Agent binding means nothing.
@@ -177,8 +245,17 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
     };
 
     return {
-        challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, request, response, addRtiResultHeader),
-        validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug, warnCloudFrontUserAgent),
+        challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, pause, request, response, addRtiResultHeader),
+        validateChallenge: async (request, isDebug) => {
+            // siteverify is down: waive the CAPTCHA, the request goes on with its verdict header.
+            if (pause.isPaused()) {
+                if (isDebug) {
+                    console.log("[validateChallenge] siteverify paused, waiving CAPTCHA");
+                }
+                return true;
+            }
+            return turnstileValidateChallengeExample(resolved, request, isDebug, warnCloudFrontUserAgent);
+        },
         isChallengeResponse: turnstileIsChallengeResponseExample,
     };
 }
@@ -191,33 +268,64 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
 const turnstileIsChallengeResponseExample = (request: CloudFrontRequest): boolean =>
     !!new URLSearchParams(request.querystring).get(TURNSTILE_RESPONSE_QUERY_PARAM);
 
-const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
-    let queryStringData = new URLSearchParams(request.querystring);
+const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pause: SiteverifyPause, request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult | CloudFrontResponseResult> => {
+    const queryStringData = new URLSearchParams(request.querystring);
     // TURNSTILE_RESPONSE_QUERY_PARAM is not set by this code: once the visitor solves the challenge, the Turnstile
     // widget (api.js) injects a hidden input with this name into the enclosing <form>. The form submits via GET,
     // so the token arrives here as a query string parameter. It must still be verified server-side (siteverify below).
-    // @ts-ignore
-    const token = queryStringData?.get(TURNSTILE_RESPONSE_QUERY_PARAM);
+    const token = queryStringData.get(TURNSTILE_RESPONSE_QUERY_PARAM);
 
     if (!token) {
-        // No token means the visitor has not solved the challenge yet. Return a 403 with the Turnstile widget.
-        // The return URL keeps the query string (gclid, utm_*, ...): request.uri is only the path. It must travel
-        // in original_url, not in the form action: a GET form replaces the action's query with its own fields.
+        // Not solved yet. The return URL keeps the query string (gclid, utm_*, ...): request.uri is only the path.
         const originalUrl = request.querystring ? `${request.uri}?${request.querystring}` : request.uri;
-        const html = `<!DOCTYPE html>
+        return challengePage(settings, response, originalUrl);
+    }
+
+    // siteverify is down: no session, back to the page. During the pause the CAPTCHA is waived there.
+    if (pause.isPaused()) {
+        return retryRedirect(request, queryStringData);
+    }
+
+    let verified: boolean;
+    try {
+        verified = await verifyTurnstileToken(settings, token, request);
+        pause.recordSuccess();
+    } catch (e) {
+        // A 4xx doesn't count toward the pause: a flood of junk tokens could get us rate limited (429), and that
+        // must not let anyone switch the CAPTCHA off. It's a failed check: show the widget again.
+        if (e instanceof SiteverifyRefusedError) {
+            console.warn(`[turnstile] ${e.message}`);
+            return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
+        }
+        // Timeout, network error, 5xx or a bad answer: not the visitor's fault. Never forward the token to the origin.
+        pause.recordError();
+        console.error(`[turnstile] siteverify error: ${e instanceof Error ? e.message : String(e)}`);
+        return retryRedirect(request, queryStringData);
+    }
+
+    if (verified) {
+        return sessionRedirect(settings, request, response, queryStringData, addRtiResultHeader);
+    }
+
+    // Wrong, reused or expired token: show the widget again instead of a dead end.
+    return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
+};
+
+/** The 403 page with the Turnstile widget. `originalUrl` is where the visitor goes once solved. */
+function challengePage(settings: ResolvedTurnstileSettings, response: RTIResponse, originalUrl: string, errorMessage?: string): CloudFrontResultResponse {
+    const html = `<!DOCTYPE html>
                     <html lang="en">
                     <head>
                     <meta charset="UTF-8">
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
                     <title>Security Verification | CHEQ</title>
-                    <link rel="preconnect" href="https://fonts.googleapis.com">
-                    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+                    <link rel="preconnect" href="https://challenges.cloudflare.com">
                     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
                     <style>
                         * { margin: 0; padding: 0; box-sizing: border-box; }
                         
                         body {
-                            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                             background: #070F18;
                             min-height: 100vh;
                             display: flex;
@@ -398,6 +506,16 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
                         .loading.show {
                         display: block;
                         }
+
+                        .error-box {
+                        background: rgba(239, 68, 68, 0.15);
+                        border: 1px solid rgba(239, 68, 68, 0.3);
+                        color: #FCA5A5;
+                        border-radius: 8px;
+                        padding: 10px 14px;
+                        margin-bottom: 20px;
+                        font-size: 0.9rem;
+                        }
                     </style>
                     </head>
                     <body>
@@ -425,6 +543,7 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
                         <p class="subtitle">
                             Please complete the verification below to confirm you're human and continue to the website.
                         </p>
+                        ${errorMessage ? `<div class="error-box" role="alert">${escapeHtml(errorMessage)}</div>` : ""}
                         <form id="captcha-form" method="GET">${/* No action: the form goes back to this page's own URL, exactly as the browser requested it. An action built from request.uri would send a path like "//evil.com/" (with the token) to another site. */ ""}
                             <input type="hidden" name="original_url" value="${escapeHtml(originalUrl)}">
                             <input type="hidden" name="request_id" value="${escapeHtml(response.ids.rayId)}">
@@ -434,6 +553,10 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
                                 data-sitekey="${escapeHtml(settings.siteKey)}"
                                 data-action="${CHALLENGE_ACTION}"${/* REQUIRED: verifyTurnstileToken rejects tokens without this action. Removing it locks every visitor in a CAPTCHA loop. */ ""}
                                 data-callback="onTurnstileSuccess"
+                                data-error-callback="onTurnstileReset"
+                                data-expired-callback="onTurnstileReset"
+                                data-timeout-callback="onTurnstileReset"
+                                data-retry-interval="2000"
                                 data-theme="dark">
                             </div>
                             </div>
@@ -461,6 +584,13 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
                     <script>
                         function onTurnstileSuccess(token) {
                         document.getElementById('submit-btn').disabled = false;
+                        document.getElementById('loading').classList.remove('show');
+                        }
+
+                        // Widget failed, expired or timed out: no valid token, so no submit and no spinner.
+                        function onTurnstileReset() {
+                        document.getElementById('submit-btn').disabled = true;
+                        document.getElementById('loading').classList.remove('show');
                         }
                         
                         document.getElementById('captcha-form').addEventListener('submit', function() {
@@ -470,29 +600,37 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
                         document.getElementById('submit-btn').disabled = true;
                         document.getElementById('loading').classList.add('show');
                         });
+
+                        // Back/forward restores the page as it was left, spinner included: reset it and get a new token.
+                        window.addEventListener('pageshow', function(event) {
+                        if (!event.persisted) return;
+                        onTurnstileReset();
+                        if (window.turnstile) window.turnstile.reset();
+                        });
                     </script>
                     </body>
                     </html>`;
-        
-        return {
-            status: '403',
-            headers: {
-                'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }],
-                'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }],
-            },
-            body: html,
-        };
-    } else {
-        if (await verifyTurnstileToken(settings, token, request)) {
-            return sessionRedirect(settings, request, response, queryStringData, addRtiResultHeader);
-        } else {
-            return {
-                status: '403',
-                body: "Verification failed. Please try again.",
-            };
-        }
-    }
-};
+
+    return {
+        status: '403',
+        headers: {
+            'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }],
+            'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }],
+        },
+        body: html,
+    };
+}
+
+/** 302 back to the page without the token and without a session: the next request is checked as usual. */
+function retryRedirect(request: CloudFrontRequest, queryStringData: URLSearchParams): CloudFrontResultResponse {
+    return {
+        status: '302',
+        headers: {
+            location: [{ key: 'Location', value: returnLocation(request, queryStringData) }],
+            'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }],
+        },
+    };
+}
 
 /**
  * Verifies a Turnstile token with Cloudflare's siteverify endpoint. A token is single-use and expires after 300 seconds.
@@ -505,17 +643,19 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, re
  * Both hosts go through RTIStatelessUtils.normalizeHost first, so case, a `:port` or a stray scheme do not cause a mismatch.
  */
 async function verifyTurnstileToken(settings: TurnstileSettings, token: string, request: CloudFrontRequest): Promise<boolean> {
-    const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-            secret: settings.secretKey,
-            response: token,
-            remoteip: request.clientIp,
-        }).toString(),
-    });
+    // Throws SiteverifyRefusedError on a 4xx. Throws on a timeout, a network error, a 5xx or a body that is not JSON: siteverify itself failed.
+    const verifyResponse = await getSiteverifyClient().post(
+        JSON.stringify({ secret: settings.secretKey, response: token, remoteip: request.clientIp }),
+        SITEVERIFY_TIMEOUT_MS,
+    );
+    if (verifyResponse.status >= 400 && verifyResponse.status < 500) {
+        throw new SiteverifyRefusedError(`siteverify refused the call: HTTP ${verifyResponse.status}`);
+    }
+    if (verifyResponse.status < 200 || verifyResponse.status >= 300) {
+        throw new Error(`siteverify answered HTTP ${verifyResponse.status}`);
+    }
 
-    const result = await verifyResponse.json() as { success?: boolean; hostname?: string; action?: string };
+    const result = JSON.parse(verifyResponse.body) as { success?: boolean; hostname?: string; action?: string };
     if (result.success !== true) {
         return false;
     }
@@ -554,9 +694,14 @@ async function verifyTurnstileToken(settings: TurnstileSettings, token: string, 
  */
 function returnLocation(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
     const host = request.headers["host"]?.[0]?.value;
+    const path = returnPath(request, queryStringData);
+    return host ? `https://${host}${path}` : path;
+}
+
+/** The checked original_url (path, query, fragment), or the request's own path. */
+function returnPath(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
     const originalUrl = queryStringData.get("original_url");
-    const returnPath = RTIStatelessUtils.safeReturnPath(originalUrl) ?? ownUriReturnPath(request, originalUrl) ?? request.uri;
-    return host ? `https://${host}${returnPath}` : returnPath;
+    return RTIStatelessUtils.safeReturnPath(originalUrl) ?? ownUriReturnPath(request, originalUrl) ?? request.uri;
 }
 
 /**

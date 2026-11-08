@@ -26,8 +26,11 @@ Outputs:
     Description: Viewer Request lambda version ARN. Use with viewer-request CloudFront event trigger.
     Value: !Ref ViewerRequest.Version
   OriginRequestPolicy:
-    Description: Includes RTI, ja3/ja4 fingerprint, tls and host headers
+    Description: Default. All viewer headers (host and x-cheq-rti-result included) plus the tls, ja3 and ja4 CloudFront headers
     Value: !Sub "${AWS::StackName}-origin-request-policy"
+  OriginRequestPolicyAllExceptHost:
+    Description: All viewer headers except host, for origins that need their own host (API Gateway, Lambda function URLs, S3)
+    Value: !Sub "${AWS::StackName}-origin-request-policy-all-except-host"
   OriginRequestPolicyNoHost:
     Description: Includes RTI, ja3/ja4 fingerprint and tls headers, no host header
     Value: !Sub "${AWS::StackName}-origin-request-policy-no-host"
@@ -115,31 +118,53 @@ Resources:
         Sourcemap: false
         EntryPoints:
           - viewer-request.ts
-  # Use when the origin requires the Host header (e.g. virtual-hosted S3, custom domain origins).
-  # Forwards all cookies, query strings, and a full set of viewer/request headers including host.
+  # The default. Forwards ALL viewer headers, so nothing has to be picked: the origin gets x-cheq-rti-result (the
+  # verdict our Lambda adds), true-client-ip, x-forwarded-for, a trusted IP header and the site's own headers.
+  # Why not a header list: a list holds at most 10 headers (AWS quota) and the old list was already full, so every
+  # new header meant dropping one that some customer needs. Here the limit only counts the CloudFront headers below.
+  # Same approach as AWS's managed AllViewerAndCloudFrontHeaders-2022-06 policy (all viewer headers), but with only the
+  # tls, ja3 and ja4 CloudFront headers (AWS's has every CloudFront header up to June 2022, so no ja4). It does not change caching
+  # (the cache key comes from the cache policy). For origins that break on the viewer's host, use
+  # OriginRequestPolicyAllExceptHost.
+  # TODO: confirm on stage that x-cheq-rti-result reaches the origin with this policy (INCQ-10263).
   OriginRequestPolicy:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:
       OriginRequestPolicyConfig:
         Name: !Sub "${AWS::StackName}-origin-request-policy"
-        Comment: Includes RTI, ja3/ja4 fingerprint, tls and host headers
+        Comment: All viewer headers plus the tls, ja3 and ja4 CloudFront headers
         QueryStringsConfig:
           QueryStringBehavior: all
         CookiesConfig:
           CookieBehavior: all
         HeadersConfig:
-          HeaderBehavior: whitelist
+          HeaderBehavior: allViewerAndWhitelistCloudFront
           Headers:
+            # Added by CloudFront, only when listed here. On origin-request the Lambda sends them to RTI.
             - cloudfront-viewer-tls
             - cloudfront-viewer-ja3-fingerprint
             - cloudfront-viewer-ja4-fingerprint
-            - accept
-            - accept-language
+  # All viewer headers except host, for origins that expect their own domain in host (API Gateway, Lambda function
+  # URLs, S3); CloudFront then sends the origin's domain as host. Like AWS's managed AllViewerExceptHostHeader.
+  # This mode can't add CloudFront headers, so no tls/ja3/ja4: fine on viewer-request (the Lambda doesn't get them
+  # there anyway). On origin-request, use OriginRequestPolicyNoHost if RTI should get them.
+  OriginRequestPolicyAllExceptHost:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-origin-request-policy-all-except-host"
+        Comment: All viewer headers except host
+        QueryStringsConfig:
+          QueryStringBehavior: all
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers:
             - host
-            - referer
-            - user-agent
-            - x-forwarded-for
-            - true-client-ip
+  # The policies below are header lists, for customers who want only named headers to reach the origin.
+  # A list holds at most 10 headers (AWS quota, can be raised with a Service Quotas request) and only the listed
+  # headers reach the origin: add x-cheq-rti-result if the origin needs the verdict.
   # Use when the origin must NOT receive the Host header (e.g. S3 REST endpoint, origins that use
   # their own domain). Omitting host prevents CloudFront from sending the viewer's hostname to
   # the origin, which would cause request failures on origins that don't recognize it.
@@ -191,7 +216,8 @@ Resources:
             - !Ref TrustedIPHeader
             - x-forwarded-for
             - true-client-ip
-  # Same as the default policy (with host) but also forwards the custom header specified by the TrustedIPHeader parameter.
+  # Note: 11 headers, over the default quota of 10, so creating it fails unless the quota was raised.
+  # Header list with host, plus the custom header named by the TrustedIPHeader parameter.
   # Only created when TrustedIPHeader is provided. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
   OriginRequestPolicyTrustedIP:
     Type: AWS::CloudFront::OriginRequestPolicy
@@ -218,9 +244,8 @@ Resources:
             - !Ref TrustedIPHeader
             - x-forwarded-for
             - true-client-ip
-  # Forwards all cookies, query strings, and all viewer/request headers to the origin. 
-  # Use for maximum flexibility when testing or if the origin needs a wide range of headers and you don't want to manage updates to the header whitelist over time. 
-  # Note that this will forward the Host header by default, which may not be suitable for all origins (e.g. S3 REST endpoints).
+  # The default policy plus CloudFront's geo and device headers (country, city, mobile/tablet/TV, header order and
+  # count). Use it when RTI or the origin should get those too. Like the default, it forwards the viewer's host.
   OriginRequestPolicyAllHeadersAllowed:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:

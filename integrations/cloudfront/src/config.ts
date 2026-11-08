@@ -79,6 +79,12 @@ const turnstileConfig: TurnstileSettings = {
     // CAPTCHA again (no block). ip: "exact" | "none". On origin-request, forward the viewer's User-Agent in the origin
     // request policy (the shipped policies do).
     sessionBinding: { ip: "exact", userAgent: true },
+
+    // If Cloudflare's siteverify fails this many times in a row (timeout, network, 5xx; a 4xx doesn't count), the CAPTCHA is paused for
+    // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result. Counted per Lambda instance.
+    // 0 turns the pause off: during an outage visitors get the CAPTCHA again, but it is never skipped.
+    siteverifyErrorsToPause: 5,
+    siteverifyPauseSeconds: 60,
 };
 
 // The three callbacks are undefined until the three secrets above are set.

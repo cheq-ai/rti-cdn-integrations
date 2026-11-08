@@ -45,6 +45,8 @@ describe('shipped config.ts', () => {
             sessionSigningSecret: 'REPLACE_ME',
             sessionTtlSeconds: 300,
             sessionBinding: { ip: 'exact', userAgent: true },
+            siteverifyErrorsToPause: 5,
+            siteverifyPauseSeconds: 60,
         });
         expect(config.challenge).toBe(challenge);
         expect(config.validateChallenge).toBe(validateChallenge);
