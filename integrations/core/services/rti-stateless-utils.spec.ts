@@ -1407,6 +1407,46 @@ describe('RTIStatelessUtils', () => {
       });
     });
 
+    describe('maskSecret', () => {
+      test.each([
+        ['a long value: first and last 4', 'abcdefghijklmnop', 'abcd****mnop'],
+        ['13 characters: still masked in the middle', 'abcdefghijklm', 'abcd****jklm'],
+        ['12 characters: all hidden', 'abcdefghijkl', '****'],
+        ['a short value', 'abc', '****'],
+        ['an empty value', '', '****'],
+      ])('%s', (_label, value, expected) => {
+        // Act & Assert
+        expect(utils.maskSecret(value)).toBe(expected);
+      });
+    });
+
+    describe('redactQueryString', () => {
+      test.each([
+        ['the token among others', 'a=1&cf-turnstile-response=0.AbCdEfGhIjKlMn&b=2', 'a=1&cf-turnstile-response=0.Ab****KlMn&b=2'],
+        ['the token first', 'cf-turnstile-response=0.AbCdEfGhIjKlMn&a=1', 'cf-turnstile-response=0.Ab****KlMn&a=1'],
+        ['the token twice', 'cf-turnstile-response=AAAABBBBCCCCDDDD&cf-turnstile-response=EEEEFFFFGGGGHHHH', 'cf-turnstile-response=AAAA****DDDD&cf-turnstile-response=EEEE****HHHH'],
+        ['a short or empty token', 'cf-turnstile-response=short&cf-turnstile-response=', 'cf-turnstile-response=****&cf-turnstile-response=****'],
+        ['a name that only ends like the token', 'x-cf-turnstile-response=keep-this-value-1234', 'x-cf-turnstile-response=keep-this-value-1234'],
+        ['no secret parameter, kept byte for byte', 'q=a%20b&utm_source=x&flag', 'q=a%20b&utm_source=x&flag'],
+        ['empty', '', ''],
+      ])('%s', (_label, querystring, expected) => {
+        // Act & Assert
+        expect(utils.redactQueryString(querystring)).toBe(expected);
+      });
+    });
+
+    describe('redactUrl', () => {
+      test.each([
+        ['no query string', 'https://shop.com/cart', 'https://shop.com/cart'],
+        ['a query string with the token', 'https://shop.com/?cf-turnstile-response=0.AbCdEfGhIjKlMn&a=1', 'https://shop.com/?cf-turnstile-response=0.Ab****KlMn&a=1'],
+        ['a fragment after the query string is kept', 'https://shop.com/?cf-turnstile-response=0.AbCdEfGhIjKlMn#top', 'https://shop.com/?cf-turnstile-response=0.Ab****KlMn#top'],
+        ['an empty query string', 'https://shop.com/?', 'https://shop.com/?'],
+      ])('%s', (_label, url, expected) => {
+        // Act & Assert
+        expect(utils.redactUrl(url)).toBe(expected);
+      });
+    });
+
     describe('stringifyRedactedPayload', () => {
       const buildPayload = (headers: Record<string, string | undefined>) => ({
         tagHash: 'tag',
@@ -1439,18 +1479,18 @@ describe('RTIStatelessUtils', () => {
         const logged = JSON.parse(utils.stringifyRedactedPayload(payload));
 
         // Assert
-        expect(logged).toEqual({ ...payload, endUserParams: { ...payload.endUserParams, headers: { cookie: 'a' } } });
+        expect(logged).toEqual({ ...payload, tagHash: '****', apiKey: '****', endUserParams: { ...payload.endUserParams, headers: { cookie: 'a' } } });
         expect(logged.duidCookie).toBe('duid-1');
         expect(logged.pvidCookie).toBe('pvid-1');
         expect(logged.sCookie).toBe('s-1');
       });
 
-      test('equals JSON.stringify when there is nothing to redact (same keys, same order)', () => {
+      test('equals JSON.stringify apart from the masked keys when there is nothing else to redact (same keys, same order)', () => {
         // Arrange
         const payload = buildPayload({ host: 'shop.com', 'user-agent': 'UA', cheq_ja3: undefined });
 
         // Act & Assert
-        expect(utils.stringifyRedactedPayload(payload)).toBe(JSON.stringify(payload));
+        expect(utils.stringifyRedactedPayload(payload)).toBe(JSON.stringify({ ...payload, tagHash: '****', apiKey: '****' }));
       });
 
       test('keeps the header order and drops undefined headers, like JSON.stringify', () => {
@@ -1479,9 +1519,38 @@ describe('RTIStatelessUtils', () => {
         expect(headers.cookie).toBe('a=secret');
       });
 
+      test('masks apiKey and tagHash: first and last 4 characters only', () => {
+        // Arrange
+        const payload = { ...buildPayload({}), apiKey: 'bbe1cb9f-75cc-437c-97fe-8dead6575828', tagHash: '89f6be46721c93dcde41c82e1e56ac78' };
+
+        // Act
+        const logged = utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(logged).not.toContain('75cc-437c');
+        expect(logged).not.toContain('721c93dc');
+        expect(JSON.parse(logged)).toMatchObject({ apiKey: 'bbe1****5828', tagHash: '89f6****ac78' });
+        expect(payload.apiKey).toBe('bbe1cb9f-75cc-437c-97fe-8dead6575828');
+      });
+
+      test('masks the Turnstile token in requestUrl, keeping the rest of the URL', () => {
+        // Arrange
+        const token = '0.AbCdEfGhIjKlMnOpQrStUvWxYz-123456789';
+        const payload = buildPayload({});
+        payload.endUserParams.requestUrl = `https://shop.com/?original_url=%2Fcart&cf-turnstile-response=${token}&request_id=r1`;
+
+        // Act
+        const logged = utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(logged).not.toContain(token);
+        expect(JSON.parse(logged).endUserParams.requestUrl).toBe('https://shop.com/?original_url=%2Fcart&cf-turnstile-response=0.Ab****6789&request_id=r1');
+        expect(payload.endUserParams.requestUrl).toContain(token);
+      });
+
       test('works without endUserParams or headers', () => {
         // Act & Assert
-        expect(utils.stringifyRedactedPayload({ tagHash: 't' } as any)).toBe('{"tagHash":"t"}');
+        expect(utils.stringifyRedactedPayload({ tagHash: 't' } as any)).toBe('{"tagHash":"****"}');
         expect(utils.stringifyRedactedPayload({ endUserParams: { clientIp: 'x' } } as any)).toBe('{"endUserParams":{"clientIp":"x"}}');
       });
 

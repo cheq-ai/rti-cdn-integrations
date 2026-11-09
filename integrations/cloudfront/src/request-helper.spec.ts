@@ -50,6 +50,7 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
                 cookieNames: realInstance.cookieNames.bind(realInstance),
                 redactHeaderValue: realInstance.redactHeaderValue.bind(realInstance),
+                redactQueryString: realInstance.redactQueryString.bind(realInstance),
                 buildRtiResultHeader: realInstance.buildRtiResultHeader.bind(realInstance),
                 isChallengeReplyAllowed: realInstance.isChallengeReplyAllowed.bind(realInstance),
                 errorMessage: realInstance.errorMessage.bind(realInstance),
