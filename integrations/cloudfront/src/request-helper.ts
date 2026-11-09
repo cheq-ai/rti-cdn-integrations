@@ -6,7 +6,7 @@ import { RTIHttpsService } from "../../core/services/rti-https.service";
 import { RTIHelperService } from "../../core/services/rti-helper.service";
 import { name, version } from "../package.json";
 import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
-import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfront';
+import { CloudFrontHeaders, CloudFrontRequest, CloudFrontResultResponse } from 'aws-lambda/common/cloudfront';
 import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Mode } from '../../core/models/mode.model';
@@ -14,6 +14,7 @@ import { Ids, RTIResponse } from '../../core/models/rti-response.model';
 import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers';
 import { randomUUID } from 'node:crypto';
 import { stringifyRedactedEvent } from './log-redaction';
+import { ResponseHeaders } from './response-headers';
 
 export enum RequestType {
   VIEWER_REQUEST,
@@ -24,9 +25,8 @@ const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIHttpsService(config);
 
-// On origin-request CloudFront can cache what the Lambda returns, so one bot's block page could be served to
-// real visitors of the same URL. Our block, 404 and redirect answers must never be cached.
-const noStore = (): CloudFrontHeaders => ({ 'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }] });
+// Our block, 404 and redirect answers are never cached.
+const responseHeaders = new ResponseHeaders();
 
 // Methods that can get the CAPTCHA page without losing the request.
 const CHALLENGEABLE_METHODS = ["GET", "HEAD"];
@@ -149,24 +149,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         if (action !== Action.ALLOW) {
             switch (actionStrategy) {
                 case ActionStrategy.ACCESS_DENIED:
-                    return {
-                        status: '403',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore() },
-                        body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids, getCfRequestId(event)),
-                    };
+                    return blockPage('403', 'Access Denied', event, rtiResponse);
                 case ActionStrategy.NOT_FOUND:
-                    return {
-                        status: '404',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore() },
-                        body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids, getCfRequestId(event)),
-                    };
+                    return blockPage('404', 'Not Found', event, rtiResponse);
                 case ActionStrategy.REDIRECT:
                     const headers: CloudFrontHeaders = {
                         'x-cheq-cdn-request-id': [{ key: 'x-cheq-cdn-request-id', value: getCfRequestId(event) }],
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
                         'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
-                        ...noStore(),
+                        ...responseHeaders.noStore(),
                     };
                     return {
                         status: '302',
@@ -337,6 +329,15 @@ function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): Req
     }
     
     return result;
+}
+
+// Our own 403 or 404 page for a blocked request.
+function blockPage(status: '403' | '404', title: string, event: CloudFrontRequestEvent, rtiResponse: RTIResponse): CloudFrontResultResponse {
+    return {
+        status,
+        headers: responseHeaders.html(),
+        body: generateDefaultBlockPage(status, title, rtiResponse.ids, getCfRequestId(event)),
+    };
 }
 
 function getCfRequestId(event: CloudFrontRequestEvent): string {

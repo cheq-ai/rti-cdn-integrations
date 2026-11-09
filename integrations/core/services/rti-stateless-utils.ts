@@ -270,8 +270,11 @@ export class RTIStatelessUtils {
     return RTIStatelessUtils.SECRET_HEADERS.has(lower) ? RTIStatelessUtils.REDACTED : value;
   }
 
+  /** The query parameter that carries the Turnstile token when the challenge page's form is submitted. */
+  static readonly TURNSTILE_RESPONSE_QUERY_PARAM = 'cf-turnstile-response';
+
   /** Query parameters whose value is a secret: the Turnstile token (single use, but a credential until it is spent). */
-  private static readonly SECRET_QUERY_PARAMS = new Set(['cf-turnstile-response']);
+  private static readonly SECRET_QUERY_PARAMS = new Set([RTIStatelessUtils.TURNSTILE_RESPONSE_QUERY_PARAM]);
 
   /**
    * A secret as it may be logged: its first and last 4 characters (`abcd****wxyz`), enough to match two log lines

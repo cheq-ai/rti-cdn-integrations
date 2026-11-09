@@ -6,8 +6,13 @@ import { RTIResponse } from "../../core/models/rti-response.model";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
 import { HttpsClient } from "../../core/services/https-client";
 import type { CloudfrontConfig } from "./config";
+import { ResponseHeaders } from "./response-headers";
 
-const TURNSTILE_RESPONSE_QUERY_PARAM = "cf-turnstile-response";
+// Defined in core, so the debug logs mask the same parameter.
+const TURNSTILE_RESPONSE_QUERY_PARAM = RTIStatelessUtils.TURNSTILE_RESPONSE_QUERY_PARAM;
+
+// The challenge page and our redirects are never cached.
+const responseHeaders = new ResponseHeaders();
 
 // For the instance helpers (e.g. cookieNames for the debug log). The class holds no state, so one instance serves all.
 const statelessUtils = new RTIStatelessUtils();
@@ -295,7 +300,7 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
         // must not let anyone switch the CAPTCHA off. It's a failed check: show the widget again.
         if (e instanceof SiteverifyRefusedError) {
             console.warn(`[turnstile] ${e.message}`);
-            return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
+            return failedCheckPage(settings, request, response, queryStringData);
         }
         // Timeout, network error, 5xx or a bad answer: not the visitor's fault. Never forward the token to the origin.
         pause.recordError();
@@ -308,8 +313,13 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
     }
 
     // Wrong, reused or expired token: show the widget again instead of a dead end.
-    return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
+    return failedCheckPage(settings, request, response, queryStringData);
 };
+
+/** The challenge page again, with an error, for a token that did not pass. Solving it returns to the same page. */
+function failedCheckPage(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams): CloudFrontResultResponse {
+    return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
+}
 
 /** The 403 page with the Turnstile widget. `originalUrl` is where the visitor goes once solved. */
 function challengePage(settings: ResolvedTurnstileSettings, response: RTIResponse, originalUrl: string, errorMessage?: string): CloudFrontResultResponse {
@@ -613,10 +623,7 @@ function challengePage(settings: ResolvedTurnstileSettings, response: RTIRespons
 
     return {
         status: '403',
-        headers: {
-            'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }],
-            'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }],
-        },
+        headers: responseHeaders.html(),
         body: html,
     };
 }
@@ -627,7 +634,7 @@ function retryRedirect(request: CloudFrontRequest, queryStringData: URLSearchPar
         status: '302',
         headers: {
             location: [{ key: 'Location', value: returnLocation(request, queryStringData) }],
-            'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }],
+            ...responseHeaders.noStore(),
         },
     };
 }
