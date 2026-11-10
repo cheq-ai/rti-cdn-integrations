@@ -23,6 +23,9 @@ const statelessUtils = new RTIStatelessUtils();
  */
 const CHALLENGE_ACTION = "cheq-challenge";
 
+// Cloudflare's Turnstile tokens are at most 2048 characters. A longer one is junk: it is not sent to siteverify.
+const MAX_TOKEN_LENGTH = 2048;
+
 
 /** Settings for the example Turnstile challenge, set in config.ts. */
 export interface TurnstileSettings {
@@ -44,6 +47,7 @@ export interface TurnstileSettings {
     sessionBinding?: SessionBinding;
     /**
      * siteverify errors in a row (timeout, network, 5xx) before the CAPTCHA is paused. A 4xx doesn't count. Default 5.
+     * Counted per Lambda instance, not for the whole site (see SiteverifyPause).
      * 0 turns the pause off: during a Cloudflare outage visitors get the CAPTCHA again, but it is never skipped.
      */
     siteverifyErrorsToPause?: number;
@@ -81,16 +85,26 @@ const DEFAULT_SESSION_TTL_SECONDS = 300;
 const SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 // RTI already used part of the viewer-request 5 s budget.
 const SITEVERIFY_TIMEOUT_MS = 1500;
+// How long an unused connection to Cloudflare is kept for the next siteverify call.
+// Kept well under Cloudflare's 400 s idle limit, so Cloudflare never closes it first.
+const SITEVERIFY_IDLE_SOCKET_TIMEOUT_MS = 50000;
 const DEFAULT_SITEVERIFY_ERRORS_TO_PAUSE = 5;
 const DEFAULT_SITEVERIFY_PAUSE_SECONDS = 60;
 
 // Same client as the RTI call: no fetch cold-start cost, a real timeout, and a stale pooled connection is retried once.
 let siteverifyClient: HttpsClient | undefined;
-const getSiteverifyClient = (): HttpsClient => (siteverifyClient ??= new HttpsClient(SITEVERIFY_URL, 50000));
+const getSiteverifyClient = (): HttpsClient => (siteverifyClient ??= new HttpsClient(SITEVERIFY_URL, SITEVERIFY_IDLE_SOCKET_TIMEOUT_MS));
 
 /**
  * Pauses the CAPTCHA when siteverify keeps failing, so visitors don't loop on a check that can't pass.
- * Counts errors in a row, per Lambda instance. After the pause it needs the same number of errors to pause again.
+ * After the pause it needs the same number of errors to pause again.
+ *
+ * The count lives in memory, so it is per Lambda instance: CloudFront runs many instances (several per edge region),
+ * and each pauses on its own errors. In a real outage every busy instance reaches the limit within seconds, but until
+ * then a visitor may get the CAPTCHA from one instance and pass through another. That is the usual trade-off for an
+ * in-memory breaker; sharing the count would need a store (e.g. DynamoDB) on every challenged request.
+ * If all of Cloudflare is down, the widget itself does not load, no token arrives and siteverify is never called,
+ * so this pause never starts: visitors stay on a CAPTCHA they can't solve, as with any CAPTCHA vendor outage.
  */
 export class SiteverifyPause {
     private errorsInRow = 0;
@@ -286,9 +300,14 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
         return challengePage(settings, response, originalUrl);
     }
 
+    // Too long to be a real token: show the widget again, without calling Cloudflare and without counting toward the pause.
+    if (token.length > MAX_TOKEN_LENGTH) {
+        return challengeRetryPage(settings, request, response, queryStringData);
+    }
+
     // siteverify is down: no session, back to the page. During the pause the CAPTCHA is waived there.
     if (pause.isPaused()) {
-        return retryRedirect(request, queryStringData);
+        return challengeUnavailable(request, queryStringData);
     }
 
     let verified: boolean;
@@ -300,24 +319,24 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
         // must not let anyone switch the CAPTCHA off. It's a failed check: show the widget again.
         if (e instanceof SiteverifyRefusedError) {
             console.warn(`[turnstile] ${e.message}`);
-            return failedCheckPage(settings, request, response, queryStringData);
+            return challengeRetryPage(settings, request, response, queryStringData);
         }
         // Timeout, network error, 5xx or a bad answer: not the visitor's fault. Never forward the token to the origin.
         pause.recordError();
         console.error(`[turnstile] siteverify error: ${e instanceof Error ? e.message : String(e)}`);
-        return retryRedirect(request, queryStringData);
+        return challengeUnavailable(request, queryStringData);
     }
 
     if (verified) {
-        return sessionRedirect(settings, request, response, queryStringData, addRtiResultHeader);
+        return challengePassed(settings, request, response, queryStringData, addRtiResultHeader);
     }
 
     // Wrong, reused or expired token: show the widget again instead of a dead end.
-    return failedCheckPage(settings, request, response, queryStringData);
+    return challengeRetryPage(settings, request, response, queryStringData);
 };
 
 /** The challenge page again, with an error, for a token that did not pass. Solving it returns to the same page. */
-function failedCheckPage(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams): CloudFrontResultResponse {
+function challengeRetryPage(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams): CloudFrontResultResponse {
     return challengePage(settings, response, returnPath(request, queryStringData), "Verification failed. Please try again.");
 }
 
@@ -628,8 +647,11 @@ function challengePage(settings: ResolvedTurnstileSettings, response: RTIRespons
     };
 }
 
-/** 302 back to the page without the token and without a session: the next request is checked as usual. */
-function retryRedirect(request: CloudFrontRequest, queryStringData: URLSearchParams): CloudFrontResultResponse {
+/**
+ * Cloudflare's siteverify is down or paused, so the token can't be checked. 302 back to the page without the token and
+ * without a session: the next request is checked as usual.
+ */
+function challengeUnavailable(request: CloudFrontRequest, queryStringData: URLSearchParams): CloudFrontResultResponse {
     return {
         status: '302',
         headers: {
@@ -727,10 +749,10 @@ function ownUriReturnPath(request: CloudFrontRequest, originalUrl: string | null
 }
 
 /**
- * The 302 back to where the visitor was, with a new `_cq_se` session bound to this client (IP and User-Agent of the
+ * The challenge was solved and verified: 302 back to where the visitor was, with a new `_cq_se` session bound to this client (IP and User-Agent of the
  * reply, see sessionBindingKey). Only sent once the token is verified.
  */
-function sessionRedirect(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): CloudFrontResultResponse {
+function challengePassed(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): CloudFrontResultResponse {
     const ttl = settings.sessionTtlSeconds;
     const expiresAt = Date.now() + (ttl * 1000);
     const signature = signSession(settings.sessionSigningSecret, expiresAt, response.ids.rayId, sessionBindingKey(settings, request));
@@ -791,7 +813,7 @@ const turnstileValidateChallengeExample = async (settings: ResolvedTurnstileSett
                 return false; 
             }
 
-            // The only accepted spelling is the one sessionRedirect issues: `${expiresAt}` of a safe integer. Anything
+            // The only accepted spelling is the one challengePassed issues: `${expiresAt}` of a safe integer. Anything
             // else reads as a number but is not what we wrote ("123abc" for parseInt, "0123", " 123", "+123", "1e13",
             // "12.0" for Number), so the round trip rejects it; isSafeInteger rules out a value Number() rounded.
             const expiresAt = Number(expiresAtStr);

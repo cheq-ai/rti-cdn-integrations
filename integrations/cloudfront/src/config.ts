@@ -81,8 +81,14 @@ const turnstileConfig: TurnstileSettings = {
     sessionBinding: { ip: "exact", userAgent: true },
 
     // If Cloudflare's siteverify fails this many times in a row (timeout, network, 5xx; a 4xx doesn't count), the CAPTCHA is paused for
-    // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result. Counted per Lambda instance.
+    // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result.
+    // Counted per Lambda instance, not for the whole site: each instance pauses after its own 5 errors, so for a few
+    // seconds some visitors may still get the CAPTCHA while others pass. See "Siteverify pause" in the README.
     // 0 turns the pause off: during an outage visitors get the CAPTCHA again, but it is never skipped.
+    // What to do when siteverify is down:
+    //   fail open:   1 or more - the CAPTCHA is skipped after that many errors in a row (1 = right away,
+    //                            5 = the default: visitors retry first)
+    //   fail closed: 0         - never skipped; visitors keep getting the CAPTCHA until Cloudflare is back
     siteverifyErrorsToPause: 5,
     siteverifyPauseSeconds: 60,
 };

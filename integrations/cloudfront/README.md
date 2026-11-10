@@ -843,9 +843,38 @@ so a copied cookie does not work elsewhere; see [Session binding](#session-bindi
 many times in a row (timeout, network error, 5xx or a body that is not JSON), the CAPTCHA is paused for that many
 seconds and challenged traffic is forwarded with `x-cheq-rti-result`. A siteverify answer (even a rejected token) resets
 the count. A 4xx (e.g. a 429 rate limit) never counts: it is shown as a failed check, so flooding junk tokens can't
-switch the CAPTCHA off. Counted per Lambda instance. `siteverifyErrorsToPause: 0` turns the pause off: during a Cloudflare
+switch the CAPTCHA off. `siteverifyErrorsToPause: 0` turns the pause off: during a Cloudflare
 outage visitors get the CAPTCHA again and again, but it is never skipped. `siteverifyErrorsToPause` must be a whole number
 from 0, `siteverifyPauseSeconds` from 1; any other value logs a warning and the default is used.
+
+#### Siteverify pause
+
+What to do when siteverify is down is set by `siteverifyErrorsToPause`:
+
+| Value | Behavior |
+|---|---|
+| 1 or more (fail open) | The CAPTCHA is skipped after that many errors in a row, for `siteverifyPauseSeconds`. 1 skips it right away; the default 5 lets visitors retry first. |
+| 0 (fail closed) | The CAPTCHA is never skipped: visitors get it again (with a retry, not a 403) until Cloudflare is back. |
+
+**The count is per Lambda instance, not for the whole site.** CloudFront runs your Lambda as many separate instances
+(several in each edge region), and they share no memory. Each one counts its own siteverify errors and pauses on its own.
+
+What visitors see during a siteverify outage:
+
+1. The first visitors on each instance solve the CAPTCHA, are sent back to the page without a session, and get the
+   CAPTCHA again.
+2. After 5 errors (the default) on an instance, that instance pauses: its challenged visitors pass, with `x-cheq-rti-result`.
+3. In a real outage every busy instance reaches 5 within seconds. Until then it is mixed: one request may pass on a
+   paused instance and the next get the CAPTCHA on another.
+4. After `siteverifyPauseSeconds` each instance tries siteverify again; if it still fails, it pauses again after 5 errors.
+
+This is the usual way a "stop calling a failing service" switch works in serverless code. Sharing one count between
+instances would need a store such as a DynamoDB global table, read on every challenged request, with its own latency,
+cost and failure modes. That is not worth it for an outage that lasts minutes.
+
+**Known limit:** if all of Cloudflare is down, the Turnstile widget itself does not load. No token is sent, siteverify is
+never called and the pause never starts, so visitors stay on a CAPTCHA they can't solve. This is the same for any CAPTCHA
+vendor outage. A fallback would have to trust the browser ("the widget failed"), which a bot can fake.
 
 **Only `GET` and `HEAD` are challenged.** A challenge page can't carry a request body through its redirect, so a `POST`,
 `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict is forwarded with `x-cheq-rti-result` instead (login, checkout,

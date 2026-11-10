@@ -411,7 +411,7 @@ describe('validateChallenge', () => {
         });
     });
 
-    // --- Session format: exactly "{expiresAt}.{signature}", and only the expiry spelling sessionRedirect issues ---
+    // --- Session format: exactly "{expiresAt}.{signature}", and only the expiry spelling challengePassed issues ---
 
     describe('strict session format', () => {
         // A correct signature for any expiry, so a rejection can only come from the format checks.
@@ -546,7 +546,7 @@ describe('validateChallenge', () => {
             });
         });
 
-        it('accepts what sessionRedirect actually issues', async () => {
+        it('accepts what challengePassed actually issues', async () => {
             // Arrange
             const { cookie, expiresAt } = await issueSession('ray-issued');
 
@@ -901,6 +901,36 @@ describe('challenge', () => {
         expect(result.body).toContain('Verification failed. Please try again.');
         expect(result.body).toContain('name="original_url" value="/target?a=1"');
         expect(result.body).not.toContain('valid-token');
+    });
+
+    describe('token length', () => {
+        const replyWithToken = (token: string) =>
+            buildTurnstileRequest(new URLSearchParams({ 'cf-turnstile-response': token, 'original_url': '/target?a=1' }).toString(), 'example.com');
+
+        it('a token longer than 2048 characters shows the widget again, without calling siteverify', async () => {
+            const siteverify = stubSiteverify(true);
+            const result = await challenge(replyWithToken('x'.repeat(2049)), buildRTIResponse()) as any;
+            expect(result.status).toBe('403');
+            expect(result.body).toContain('Verification failed. Please try again.');
+            expect(result.body).toContain('name="original_url" value="/target?a=1"');
+            expect(result.headers['set-cookie']).toBeUndefined();
+            expect(siteverify).not.toHaveBeenCalled();
+        });
+
+        it('a token of exactly 2048 characters is still sent to siteverify', async () => {
+            const siteverify = stubSiteverify(true);
+            const result = await challenge(replyWithToken('x'.repeat(2048)), buildRTIResponse()) as any;
+            expect(siteverify).toHaveBeenCalledTimes(1);
+            expect(result.status).toBe('302');
+        });
+
+        it('too-long tokens never count toward the pause', async () => {
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 1 });
+            const siteverify = stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            for (let i = 0; i < 5; i++) await cb.challenge(replyWithToken('x'.repeat(5000)), buildRTIResponse());
+            expect(siteverify).not.toHaveBeenCalled();
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
     });
 
     describe('siteverify pause', () => {
