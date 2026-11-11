@@ -271,22 +271,87 @@ export class RTIStatelessUtils {
   }
 
   /**
-   * `JSON.stringify(payload)` for a debug log, with `endUserParams.headers` redacted ({@link redactHeaderValue}).
+   * The page the visitor came from, when it is on this site: the Referer's path and query (without `?`). `undefined`
+   * when there is no Referer, it is on another host, or it is not a URL. Used to build a CAPTCHA page for a request
+   * with a body, so the visitor is back on the form after solving it.
+   * @param referer the Referer header value
+   * @param host the request's Host header value
+   */
+  sameSiteReferer(referer: string | null | undefined, host: string | null | undefined): { path: string; query: string } | undefined {
+    const ownHost = RTIStatelessUtils.normalizeHost(host);
+    if (!referer || !ownHost) {
+      return undefined;
+    }
+    try {
+      const url = new URL(referer);
+      if (RTIStatelessUtils.normalizeHost(url.host) !== ownHost) {
+        return undefined;
+      }
+      return { path: url.pathname, query: url.search.replace(/^\?/, '') };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The query parameter that carries the Turnstile token when the challenge page's form is submitted. */
+  static readonly TURNSTILE_RESPONSE_QUERY_PARAM = 'cf-turnstile-response';
+
+  /** Query parameters whose value is a secret: the Turnstile token (single use, but a credential until it is spent). */
+  private static readonly SECRET_QUERY_PARAMS = new Set([RTIStatelessUtils.TURNSTILE_RESPONSE_QUERY_PARAM]);
+
+  /**
+   * A secret as it may be logged: its first and last 4 characters (`abcd****wxyz`), enough to match two log lines
+   * but not to use it. A value of 12 characters or less is all `****`, so a short secret is never mostly shown.
+   */
+  maskSecret(value: string): string {
+    return value.length > 12 ? `${value.slice(0, 4)}****${value.slice(-4)}` : '****';
+  }
+
+  /**
+   * A raw query string (no leading `?`) as it may be logged: the secret parameters' values masked
+   * ({@link maskSecret}), everything else kept exactly as received.
+   */
+  redactQueryString(querystring: string): string {
+    return querystring.replace(/(^|&)([^=&]*)=([^&]*)/g, (match, separator: string, name: string, value: string) =>
+      RTIStatelessUtils.SECRET_QUERY_PARAMS.has(name) ? `${separator}${name}=${this.maskSecret(value)}` : match);
+  }
+
+  /** A URL as it may be logged: its query string redacted ({@link redactQueryString}). */
+  redactUrl(url: string): string {
+    const queryStart = url.indexOf('?');
+    if (queryStart < 0) {
+      return url;
+    }
+    const hashStart = url.indexOf('#', queryStart);
+    const queryEnd = hashStart < 0 ? url.length : hashStart;
+    return url.slice(0, queryStart + 1) + this.redactQueryString(url.slice(queryStart + 1, queryEnd)) + url.slice(queryEnd);
+  }
+
+  /**
+   * `JSON.stringify(payload)` for a debug log, redacted: `apiKey` and `tagHash` masked ({@link maskSecret}),
+   * `endUserParams.headers` ({@link redactHeaderValue}) and the token in `endUserParams.requestUrl` ({@link redactUrl}).
    * Only the log changes: `payload` is neither changed nor copied deeply, and the real one is still sent to RTI.
    * `duidCookie`, `pvidCookie` and `sCookie` are kept: they are CHEQ's own ids, needed to debug RTI.
    *
    * @param payload the RTI request about to be sent
    */
   stringifyRedactedPayload(payload: RTIRequest): string {
-    const headers = payload.endUserParams?.headers;
-    if (!headers) {
-      return JSON.stringify(payload);
-    }
-    const redacted: RequestHeaders = {};
-    for (const [name, value] of Object.entries(headers)) {
-      redacted[name] = typeof value === 'string' ? this.redactHeaderValue(name, value) : value;
-    }
-    return JSON.stringify({ ...payload, endUserParams: { ...payload.endUserParams, headers: redacted } });
+    return JSON.stringify(payload, (key, value) => {
+      if ((key === 'apiKey' || key === 'tagHash') && typeof value === 'string') {
+        return this.maskSecret(value);
+      }
+      if (key === 'requestUrl' && typeof value === 'string') {
+        return this.redactUrl(value);
+      }
+      if (key === 'headers' && value && typeof value === 'object' && !Array.isArray(value)) {
+        const redacted: RequestHeaders = {};
+        for (const [name, headerValue] of Object.entries(value as RequestHeaders)) {
+          redacted[name] = typeof headerValue === 'string' ? this.redactHeaderValue(name, headerValue) : headerValue;
+        }
+        return redacted;
+      }
+      return value;
+    });
   }
 
   /**

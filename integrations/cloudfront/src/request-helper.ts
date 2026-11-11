@@ -6,7 +6,7 @@ import { RTIHttpsService } from "../../core/services/rti-https.service";
 import { RTIHelperService } from "../../core/services/rti-helper.service";
 import { name, version } from "../package.json";
 import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
-import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfront';
+import { CloudFrontHeaders, CloudFrontRequest, CloudFrontResultResponse } from 'aws-lambda/common/cloudfront';
 import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Mode } from '../../core/models/mode.model';
@@ -14,6 +14,7 @@ import { Ids, RTIResponse } from '../../core/models/rti-response.model';
 import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers';
 import { randomUUID } from 'node:crypto';
 import { stringifyRedactedEvent } from './log-redaction';
+import { ResponseHeaders } from './response-headers';
 
 export enum RequestType {
   VIEWER_REQUEST,
@@ -23,6 +24,14 @@ export enum RequestType {
 const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIHttpsService(config);
+
+// Our block, 404 and redirect answers are never cached.
+const responseHeaders = new ResponseHeaders();
+
+// Once per cold start: a typo in actionOnSuspicious is ALLOW at run time, so say what to fix.
+for (const problem of rtiHelperService.validateActionOnSuspicious()) {
+    console.warn(`[config] ${problem} (counts as ALLOW)`);
+}
 
 // Once per cold start: without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING
 // mode it is handled like any request (e.g. forwarded with the form fields when RTI allows it).
@@ -44,6 +53,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
 
     // Safe: CloudFront always provides exactly one record with this structure when invoking Lambda@Edge.
     // Would only throw if invoked directly (not via CloudFront), which should not happen in production.
+    // The original request, as the visitor's browser sent it. Checked by RTI and for a session, and forwarded to the origin.
     const cfRequest : CloudFrontRequest = event.Records[0].cf.request;
 
     // A client must not be able to hand the origin its own verdict: on paths that return without one (ignored
@@ -119,7 +129,14 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
-        const actionStrategy = action !== Action.ALLOW ? rtiHelperService.getActionStrategy(action) : null;
+        // RTI's action as a strategy. A request with a body is never challenged in place: config.actionOnSuspicious
+        // decides (see getStrategyForRequest).
+        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, cfRequest.method, requestURL.pathname);
+        // Set only when actionOnSuspicious decided: a request with a body and a CAPTCHA verdict.
+        if (isDebugEnabled && actionOnSuspicious !== undefined) {
+            console.log(`${cfRequest.method} request: actionOnSuspicious says ${Action[actionOnSuspicious]}`);
+        }
+
 
         if (isDebugEnabled && action !== Action.ALLOW) {
             console.log(`action strategy: ${actionStrategy !== null ? `${ActionStrategy[actionStrategy]} (${actionStrategy})` : "none (should not happen)"} `);
@@ -142,23 +159,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         if (action !== Action.ALLOW) {
             switch (actionStrategy) {
                 case ActionStrategy.ACCESS_DENIED:
-                    return {
-                        status: '403',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
-                        body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids, getCfRequestId(event)),
-                    };
+                    return blockPage('403', 'Access Denied', event, rtiResponse);
                 case ActionStrategy.NOT_FOUND:
-                    return {
-                        status: '404',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
-                        body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids, getCfRequestId(event)),
-                    };
+                    return blockPage('404', 'Not Found', event, rtiResponse);
                 case ActionStrategy.REDIRECT:
                     const headers: CloudFrontHeaders = {
                         'x-cheq-cdn-request-id': [{ key: 'x-cheq-cdn-request-id', value: getCfRequestId(event) }],
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
                         'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
+                        ...responseHeaders.noStore(),
                     };
                     return {
                         status: '302',
@@ -176,7 +186,12 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                                 }
                                 break;
                             }
-                            const challengeResult = await config.challenge(cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+                            // On a request with no body (GET, HEAD), the request is challenged in place (forward to the original requested page).
+                            // On a request with a body (POST, PUT, PATCH, DELETE, OPTIONS), the visitor is redirected to the page they came from (the Referer, same site only) or to the site's home page if there is no usable Referer.
+                            // The body is not kept (this is why we redirect to the Referer): the visitor can resubmit it after solving the challenge.
+                            const afterChallengeRequest = rtiHelperService.isBodylessMethod(cfRequest.method) ? cfRequest : refererAfterChallengeRequest(cfRequest);
+
+                            const challengeResult = await config.challenge(afterChallengeRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
                             return challengeResult;
                         }
                         break;
@@ -321,6 +336,28 @@ function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): Req
     }
     
     return result;
+}
+
+/**
+ * The request the visitor makes after passing the challenge, when a request with a body is challenged (actionOnSuspicious CHALLENGE):
+ * a GET for the page the visitor came from (the Referer, same host only), so after solving they are back on the form
+ * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the site's home page
+ * ("/"): an address on another site is never used, so the CAPTCHA can't be turned into an open redirect.
+ * The body is not kept. The real request is not changed: it is still the one checked for a session.
+ */
+function refererAfterChallengeRequest(request: CloudFrontRequest): CloudFrontRequest {
+    const { body: _body, ...withoutBody } = request;
+    const referer = rtiHelperService.sameSiteReferer(request.headers['referer']?.[0]?.value, request.headers['host']?.[0]?.value);
+    return { ...withoutBody, method: 'GET', uri: referer?.path ?? '/', querystring: referer?.query ?? '' };
+}
+
+// Our own 403 or 404 page for a blocked request.
+function blockPage(status: '403' | '404', title: string, event: CloudFrontRequestEvent, rtiResponse: RTIResponse): CloudFrontResultResponse {
+    return {
+        status,
+        headers: responseHeaders.html(),
+        body: generateDefaultBlockPage(status, title, rtiResponse.ids, getCfRequestId(event)),
+    };
 }
 
 function getCfRequestId(event: CloudFrontRequestEvent): string {

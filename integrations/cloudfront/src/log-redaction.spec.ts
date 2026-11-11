@@ -1,6 +1,6 @@
 // cspell:ignore cheq
 // The redaction rules (cookieNames, redactHeaderValue, the RTI payload) are tested in core's rti-stateless-utils.spec.ts.
-// This covers only what is CloudFront's: the event's `name → [{ key, value }]` header shape.
+// This covers only what is CloudFront's: the event's `name → [{ key, value }]` header shape and its querystring.
 import { describe, it, expect } from 'vitest';
 import type { CloudFrontRequestEvent } from 'aws-lambda';
 import { stringifyRedactedEvent } from './log-redaction';
@@ -8,8 +8,8 @@ import { RTIStatelessUtils } from '../../core/services/rti-stateless-utils';
 
 const utils = new RTIStatelessUtils();
 
-const buildEvent = (headers: Record<string, unknown>) => ({
-    Records: [{ cf: { config: { requestId: 'req-1' }, request: { clientIp: '1.2.3.4', method: 'GET', uri: '/', querystring: '', headers } } }],
+const buildEvent = (headers: Record<string, unknown>, querystring = '') => ({
+    Records: [{ cf: { config: { requestId: 'req-1' }, request: { clientIp: '1.2.3.4', method: 'GET', uri: '/', querystring, headers } } }],
 }) as unknown as CloudFrontRequestEvent;
 
 describe('stringifyRedactedEvent', () => {
@@ -130,6 +130,35 @@ describe('stringifyRedactedEvent', () => {
 
         // Assert
         expect(customHeaders['x-origin-verify'][0].value).toBe('shared-secret');
+    });
+
+    it('masks the Turnstile token in the querystring: first and last 4 characters only, the rest kept as received', () => {
+        // Arrange
+        const token = '0.AbCdEfGhIjKlMnOpQrStUvWxYz-123456789';
+        const event = buildEvent({}, `original_url=%2Fcart%3Fa%3D1&request_id=r1&cf-turnstile-response=${token}&gclid=abc`);
+
+        // Act
+        const logged = stringifyRedactedEvent(event, utils);
+
+        // Assert
+        expect(logged).not.toContain(token);
+        expect(JSON.parse(logged).Records[0].cf.request.querystring)
+            .toBe('original_url=%2Fcart%3Fa%3D1&request_id=r1&cf-turnstile-response=0.Ab****6789&gclid=abc');
+        expect(event.Records[0].cf.request.querystring).toContain(token);
+    });
+
+    it.each([
+        ['a short token', 'cf-turnstile-response=short', 'cf-turnstile-response=****'],
+        ['an empty token', 'cf-turnstile-response=', 'cf-turnstile-response=****'],
+        ['the token first', 'cf-turnstile-response=0.AbCdEfGhIjKlMn&a=1', 'cf-turnstile-response=0.Ab****KlMn&a=1'],
+        ['a parameter that only ends with the name', 'x-cf-turnstile-response=keep-this-value-1234', 'x-cf-turnstile-response=keep-this-value-1234'],
+        ['no secret parameter', 'gclid=abc&utm_source=x', 'gclid=abc&utm_source=x'],
+    ])('querystring with %s', (_label, querystring, expected) => {
+        // Act
+        const logged = JSON.parse(stringifyRedactedEvent(buildEvent({}, querystring), utils));
+
+        // Assert
+        expect(logged.Records[0].cf.request.querystring).toBe(expected);
     });
 
     it('leaves a "headers" key that is not a map alone', () => {

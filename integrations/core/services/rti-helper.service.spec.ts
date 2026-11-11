@@ -313,6 +313,149 @@ describe('RTIHelperService', () => {
   // #endregion getActionStrategy Method Tests
 
   // #region validateConfig Method Tests
+  describe('isBodylessMethod', () => {
+    test.each(['GET', 'HEAD', 'get', 'Head'])('%s can get the CAPTCHA in place', (method) => {
+      expect(new RTIHelperService({} as any).isBodylessMethod(method)).toBe(true);
+    });
+
+    test.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'post'])('%s can not (it has a body)', (method) => {
+      expect(new RTIHelperService({} as any).isBodylessMethod(method)).toBe(false);
+    });
+  });
+
+  describe('getStrategyForRequest', () => {
+    const svc = (config: any = {}) => new RTIHelperService(config);
+
+    test('ALLOW is null (forward), for every method', () => {
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'GET', '/x')).toEqual({ strategy: null });
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'POST', '/x')).toEqual({ strategy: null });
+    });
+
+    test('maps RTI\'s action like getActionStrategy for GET and HEAD, whatever actionOnSuspicious says', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { rules: [{ path: '.*', action: Action.ALLOW }] } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'GET', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.REDIRECT, 'GET', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT });
+    });
+
+    test.each([Action.BLOCK, Action.REDIRECT])('%s on a body method is kept: actionOnSuspicious is only for a CAPTCHA', (action) => {
+      const s = svc({ actionOnSuspicious: { methods: { POST: Action.ALLOW } } });
+      expect(s.getStrategyForRequest(action, 'POST', '/x')).toEqual({ strategy: s.getActionStrategy(action) });
+    });
+
+    test('a CHALLENGE on a body method with nothing set: forward, and says ALLOW decided it', () => {
+      expect(svc().getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a CHALLENGE on a body method follows actionOnSuspicious, mapped like any Action', () => {
+      const s = svc({
+        blockingStrategy: ActionStrategy.NOT_FOUND,
+        actionOnSuspicious: { methods: { POST: Action.BLOCK, PUT: Action.REDIRECT, PATCH: Action.CHALLENGE, DELETE: Action.ALLOW } },
+      });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: Action.BLOCK });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PUT', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PATCH', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA, actionOnSuspicious: Action.CHALLENGE });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'DELETE', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a BLOCK shown as a CAPTCHA (blockingStrategy CAPTCHA) on a body method also follows actionOnSuspicious', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { methods: { POST: Action.REDIRECT } } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'POST', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+    });
+
+    test('uses the path for rules', () => {
+      const s = svc({ actionOnSuspicious: { rules: [{ path: '^/login$', action: Action.BLOCK }] } });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/login').strategy).toBe(ActionStrategy.ACCESS_DENIED);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/search').strategy).toBeNull();
+    });
+  });
+
+  describe('getActionOnSuspicious', () => {
+    const svc = (actionOnSuspicious?: any) => new RTIHelperService({ actionOnSuspicious } as any);
+
+    test('every method is ALLOW when nothing is set', () => {
+      for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+        expect(svc().getActionOnSuspicious(method, '/x')).toBe(Action.ALLOW);
+      }
+    });
+
+    test('uses the method default; a method not listed is ALLOW', () => {
+      const s = svc({ methods: { POST: Action.BLOCK, PUT: Action.CHALLENGE } });
+      expect(s.getActionOnSuspicious('POST', '/x')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('PUT', '/x')).toBe(Action.CHALLENGE);
+      expect(s.getActionOnSuspicious('DELETE', '/x')).toBe(Action.ALLOW);
+    });
+
+    test('matches the method in any case', () => {
+      expect(svc({ methods: { POST: Action.BLOCK } }).getActionOnSuspicious('post', '/x')).toBe(Action.BLOCK);
+    });
+
+    test('a matching rule wins over the method default; the first match wins', () => {
+      const s = svc({
+        methods: { POST: Action.ALLOW },
+        rules: [
+          { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+          { path: '^/log', action: Action.BLOCK },
+        ],
+      });
+      expect(s.getActionOnSuspicious('POST', '/login')).toBe(Action.CHALLENGE);
+      expect(s.getActionOnSuspicious('PUT', '/login')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/logout')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/search')).toBe(Action.ALLOW);
+    });
+
+    test('a rule with methods applies only to them', () => {
+      const s = svc({ rules: [{ path: '^/api/', methods: ['DELETE'], action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious('DELETE', '/api/item')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/api/item')).toBe(Action.ALLOW);
+    });
+
+    test('a rule with a bad regex never matches; the next rule or the default is used', () => {
+      const s = svc({ methods: { POST: Action.REDIRECT }, rules: [{ path: '([', action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious('POST', '/x')).toBe(Action.REDIRECT);
+    });
+
+    test.each(['GET', 'HEAD', 'CONNECT', 'TRACE'])('%s is always ALLOW here (not a body method)', (method) => {
+      const s = svc({ rules: [{ path: '.*', action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious(method, '/x')).toBe(Action.ALLOW);
+    });
+
+    test.each([undefined, 'BLOCK', 99, -1, null])('a value that is not an Action (%j) is ALLOW, so a typo never blocks', (value) => {
+      expect(svc({ methods: { POST: value } }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
+      expect(svc({ rules: [{ path: '.*', action: value }] }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
+    });
+  });
+
+  describe('validateActionOnSuspicious', () => {
+    test('no problems for a valid setting, or none at all', () => {
+      expect(new RTIHelperService({} as any).validateActionOnSuspicious()).toEqual([]);
+      expect(new RTIHelperService({ actionOnSuspicious: {
+        methods: { POST: Action.CHALLENGE, OPTIONS: Action.ALLOW },
+        rules: [{ path: '^/login$', methods: ['POST'], action: Action.BLOCK }],
+      } } as any).validateActionOnSuspicious()).toEqual([]);
+    });
+
+    test('names every problem: an unknown method, a value that is not an Action, a bad regex', () => {
+      const problems = new RTIHelperService({ actionOnSuspicious: {
+        methods: { GET: Action.BLOCK, POST: 'BLOCK' },
+        rules: [{ path: '([', methods: ['HEAD'], action: 7 }],
+      } } as any).validateActionOnSuspicious();
+      expect(problems).toEqual([
+        "actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        'actionOnSuspicious.methods.POST: "BLOCK" is not an Action',
+        "actionOnSuspicious.rules[0].path: '([' is not a valid regex",
+        "actionOnSuspicious.rules[0].methods: 'HEAD' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        'actionOnSuspicious.rules[0].action: 7 is not an Action',
+      ]);
+    });
+
+    test('validateConfig includes these problems', () => {
+      const svc = new RTIHelperService({ actionOnSuspicious: { methods: { POST: 9 } } } as any);
+      expect(svc.validateConfig()).toContain('actionOnSuspicious.methods.POST: 9 is not an Action');
+    });
+  });
+
   describe('validateConfig', () => {
     test('returns error when redirectReasons defined but redirectLocation is not', () => {
       // Arrange

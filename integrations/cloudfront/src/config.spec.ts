@@ -2,6 +2,7 @@
 // vi.resetModules(), because config.ts calls createTurnstileChallenge (and may warn) while it loads.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Mode } from '../../core/models/mode.model';
+import { Action } from '../../core/models/action.model';
 
 // vi.importActual, not import(): the package compiles with module es2015, which has no dynamic import.
 // Its dependencies still go through vi.doMock.
@@ -45,11 +46,22 @@ describe('shipped config.ts', () => {
             sessionSigningSecret: 'REPLACE_ME',
             sessionTtlSeconds: 300,
             sessionBinding: { ip: 'exact', userAgent: true },
+            siteverifyErrorsToPause: 3,
+            siteverifyPauseSeconds: 60,
         });
         expect(config.challenge).toBe(challenge);
         expect(config.validateChallenge).toBe(validateChallenge);
         expect(config.isChallengeResponse).toBe(isChallengeResponse);
         expect('handleChallengeReply' in config).toBe(false);
+    });
+
+    it('ships actionOnSuspicious with ALLOW for every body method and no rules: nothing changes until set', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const config = await loadConfig();
+        expect(config.actionOnSuspicious).toEqual({
+            methods: { POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW },
+            rules: [],
+        });
     });
 
     it('ships safe defaults', async () => {

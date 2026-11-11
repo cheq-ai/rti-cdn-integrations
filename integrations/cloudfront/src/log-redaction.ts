@@ -25,6 +25,7 @@ function redactCloudFrontHeaders(headers: Record<string, unknown>, redact: (name
 
 /**
  * `JSON.stringify(event)` for the debug log, redacted while serializing, so `event` is neither changed nor copied:
+ * - `querystring` by `utils.redactQueryString`: the Turnstile token shows only its first and last 4 characters.
  * - `headers` (the viewer's request headers) by `utils.redactHeaderValue`: cookie names only, `[REDACTED]` for the
  *   session token and credentials. The handler passes its RTIHelperService, which is an RTIStatelessUtils.
  * - `customHeaders` (origin-request only: the headers the operator configured for the origin, in `origin.custom` or
@@ -33,6 +34,9 @@ function redactCloudFrontHeaders(headers: Record<string, unknown>, redact: (name
  */
 export function stringifyRedactedEvent(event: CloudFrontRequestEvent, utils: RTIStatelessUtils): string {
     return JSON.stringify(event, (key, nested) => {
+        if (key === 'querystring' && typeof nested === 'string') {
+            return utils.redactQueryString(nested);
+        }
         if (!nested || typeof nested !== 'object' || Array.isArray(nested)) {
             return nested;
         }
