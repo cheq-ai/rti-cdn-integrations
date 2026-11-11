@@ -839,7 +839,7 @@ The settings live in the `turnstileConfig` block at the top of [`src/config.ts`]
 so a copied cookie does not work elsewhere; see [Session binding](#session-binding). `ip` is `"exact"` or `"none"`,
 `userAgent` is `true` or `false`; any other value logs a warning and the default is used.
 
-`siteverifyErrorsToPause` (default 5) and `siteverifyPauseSeconds` (default 60): when Cloudflare's siteverify fails that
+`siteverifyErrorsToPause` (default 3) and `siteverifyPauseSeconds` (default 60): when Cloudflare's siteverify fails that
 many times in a row (timeout, network error, 5xx or a body that is not JSON), the CAPTCHA is paused for that many
 seconds and challenged traffic is forwarded with `x-cheq-rti-result`. A siteverify answer (even a rejected token) resets
 the count. A 4xx (e.g. a 429 rate limit) never counts: it is shown as a failed check, so flooding junk tokens can't
@@ -853,20 +853,21 @@ What to do when siteverify is down is set by `siteverifyErrorsToPause`:
 
 | Value | Behavior |
 |---|---|
-| 1 or more (fail open) | The CAPTCHA is skipped after that many errors in a row, for `siteverifyPauseSeconds`. 1 skips it right away; the default 5 lets visitors retry first. |
-| 0 (fail closed) | The CAPTCHA is never skipped: visitors get it again (with a retry, not a 403) until Cloudflare is back. |
+| 1 or more (fail open) | The CAPTCHA is skipped after that many errors in a row, for `siteverifyPauseSeconds`. 1 skips it right away; the default 3 lets visitors retry first. |
+| 0 (fail closed) | The CAPTCHA is never skipped: visitors get it again, with "We couldn't verify you right now. Please try again.", until Cloudflare is back. |
 
 **The count is per Lambda instance, not for the whole site.** CloudFront runs your Lambda as many separate instances
 (several in each edge region), and they share no memory. Each one counts its own siteverify errors and pauses on its own.
 
 What visitors see during a siteverify outage:
 
-1. The first visitors on each instance solve the CAPTCHA, are sent back to the page without a session, and get the
-   CAPTCHA again.
-2. After 5 errors (the default) on an instance, that instance pauses: its challenged visitors pass, with `x-cheq-rti-result`.
-3. In a real outage every busy instance reaches 5 within seconds. Until then it is mixed: one request may pass on a
+1. The first visitors on each instance solve the CAPTCHA and get it again, with "We couldn't verify you right now.
+   Please try again." (not "Verification failed": it isn't their fault).
+2. The error that reaches the limit (3 by default) pauses that instance: that visitor is sent back to the page and passes,
+   and so do its other challenged visitors during the pause, with `x-cheq-rti-result`. With `1` this is the first error.
+3. In a real outage every busy instance reaches 3 within seconds. Until then it is mixed: one request may pass on a
    paused instance and the next get the CAPTCHA on another.
-4. After `siteverifyPauseSeconds` each instance tries siteverify again; if it still fails, it pauses again after 5 errors.
+4. After `siteverifyPauseSeconds` each instance tries siteverify again; if it still fails, it pauses again after 3 errors.
 
 This is the usual way a "stop calling a failing service" switch works in serverless code. Sharing one count between
 instances would need a store such as a DynamoDB global table, read on every challenged request, with its own latency,
@@ -876,10 +877,37 @@ cost and failure modes. That is not worth it for an outage that lasts minutes.
 never called and the pause never starts, so visitors stay on a CAPTCHA they can't solve. This is the same for any CAPTCHA
 vendor outage. A fallback would have to trust the browser ("the widget failed"), which a bot can fake.
 
-**Only `GET` and `HEAD` are challenged.** A challenge page can't carry a request body through its redirect, so a `POST`,
-`PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict is forwarded with `x-cheq-rti-result` instead (login, checkout,
-a bank's 3D Secure return). Blocks, 404s and redirects still apply to every method. To protect form submits, challenge
-the page that shows the form, or act on `x-cheq-rti-result` in the origin.
+**Only `GET` and `HEAD` are challenged in place.** A challenge page can't carry a request body through its redirect
+(login, checkout, a bank's 3D Secure return). For a `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict,
+`actionOnSuspicious` says what to do instead. Blocks, 404s and redirects from RTI still apply to every method.
+
+#### actionOnSuspicious
+
+| Action | What a request with a body gets |
+|---|---|
+| `Action.ALLOW` (default for every method) | Forwarded with `x-cheq-rti-result`, so the origin decides. |
+| `Action.CHALLENGE` | The CAPTCHA page, built for the page the visitor came from (the `Referer`, same site only; without one, the request's own URL). After solving they are back on that page and send the form again. The body itself is not kept. A visitor with a valid session is not challenged: the request is forwarded. |
+| `Action.BLOCK` | The `blockingStrategy` answer (403 by default, or 404). |
+| `Action.REDIRECT` | A 302 to `redirectLocation`. |
+
+```ts
+actionOnSuspicious: {
+    methods: { POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW },
+    rules: [
+        { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }, // login form: CAPTCHA, then log in again
+        { path: '^/api/', action: Action.BLOCK },                          // every body method under /api/
+    ],
+},
+```
+
+- `methods` is the default per method. A method left out is `ALLOW`.
+- `rules` match the path with a regex (like `ignorePaths`) and, optionally, a list of methods. They are checked in
+  order; the first match wins over `methods`.
+- `OPTIONS` is the browser's CORS preflight, sent before a cross-site call. Blocking or challenging it breaks that call.
+- A typo (a method that isn't one of these five, a value that isn't an `Action`, a bad regex) is logged as a warning once
+  per cold start and counts as `ALLOW`, so it never blocks by mistake.
+- On origin-request, `CHALLENGE` needs the viewer's `Referer` in the origin request policy (the default policy forwards
+  all viewer headers). Without it, the CAPTCHA page is built for the request's own URL.
 
 `config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 

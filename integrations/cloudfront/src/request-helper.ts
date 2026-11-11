@@ -28,8 +28,10 @@ const rtiService = new RTIHttpsService(config);
 // Our block, 404 and redirect answers are never cached.
 const responseHeaders = new ResponseHeaders();
 
-// Methods that can get the CAPTCHA page without losing the request.
-const CHALLENGEABLE_METHODS = ["GET", "HEAD"];
+// Once per cold start: a typo in actionOnSuspicious is ALLOW at run time, so say what to fix.
+for (const problem of rtiHelperService.validateActionOnSuspicious()) {
+    console.warn(`[config] ${problem} (counts as ALLOW)`);
+}
 
 // Once per cold start: without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING
 // mode it is handled like any request (e.g. forwarded with the form fields when RTI allows it).
@@ -51,6 +53,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
 
     // Safe: CloudFront always provides exactly one record with this structure when invoking Lambda@Edge.
     // Would only throw if invoked directly (not via CloudFront), which should not happen in production.
+    // The original request, as the visitor's browser sent it. Checked by RTI and for a session, and forwarded to the origin.
     const cfRequest : CloudFrontRequest = event.Records[0].cf.request;
 
     // A client must not be able to hand the origin its own verdict: on paths that return without one (ignored
@@ -126,7 +129,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
-        const actionStrategy = action !== Action.ALLOW ? rtiHelperService.getActionStrategy(action) : null;
+        //todo: move rtistrategy to rti-helper-service
+        const rtiStrategy = action !== Action.ALLOW ? rtiHelperService.getActionStrategy(action) : null;
+
+        // A request with a body is never challenged in place: config.actionOnSuspicious decides (see getStrategyForMethod).
+        const actionStrategy = rtiHelperService.getStrategyForMethod(rtiStrategy, cfRequest.method, requestURL.pathname);
+        // Logged for every body request with a CAPTCHA verdict, also when the answer is still a CAPTCHA (CHALLENGE).
+        if (isDebugEnabled && rtiStrategy === ActionStrategy.CAPTCHA && !rtiHelperService.isBodylessMethod(cfRequest.method)) {
+            console.log(`${cfRequest.method} request: actionOnSuspicious gives ${actionStrategy !== null ? ActionStrategy[actionStrategy] : "ALLOW (forward)"}`);
+        }
+
 
         if (isDebugEnabled && action !== Action.ALLOW) {
             console.log(`action strategy: ${actionStrategy !== null ? `${ActionStrategy[actionStrategy]} (${actionStrategy})` : "none (should not happen)"} `);
@@ -165,14 +177,6 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         headers,
                     };
                 case ActionStrategy.CAPTCHA:
-                    // A challenge can't carry a POST body through the redirect (login, payment, the bank's 3DS
-                    // return). Only GET and HEAD are challenged; other methods go on with the verdict header.
-                    if (!CHALLENGEABLE_METHODS.includes(cfRequest.method)) {
-                        if (isDebugEnabled) {
-                            console.log(`${cfRequest.method} request: CAPTCHA not applicable, forwarding with x-cheq-rti-result`);
-                        }
-                        break;
-                    }
                     try {
                         if (config.challenge) {
                             // A visitor who already solved the challenge (valid _cq_se session) is not challenged
@@ -184,7 +188,12 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                                 }
                                 break;
                             }
-                            const challengeResult = await config.challenge(cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+                            // On a request with no body (GET, HEAD), the request is challenged in place (forward to the original requested page).
+                            // On a request with a body (POST, PUT, PATCH, DELETE, OPTIONS), the visitor is redirected to the page they came from (the Referer) or to the request's own URL if there is no usable Referer.
+                            // The body is not kept (this is why we redirect to the Referer): the visitor can resubmit it after solving the challenge.
+                            const afterChallengeRequest = rtiHelperService.isBodylessMethod(cfRequest.method) ? cfRequest : refererAfterChallengeRequest(cfRequest);
+
+                            const challengeResult = await config.challenge(afterChallengeRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
                             return challengeResult;
                         }
                         break;
@@ -329,6 +338,20 @@ function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): Req
     }
     
     return result;
+}
+
+/**
+ * The request the visitor makes after passing the challenge, when a request with a body is challenged (actionOnSuspicious CHALLENGE):
+ * a GET for the page the visitor came from (the Referer, same host only), so after solving they are back on the form
+ * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the request's own URL.
+ * The body is not kept. The real request is not changed: it is still the one checked for a session.
+ */
+//todo: remove the same site referer check always use the referrer if it exists, otherwise use the request's own URL
+function refererAfterChallengeRequest(request: CloudFrontRequest): CloudFrontRequest {
+    const { body: _body, ...withoutBody } = request;
+    const getRequest: CloudFrontRequest = { ...withoutBody, method: 'GET' };
+    const referer = rtiHelperService.sameSiteReferer(request.headers['referer']?.[0]?.value, request.headers['host']?.[0]?.value);
+    return referer ? { ...getRequest, uri: referer.path, querystring: referer.query } : getRequest;
 }
 
 // Our own 403 or 404 page for a blocked request.

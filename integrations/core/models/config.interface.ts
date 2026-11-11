@@ -2,6 +2,7 @@ import { RouteToEventType } from "./route-to-event-type.model";
 import { Mode } from "./mode.model";
 import { RTIResponse } from "./rti-response.model";
 import { ActionStrategy } from "./action-strategy.model";
+import { ActionOnSuspicious } from "./action-on-suspicious.model";
 
 export interface Config {
   /**
@@ -97,6 +98,20 @@ export interface Config {
    * ```
    */
   ignorePaths?: string[];
+
+  /**
+   * What to do when RTI says CHALLENGE for a request with a body (POST, PUT, PATCH, DELETE, OPTIONS). GET and HEAD
+   * always get the CAPTCHA page. Every default is ALLOW: forwarded with `x-cheq-rti-result`.
+   * See {@link ActionOnSuspicious}.
+   * @example
+   * ```ts
+   * {
+   *   methods: { POST: Action.ALLOW, PUT: Action.BLOCK },
+   *   rules: [{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }],
+   * }
+   * ```
+   */
+  actionOnSuspicious?: ActionOnSuspicious;
 
   /**
    * List of {@link RouteToEventType} mappings

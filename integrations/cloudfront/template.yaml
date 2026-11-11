@@ -126,7 +126,6 @@ Resources:
   # tls, ja3 and ja4 CloudFront headers (AWS's has every CloudFront header up to June 2022, so no ja4). It does not change caching
   # (the cache key comes from the cache policy). For origins that break on the viewer's host, use
   # OriginRequestPolicyAllExceptHost.
-  # TODO: confirm on stage that x-cheq-rti-result reaches the origin with this policy (INCQ-10263).
   OriginRequestPolicy:
     Type: AWS::CloudFront::OriginRequestPolicy
     Properties:

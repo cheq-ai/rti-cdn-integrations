@@ -3,6 +3,7 @@ import { CloudFrontHeaders, CloudFrontRequest } from 'aws-lambda/common/cloudfro
 import { Config } from '../../core/models/config.interface';
 import { RTIResponse } from '../../core/models/rti-response.model';
 import { Mode } from '../../core/models/mode.model';
+import { Action } from '../../core/models/action.model';
 import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challenge-example';
 
 /**
@@ -82,14 +83,14 @@ const turnstileConfig: TurnstileSettings = {
 
     // If Cloudflare's siteverify fails this many times in a row (timeout, network, 5xx; a 4xx doesn't count), the CAPTCHA is paused for
     // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result.
-    // Counted per Lambda instance, not for the whole site: each instance pauses after its own 5 errors, so for a few
+    // Counted per Lambda instance, not for the whole site: each instance pauses after its own 3 errors, so for a few
     // seconds some visitors may still get the CAPTCHA while others pass. See "Siteverify pause" in the README.
     // 0 turns the pause off: during an outage visitors get the CAPTCHA again, but it is never skipped.
     // What to do when siteverify is down:
     //   fail open:   1 or more - the CAPTCHA is skipped after that many errors in a row (1 = right away,
-    //                            5 = the default: visitors retry first)
+    //                            3 = the default: visitors retry first)
     //   fail closed: 0         - never skipped; visitors keep getting the CAPTCHA until Cloudflare is back
-    siteverifyErrorsToPause: 5,
+    siteverifyErrorsToPause: 3,
     siteverifyPauseSeconds: 60,
 };
 
@@ -143,6 +144,26 @@ export const config: CloudfrontConfig = {
         '^/static/',       // Generic static directory
         '^/assets/',       // Generic assets directory
     ],
+
+    // What to do when RTI says CHALLENGE for a request with a body. A CAPTCHA page can't carry the body through,
+    // so these requests are never challenged in place. GET and HEAD always get the CAPTCHA page.
+    //   Action.ALLOW:     forwarded with x-cheq-rti-result, so the origin decides (the default for every method)
+    //   Action.CHALLENGE: the CAPTCHA, for the page the visitor came from (Referer); after solving they send the form again
+    //   Action.BLOCK:     the blockingStrategy answer (403 by default)
+    //   Action.REDIRECT:  a 302 to redirectLocation
+    actionOnSuspicious: {
+        methods: {
+            POST: Action.ALLOW,    // forms, logins, checkout, API calls
+            PUT: Action.ALLOW,     // API calls
+            PATCH: Action.ALLOW,   // API calls
+            DELETE: Action.ALLOW,  // API calls
+            OPTIONS: Action.ALLOW, // CORS preflight: blocking it breaks the site's own cross-site API calls
+        },
+        // Per path (regex, like ignorePaths) and method. The first matching rule wins over the defaults above.
+        rules: [
+            // { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+        ],
+    },
         
     timeout: 2000,
     debug: false, // Set to true to enable debug logging, false for production

@@ -46,6 +46,11 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 getActionStrategy: mocks.getActionStrategy,
                 getEventType: mocks.getEventType,
                 validateConfig: vi.fn().mockReturnValue([]),
+                validateActionOnSuspicious: realInstance.validateActionOnSuspicious.bind(realInstance),
+                getActionOnSuspicious: realInstance.getActionOnSuspicious.bind(realInstance),
+                getStrategyForMethod: realInstance.getStrategyForMethod.bind(realInstance),
+                isBodylessMethod: realInstance.isBodylessMethod.bind(realInstance),
+                sameSiteReferer: realInstance.sameSiteReferer.bind(realInstance),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
                 stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
                 cookieNames: realInstance.cookieNames.bind(realInstance),
@@ -619,6 +624,130 @@ describe('request-helper handle', () => {
 
         // Assert
         expect(result.status).toBe(status);
+    });
+
+    describe('actionOnSuspicious: what a request with a body gets on a CAPTCHA verdict', () => {
+        // The real mapping: CHALLENGE to the CAPTCHA, BLOCK to a 403, REDIRECT to a redirect.
+        const realStrategies = () => mocks.getActionStrategy.mockImplementation((a: Action) =>
+            a === Action.CHALLENGE ? ActionStrategy.CAPTCHA : a === Action.BLOCK ? ActionStrategy.ACCESS_DENIED : a === Action.REDIRECT ? ActionStrategy.REDIRECT : null);
+        const post = (uri = '/login', extraHeaders: Record<string, string> = {}) =>
+            buildEvent(uri, 'example.com', '1.2.3.4', 'step=2', '', { method: 'POST', extraHeaders });
+
+        afterEach(() => {
+            delete (config as any).actionOnSuspicious;
+        });
+
+        it('with no setting, a POST is forwarded with x-cheq-rti-result (every default is ALLOW)', async () => {
+            const challenge = captchaVerdict();
+            realStrategies();
+            const event = post();
+            const result = await handle(event, RequestType.VIEWER_REQUEST);
+            expect(result).toBe(event.Records[0].cf.request);
+            expect(challenge).not.toHaveBeenCalled();
+            expect(event.Records[0].cf.request.headers['x-cheq-rti-result']?.[0].value).toContain('verdict=suspicious');
+        });
+
+        it('BLOCK for the method: the block page', async () => {
+            captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.BLOCK } };
+            const result = await handle(post(), RequestType.VIEWER_REQUEST) as any;
+            expect(result.status).toBe('403');
+        });
+
+        it('REDIRECT for the method: a 302 to redirectLocation', async () => {
+            captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.REDIRECT } };
+            const result = await handle(post(), RequestType.VIEWER_REQUEST) as any;
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('https://www.cheq.ai/');
+        });
+
+        it('a path rule wins over the method default', async () => {
+            captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.ALLOW }, rules: [{ path: '^/login$', methods: ['POST'], action: Action.BLOCK }] };
+            expect((await handle(post('/login'), RequestType.VIEWER_REQUEST) as any).status).toBe('403');
+            const other = post('/search');
+            expect(await handle(other, RequestType.VIEWER_REQUEST)).toBe(other.Records[0].cf.request);
+        });
+
+        it('CHALLENGE: the CAPTCHA page is built for the Referer page, as a GET without the body', async () => {
+            const challenge = captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
+            const event = post('/api/login', { Referer: 'https://example.com/account/login?next=%2Fcart' });
+            (event.Records[0].cf.request as any).body = { data: 'cGFzc3dvcmQ=', encoding: 'base64' };
+
+            const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+            expect(result).toEqual({ status: '403', body: '<html>captcha</html>' });
+            const pageRequest = challenge.mock.calls[0][0];
+            expect(pageRequest).toMatchObject({ method: 'GET', uri: '/account/login', querystring: 'next=%2Fcart' });
+            expect(pageRequest.body).toBeUndefined();
+            // The real request is not changed
+            expect(event.Records[0].cf.request).toMatchObject({ method: 'POST', uri: '/api/login', querystring: 'step=2' });
+        });
+
+        it.each([
+            ['no Referer', {}],
+            ['a Referer from another site', { Referer: 'https://evil.example/form' }],
+            ['a Referer that is not a URL', { Referer: 'not a url' }],
+        ])('CHALLENGE with %s: the page is built for the request\'s own URL', async (_label, headers) => {
+            const challenge = captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
+            await handle(post('/api/login', headers), RequestType.VIEWER_REQUEST);
+            expect(challenge.mock.calls[0][0]).toMatchObject({ method: 'GET', uri: '/api/login', querystring: 'step=2' });
+        });
+
+        it('CHALLENGE with a valid session: no CAPTCHA, forwarded with the real POST', async () => {
+            const challenge = captchaVerdict();
+            realStrategies();
+            mocks.validateChallenge.mockResolvedValue(true);
+            (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
+            const event = post();
+            const result = await handle(event, RequestType.VIEWER_REQUEST);
+            expect(result).toBe(event.Records[0].cf.request);
+            expect(challenge).not.toHaveBeenCalled();
+            expect(mocks.validateChallenge.mock.calls[0][0].method).toBe('POST');
+        });
+
+        it.each([
+            [Action.CHALLENGE, 'CAPTCHA'],
+            [Action.BLOCK, 'ACCESS_DENIED'],
+            [Action.REDIRECT, 'REDIRECT'],
+            [Action.ALLOW, 'ALLOW (forward)'],
+        ])('debug logs what actionOnSuspicious gives for a POST: %s', async (action, logged) => {
+            captchaVerdict();
+            realStrategies();
+            (config as any).debug = true;
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+            (config as any).actionOnSuspicious = { methods: { POST: action } };
+            await handle(post(), RequestType.VIEWER_REQUEST);
+            expect(log).toHaveBeenCalledWith(`POST request: actionOnSuspicious gives ${logged}`);
+            (config as any).debug = false;
+        });
+
+        it('debug logs nothing about actionOnSuspicious for a GET', async () => {
+            captchaVerdict();
+            realStrategies();
+            (config as any).debug = true;
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+            await handle(buildEvent(), RequestType.VIEWER_REQUEST);
+            expect(log).not.toHaveBeenCalledWith(expect.stringContaining('actionOnSuspicious'));
+            (config as any).debug = false;
+        });
+
+        it('GET still gets the CAPTCHA for its own URL, whatever actionOnSuspicious says', async () => {
+            const challenge = captchaVerdict();
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.ALLOW }, rules: [{ path: '.*', action: Action.ALLOW }] };
+            const event = buildEvent('/page', 'example.com', '1.2.3.4', 'a=1', '', { extraHeaders: { Referer: 'https://example.com/other' } });
+            await handle(event, RequestType.VIEWER_REQUEST);
+            expect(challenge.mock.calls[0][0]).toBe(event.Records[0].cf.request);
+        });
     });
 
     it('calls RTI when validateChallenge is not configured', async () => {
@@ -2419,7 +2548,7 @@ describe('request-helper handle', () => {
         expect(await (config as any).validateChallenge(next, false)).toBe(true);
     });
 
-    it('Turnstile end to end: the siteverify call fails → back to the original URL, no session, the token never reaches the origin', async () => {
+    it('Turnstile end to end: the siteverify call fails → the widget again for the original URL, no session, the token never reaches the origin', async () => {
         // Arrange
         expectError = true;
         realTurnstile(new Error('siteverify unreachable'));
@@ -2428,9 +2557,10 @@ describe('request-helper handle', () => {
         // Act
         const result = await handle(event, RequestType.VIEWER_REQUEST) as any;
 
-        // Assert
-        expect(result.status).toBe('302');
-        expect(result.headers.location[0].value).toBe(`https://example.com${new URLSearchParams(replyQuery).get('original_url')}`);
+        // Assert: below the pause limit, so the CAPTCHA again (not a pass)
+        expect(result.status).toBe('403');
+        expect(result.body).toContain("We couldn&#39;t verify you right now. Please try again.");
+        expect(result.body).toContain(`name="original_url" value="${new URLSearchParams(replyQuery).get('original_url')}"`);
         expect(result.headers['set-cookie']).toBeUndefined();
         expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('siteverify unreachable'));
     });

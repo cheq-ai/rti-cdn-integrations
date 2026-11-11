@@ -852,23 +852,58 @@ describe('challenge', () => {
     // --- siteverify errors (#8) ---
 
     const errorQuery = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': '/target?a=1' }).toString();
+    // As it appears in the page: the apostrophe is HTML-escaped.
+    const UNAVAILABLE = "We couldn&#39;t verify you right now. Please try again.";
 
-    it('a siteverify error sends the visitor back to the original URL, without a session or the token', async () => {
+    it('a siteverify error below the limit shows the widget again, saying it was not the visitor\'s fault', async () => {
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
         stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('siteverify unreachable')));
         const result = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('class="cf-turnstile"');
+        expect(result.body).toContain(UNAVAILABLE);
+        expect(result.body).not.toContain('Verification failed');
+        expect(result.body).toContain('name="original_url" value="/target?a=1"');
+        expect(result.body).not.toContain('valid-token');
+        expect(result.headers['set-cookie']).toBeUndefined();
+        expect(result.headers['cache-control'][0].value).toContain('no-store');
+        expect(error).toHaveBeenCalledWith(expect.stringContaining('siteverify unreachable'));
+    });
+
+    it('the siteverify error that starts the pause sends the visitor back to the original URL (fail open), without a session or the token', async () => {
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const cb = build({ ...testSettings, siteverifyErrorsToPause: 1 });
+        stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('siteverify unreachable')));
+        const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
         expect(result.status).toBe('302');
         expect(result.headers.location[0].value).toBe('https://example.com/target?a=1');
         expect(result.headers['set-cookie']).toBeUndefined();
         expect(result.headers['cache-control'][0].value).toContain('no-store');
-        expect(error).toHaveBeenCalledWith(expect.stringContaining('siteverify unreachable'));
+        expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+    });
+
+    it.each([
+        [0, ['retry', 'retry', 'retry', 'retry']],
+        [1, ['fail open', 'fail open', 'fail open', 'fail open']],
+        [3, ['retry', 'retry', 'fail open', 'fail open']],
+    ] as const)('siteverifyErrorsToPause %s: what each failed solve gets', async (errorsToPause, expected) => {
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const cb = build({ ...testSettings, siteverifyErrorsToPause: errorsToPause });
+        stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+        const got: string[] = [];
+        for (let i = 0; i < expected.length; i++) {
+            const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+            got.push(result.status === '302' ? 'fail open' : result.status === '403' && result.body.includes(UNAVAILABLE) ? 'retry' : `unexpected ${result.status}`);
+        }
+        expect(got).toEqual(expected);
     });
 
     it('a non-2xx siteverify answer counts as a siteverify error', async () => {
         vi.spyOn(console, 'error').mockImplementation(() => {});
         stubSiteverifyClient(vi.fn().mockResolvedValue({ status: 503, json: async () => ({}) }));
         const result = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
-        expect(result.status).toBe('302');
+        expect(result.status).toBe('403');
+        expect(result.body).toContain(UNAVAILABLE);
         expect(result.headers['set-cookie']).toBeUndefined();
     });
 
@@ -889,7 +924,8 @@ describe('challenge', () => {
         vi.spyOn(console, 'error').mockImplementation(() => {});
         vi.spyOn(HttpsClient.prototype, 'post').mockResolvedValue({ status: 200, statusText: 'OK', body: '<html>' });
         const result = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
-        expect(result.status).toBe('302');
+        expect(result.status).toBe('403');
+        expect(result.body).toContain(UNAVAILABLE);
         expect(result.headers['set-cookie']).toBeUndefined();
     });
 
@@ -979,7 +1015,8 @@ describe('challenge', () => {
             const siteverify = failSiteverify();
             for (let i = 0; i < 10; i++) {
                 const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
-                expect(result.status).toBe('302');
+                expect(result.status).toBe('403');
+                expect(result.body).toContain(UNAVAILABLE);
                 expect(result.headers['set-cookie']).toBeUndefined();
             }
             expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);

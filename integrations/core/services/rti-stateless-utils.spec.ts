@@ -1639,4 +1639,31 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion getCookieValue Method Tests
+
+  // #region sameSiteReferer Method Tests
+  describe('sameSiteReferer', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['a page on this site', 'https://shop.com/account/login?next=%2Fcart', 'shop.com', { path: '/account/login', query: 'next=%2Fcart' }],
+      ['no query', 'https://shop.com/form', 'shop.com', { path: '/form', query: '' }],
+      ['the host in another case and with a port', 'https://SHOP.com:443/form', 'shop.com', { path: '/form', query: '' }],
+      ['a fragment, which is dropped', 'https://shop.com/form?a=1#top', 'shop.com', { path: '/form', query: 'a=1' }],
+    ])('%s', (_label, referer, host, expected) => {
+      expect(utils.sameSiteReferer(referer, host)).toEqual(expected);
+    });
+
+    test.each([
+      ['no Referer', undefined, 'shop.com'],
+      ['an empty Referer', '', 'shop.com'],
+      ['no Host', 'https://shop.com/form', undefined],
+      ['another site', 'https://evil.example/form', 'shop.com'],
+      ['a subdomain', 'https://login.shop.com/form', 'shop.com'],
+      ['not a URL', 'not a url', 'shop.com'],
+      ['a javascript: URL', 'javascript:alert(1)', 'shop.com'],
+    ])('undefined for %s', (_label, referer, host) => {
+      expect(utils.sameSiteReferer(referer, host)).toBeUndefined();
+    });
+  });
+  // #endregion sameSiteReferer Method Tests
 });

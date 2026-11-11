@@ -270,6 +270,29 @@ export class RTIStatelessUtils {
     return RTIStatelessUtils.SECRET_HEADERS.has(lower) ? RTIStatelessUtils.REDACTED : value;
   }
 
+  /**
+   * The page the visitor came from, when it is on this site: the Referer's path and query (without `?`). `undefined`
+   * when there is no Referer, it is on another host, or it is not a URL. Used to build a CAPTCHA page for a request
+   * with a body, so the visitor is back on the form after solving it.
+   * @param referer the Referer header value
+   * @param host the request's Host header value
+   */
+  sameSiteReferer(referer: string | null | undefined, host: string | null | undefined): { path: string; query: string } | undefined {
+    const ownHost = RTIStatelessUtils.normalizeHost(host);
+    if (!referer || !ownHost) {
+      return undefined;
+    }
+    try {
+      const url = new URL(referer);
+      if (RTIStatelessUtils.normalizeHost(url.host) !== ownHost) {
+        return undefined;
+      }
+      return { path: url.pathname, query: url.search.replace(/^\?/, '') };
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The query parameter that carries the Turnstile token when the challenge page's form is submitted. */
   static readonly TURNSTILE_RESPONSE_QUERY_PARAM = 'cf-turnstile-response';
 
