@@ -81,6 +81,12 @@ const turnstileConfig: TurnstileSettings = {
     // request policy (the shipped policies do).
     sessionBinding: { ip: "exact", userAgent: true },
 
+    // Optional: the site's hostnames. A solved CAPTCHA is accepted only if it was solved on one of them or a subdomain
+    // of one ("example.com" also covers "www.example.com"). Without it, it must have been solved on the request's own
+    // Host. Set it on origin-request when the viewer's Host is not forwarded (the Lambda then sees the origin's hostname
+    // and would reject every solve), or for several domains.
+    // allowedHostnames: ["example.com"],
+
     // If Cloudflare's siteverify fails this many times in a row (timeout, network, 5xx; a 4xx doesn't count), the CAPTCHA is paused for
     // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result.
     // Counted per Lambda instance, not for the whole site: each instance pauses after its own 3 errors, so for a few

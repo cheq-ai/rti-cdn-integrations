@@ -57,6 +57,14 @@ export interface TurnstileSettings {
     siteverifyErrorsToPause?: number;
     /** How long the CAPTCHA is paused, in seconds. During the pause challenged traffic is forwarded with x-cheq-rti-result. Default 60. */
     siteverifyPauseSeconds?: number;
+    /**
+     * The site's hostnames, e.g. `["example.com"]`. A solved token is accepted only if Cloudflare says it was solved on
+     * one of them or on a subdomain of one (`example.com` also covers `www.example.com` and `shop.eu.example.com`, not
+     * `evilexample.com`). Optional: without it, the token must have been solved on the request's own Host.
+     * Set it on origin-request when the viewer's Host is not forwarded (the Lambda then sees the origin's hostname,
+     * and every solve would be rejected), or when the site has several domains. Case and a `:port` are ignored.
+     */
+    allowedHostnames?: string[];
 }
 
 /** See {@link sessionBindingKey}. */
@@ -68,7 +76,13 @@ export interface SessionBinding {
 }
 
 /** The settings once createTurnstileChallenge has checked them: every optional setting has its value. */
-type ResolvedTurnstileSettings = TurnstileSettings & { sessionBinding: SessionBinding; siteverifyErrorsToPause: number; siteverifyPauseSeconds: number };
+type ResolvedTurnstileSettings = TurnstileSettings & {
+    sessionBinding: SessionBinding;
+    siteverifyErrorsToPause: number;
+    siteverifyPauseSeconds: number;
+    /** Normalized (lower case, no port). Empty: check against the request's Host. */
+    allowedHostnames: string[];
+};
 
 const DEFAULT_SESSION_BINDING: SessionBinding = { ip: "exact", userAgent: true };
 
@@ -251,12 +265,21 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
         console.warn(`[turnstile] invalid sessionBinding ${JSON.stringify(settings.sessionBinding)}, using ${JSON.stringify(DEFAULT_SESSION_BINDING)} (ip: "exact" or "none"; userAgent: true or false, in config.ts)`);
     }
     const binding = bindingValid && settings.sessionBinding ? settings.sessionBinding : DEFAULT_SESSION_BINDING;
+    // A list with anything but host names in it is ignored as a whole: a partly used list would accept fewer hosts than
+    // the operator meant (a CAPTCHA loop), and guessing could accept more. The Host check is used instead.
+    const listed: unknown = settings.allowedHostnames;
+    const allowedHostnames = Array.isArray(listed) ? listed.map(h => typeof h === "string" ? RTIStatelessUtils.normalizeHost(h) : "") : [];
+    const hostnamesValid = listed === undefined || (Array.isArray(listed) && allowedHostnames.every(h => h !== ""));
+    if (!hostnamesValid) {
+        console.warn(`[turnstile] invalid allowedHostnames ${JSON.stringify(settings.allowedHostnames)}, checking against the request's Host instead (set a list of host names, e.g. ["www.example.com"], in config.ts)`);
+    }
     const resolved: ResolvedTurnstileSettings = {
         ...settings,
         sessionTtlSeconds: ttlValid ? settings.sessionTtlSeconds : DEFAULT_SESSION_TTL_SECONDS,
         sessionBinding: { ip: binding.ip, userAgent: binding.userAgent },
         siteverifyErrorsToPause: integerSetting("siteverifyErrorsToPause", settings.siteverifyErrorsToPause, 0, DEFAULT_SITEVERIFY_ERRORS_TO_PAUSE),
         siteverifyPauseSeconds: integerSetting("siteverifyPauseSeconds", settings.siteverifyPauseSeconds, 1, DEFAULT_SITEVERIFY_PAUSE_SECONDS),
+        allowedHostnames: hostnamesValid ? allowedHostnames : [],
     };
     const pause = new SiteverifyPause(resolved.siteverifyErrorsToPause, resolved.siteverifyPauseSeconds);
 
@@ -679,16 +702,25 @@ function challengeUnavailableFailOpen(request: CloudFrontRequest, queryStringDat
 }
 
 /**
+ * True when `hostname` is one of `allowed` or a subdomain of one. The match is on a dot boundary: `example.com` covers
+ * `www.example.com`, but not `evilexample.com` or `example.com.evil.net`. Both sides are already normalized.
+ */
+function isAllowedHostname(hostname: string, allowed: string[]): boolean {
+    return hostname !== "" && allowed.some(host => hostname === host || hostname.endsWith(`.${host}`));
+}
+
+/**
  * Verifies a Turnstile token with Cloudflare's siteverify endpoint. A token is single-use and expires after 300 seconds.
  *
  * `success` alone only says the token is genuine for this site key. It is accepted only when it was also solved on
  * THIS host and on the CHEQ challenge widget ({@link CHALLENGE_ACTION}): otherwise a token from another site sharing
  * the site key, or from another Turnstile widget on this site (a login or newsletter form), would buy a CHEQ session.
  * An empty or missing action is rejected too, never accepted "to be safe": the site's other widgets usually have none,
- * so allowing it would let exactly those tokens through. No Host header means the host cannot be checked: rejected.
- * Both hosts go through RTIStatelessUtils.normalizeHost first, so case, a `:port` or a stray scheme do not cause a mismatch.
+ * so allowing it would let exactly those tokens through. With `allowedHostnames` set, the token's host must be one of
+ * them or a subdomain of one; without it, exactly the request's Host (no Host header means it cannot be checked: rejected).
+ * Hosts go through RTIStatelessUtils.normalizeHost first, so case, a `:port` or a stray scheme do not cause a mismatch.
  */
-async function verifyTurnstileToken(settings: TurnstileSettings, token: string, request: CloudFrontRequest): Promise<boolean> {
+async function verifyTurnstileToken(settings: ResolvedTurnstileSettings, token: string, request: CloudFrontRequest): Promise<boolean> {
     // Throws SiteverifyRefusedError on a 4xx. Throws on a timeout, a network error, a 5xx or a body that is not JSON: siteverify itself failed.
     const verifyResponse = await getSiteverifyClient().post(
         JSON.stringify({ secret: settings.secretKey, response: token, remoteip: request.clientIp }),
@@ -713,11 +745,17 @@ async function verifyTurnstileToken(settings: TurnstileSettings, token: string, 
     const action = result.action ?? "";
     let accepted = true;
 
-    if (!requestHost) {
-        console.warn(`[turnstile] token valid but the request has no Host header to check hostname '${hostname}' against (on origin-request, forward the viewer's Host)`);
+    if (settings.allowedHostnames.length > 0) {
+        // The operator's list wins over the Host header (which on origin-request may be the origin's own hostname).
+        if (!isAllowedHostname(hostname, settings.allowedHostnames)) {
+            console.warn(`[turnstile] token valid but hostname '${hostname}' is not in allowedHostnames or a subdomain of one (${settings.allowedHostnames.join(", ")})`);
+            accepted = false;
+        }
+    } else if (!requestHost) {
+        console.warn(`[turnstile] token valid but the request has no Host header to check hostname '${hostname}' against (on origin-request, forward the viewer's Host or set allowedHostnames)`);
         accepted = false;
     } else if (hostname !== requestHost) {
-        console.warn(`[turnstile] token valid but hostname '${hostname}' ≠ request host '${requestHost}'`);
+        console.warn(`[turnstile] token valid but hostname '${hostname}' ≠ request host '${requestHost}' (if this is the origin's hostname, forward the viewer's Host or set allowedHostnames)`);
         accepted = false;
     }
 

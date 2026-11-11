@@ -5,7 +5,7 @@ import { RTIResponse } from "../models/rti-response.model";
 import { Action } from "../models/action.model";
 import { Mode } from "../models/mode.model";
 import { ActionStrategy } from "../models/action-strategy.model";
-import { BODY_METHODS, BodyMethod, CHALLENGEABLE_METHODS } from "../models/action-on-suspicious.model";
+import { BODY_METHODS, BodyMethod, CHALLENGEABLE_METHODS, RequestStrategy } from "../models/action-on-suspicious.model";
 import { RTIStatelessUtils } from "./rti-stateless-utils";
 
 /**
@@ -97,20 +97,24 @@ export class RTIHelperService extends RTIStatelessUtils {
   }
 
   /**
-   * The strategy for this request's method. A CAPTCHA page can't carry a request body through (login, payment, the
-   * bank's 3DS return), so a POST, PUT, PATCH, DELETE or OPTIONS is never challenged in place: when `strategy` is
-   * CAPTCHA, {@link getActionOnSuspicious} decides instead, mapped like any Action ({@link getActionStrategy}).
-   * ALLOW gives `null`: forward with the verdict. Any other strategy, and any GET or HEAD, is returned as it is.
-   * @param strategy what {@link getActionStrategy} gave for RTI's action
+   * What to do with this request: RTI's {@link Action} mapped to a strategy ({@link getActionStrategy}).
+   * A CAPTCHA page can't carry a request body through (login, payment, the bank's 3DS return), so a POST, PUT, PATCH,
+   * DELETE or OPTIONS is never challenged in place: when the strategy is CAPTCHA, {@link getActionOnSuspicious} decides
+   * instead, mapped the same way. `strategy: null` means forward to the origin with the verdict.
+   * @param action RTI's action for this request ({@link getAction})
    * @param method the request method
    * @param path the request path, for actionOnSuspicious rules
    */
-  getStrategyForMethod(strategy: ActionStrategy | null, method: string, path: string): ActionStrategy | null {
+  getStrategyForRequest(action: Action, method: string, path: string): RequestStrategy {
+    const strategy = action !== Action.ALLOW ? this.getActionStrategy(action) : null;
     if (strategy !== ActionStrategy.CAPTCHA || this.isBodylessMethod(method)) {
-      return strategy;
+      return { strategy };
     }
     const bodyAction = this.getActionOnSuspicious(method, path);
-    return bodyAction === Action.ALLOW ? null : this.getActionStrategy(bodyAction);
+    return {
+      strategy: bodyAction === Action.ALLOW ? null : this.getActionStrategy(bodyAction),
+      actionOnSuspicious: bodyAction,
+    };
   }
 
   /**

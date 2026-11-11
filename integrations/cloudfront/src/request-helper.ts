@@ -129,14 +129,12 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
-        //todo: move rtistrategy to rti-helper-service
-        const rtiStrategy = action !== Action.ALLOW ? rtiHelperService.getActionStrategy(action) : null;
-
-        // A request with a body is never challenged in place: config.actionOnSuspicious decides (see getStrategyForMethod).
-        const actionStrategy = rtiHelperService.getStrategyForMethod(rtiStrategy, cfRequest.method, requestURL.pathname);
-        // Logged for every body request with a CAPTCHA verdict, also when the answer is still a CAPTCHA (CHALLENGE).
-        if (isDebugEnabled && rtiStrategy === ActionStrategy.CAPTCHA && !rtiHelperService.isBodylessMethod(cfRequest.method)) {
-            console.log(`${cfRequest.method} request: actionOnSuspicious gives ${actionStrategy !== null ? ActionStrategy[actionStrategy] : "ALLOW (forward)"}`);
+        // RTI's action as a strategy. A request with a body is never challenged in place: config.actionOnSuspicious
+        // decides (see getStrategyForRequest).
+        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, cfRequest.method, requestURL.pathname);
+        // Set only when actionOnSuspicious decided: a request with a body and a CAPTCHA verdict.
+        if (isDebugEnabled && actionOnSuspicious !== undefined) {
+            console.log(`${cfRequest.method} request: actionOnSuspicious says ${Action[actionOnSuspicious]}`);
         }
 
 
@@ -189,7 +187,7 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                                 break;
                             }
                             // On a request with no body (GET, HEAD), the request is challenged in place (forward to the original requested page).
-                            // On a request with a body (POST, PUT, PATCH, DELETE, OPTIONS), the visitor is redirected to the page they came from (the Referer) or to the request's own URL if there is no usable Referer.
+                            // On a request with a body (POST, PUT, PATCH, DELETE, OPTIONS), the visitor is redirected to the page they came from (the Referer, same site only) or to the site's home page if there is no usable Referer.
                             // The body is not kept (this is why we redirect to the Referer): the visitor can resubmit it after solving the challenge.
                             const afterChallengeRequest = rtiHelperService.isBodylessMethod(cfRequest.method) ? cfRequest : refererAfterChallengeRequest(cfRequest);
 
@@ -343,15 +341,14 @@ function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): Req
 /**
  * The request the visitor makes after passing the challenge, when a request with a body is challenged (actionOnSuspicious CHALLENGE):
  * a GET for the page the visitor came from (the Referer, same host only), so after solving they are back on the form
- * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the request's own URL.
+ * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the site's home page
+ * ("/"): an address on another site is never used, so the CAPTCHA can't be turned into an open redirect.
  * The body is not kept. The real request is not changed: it is still the one checked for a session.
  */
-//todo: remove the same site referer check always use the referrer if it exists, otherwise use the request's own URL
 function refererAfterChallengeRequest(request: CloudFrontRequest): CloudFrontRequest {
     const { body: _body, ...withoutBody } = request;
-    const getRequest: CloudFrontRequest = { ...withoutBody, method: 'GET' };
     const referer = rtiHelperService.sameSiteReferer(request.headers['referer']?.[0]?.value, request.headers['host']?.[0]?.value);
-    return referer ? { ...getRequest, uri: referer.path, querystring: referer.query } : getRequest;
+    return { ...withoutBody, method: 'GET', uri: referer?.path ?? '/', querystring: referer?.query ?? '' };
 }
 
 // Our own 403 or 404 page for a blocked request.

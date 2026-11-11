@@ -1199,6 +1199,79 @@ describe('challenge', () => {
 // siteverify's `success` only says the token is genuine for the site key. It must also have been solved on this host
 // and on the CHEQ widget (data-action="cheq-challenge"): otherwise a token from another site sharing the key, or from
 // another Turnstile widget on this site (a login or newsletter form), would buy a CHEQ session.
+describe('allowedHostnames', () => {
+    const solvedQuery = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', original_url: '/page', request_id: 'ray-hosts' }).toString();
+    const solve = (settings: any, host: string | null, tokenHost: string) => {
+        stubSiteverifyResult({ success: true, hostname: tokenHost, action: 'cheq-challenge' });
+        return build({ ...testSettings, ...settings }).challenge(buildTurnstileRequest(solvedQuery, host), buildRTIResponse('ray-hosts')) as Promise<any>;
+    };
+    const passed = (result: any) => result.status === '302' && !!result.headers['set-cookie'];
+
+    it('accepts a token solved on a listed host, even when the Host is the origin\'s own hostname', async () => {
+        expect(passed(await solve({ allowedHostnames: ['www.shop.com', 'shop.com'] }, 'abc123.lambda-url.us-east-1.on.aws', 'shop.com'))).toBe(true);
+    });
+
+    it('accepts it with no Host header at all', async () => {
+        expect(passed(await solve({ allowedHostnames: ['www.shop.com'] }, null, 'www.shop.com'))).toBe(true);
+    });
+
+    it('rejects a token solved on a host not in the list, even if it equals the Host header, and warns', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const result = await solve({ allowedHostnames: ['www.shop.com'] }, 'evil.example', 'evil.example');
+        expect(passed(result)).toBe(false);
+        expect(result.body).toContain('Verification failed');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("hostname 'evil.example' is not in allowedHostnames or a subdomain of one (www.shop.com)"));
+    });
+
+    it.each(['shop.com', 'www.shop.com', 'eu.shop.shop.com', 'WWW.SHOP.COM'])('a listed domain covers itself and its subdomains: %s', async (tokenHost) => {
+        expect(passed(await solve({ allowedHostnames: ['shop.com'] }, 'origin.example', tokenHost))).toBe(true);
+    });
+
+    it.each([
+        ['a look-alike ending in the name', 'evilshop.com'],
+        ['the name inside another domain', 'shop.com.evil.net'],
+        ['the parent of a listed subdomain', 'shop.com', ['www.shop.com']],
+        ['another subdomain of the parent', 'login.shop.com', ['www.shop.com']],
+        ['no hostname from Cloudflare', ''],
+    ])('rejects %s', async (_label, tokenHost, list = ['shop.com']) => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(passed(await solve({ allowedHostnames: list }, 'origin.example', tokenHost as string))).toBe(false);
+    });
+
+    it.each([
+        ['case', 'WWW.Shop.COM'],
+        ['a port', 'www.shop.com:443'],
+    ])('ignores %s in the list', async (_label, listed) => {
+        expect(passed(await solve({ allowedHostnames: [listed] }, 'origin.example', 'www.shop.com'))).toBe(true);
+    });
+
+    it('an empty list means the Host check, as without the setting', async () => {
+        expect(passed(await solve({ allowedHostnames: [] }, 'www.shop.com', 'www.shop.com'))).toBe(true);
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(passed(await solve({ allowedHostnames: [] }, 'origin.example', 'www.shop.com'))).toBe(false);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('or set allowedHostnames'));
+    });
+
+    it.each([
+        ['a string, not a list', 'www.shop.com'],
+        ['an empty name', ['www.shop.com', '']],
+        ['a number', ['www.shop.com', 42]],
+    ])('ignores an invalid list (%s) with a warning, and uses the Host check', async (_label, value) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        expect(passed(await solve({ allowedHostnames: value }, 'origin.example', 'www.shop.com'))).toBe(false);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid allowedHostnames'));
+        expect(passed(await solve({ allowedHostnames: value }, 'www.shop.com', 'www.shop.com'))).toBe(true);
+    });
+
+    it('still requires the cheq-challenge action', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        stubSiteverifyResult({ success: true, hostname: 'www.shop.com', action: 'login' });
+        const result = await build({ ...testSettings, allowedHostnames: ['www.shop.com'] })
+            .challenge(buildTurnstileRequest(solvedQuery, 'www.shop.com'), buildRTIResponse('ray-hosts')) as any;
+        expect(passed(result)).toBe(false);
+    });
+});
+
 describe('challenge token checks (hostname and action)', () => {
     const solvedOn = (host: string | null) => challenge(buildTurnstileRequest(solvedQuery, host), buildRTIResponse('ray-checks')) as Promise<any>;
 
@@ -1242,7 +1315,7 @@ describe('challenge token checks (hostname and action)', () => {
 
         expectRejected(await solvedOn('shop.com'));
         expect(warn).toHaveBeenCalledOnce();
-        expect(warn).toHaveBeenCalledWith(`[turnstile] token valid but ${reason}`);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining(`[turnstile] token valid but ${reason}`));
     });
 
     it('warns about both when hostname and action are wrong', async () => {

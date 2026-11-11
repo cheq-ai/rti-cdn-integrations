@@ -40,7 +40,7 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
             // buildRtiResultHeader, parseCookies, isChallengeReplyAllowed and errorMessage are pure functions with no side
             // effects — use the real implementation so tests verify actual output rather than a duplicated mock formula.
             const realInstance = new real.RTIHelperService(config);
-            return {
+            const service: any = {
                 shouldIgnore: mocks.shouldIgnore,
                 getAction: mocks.getAction,
                 getActionStrategy: mocks.getActionStrategy,
@@ -48,7 +48,6 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 validateConfig: vi.fn().mockReturnValue([]),
                 validateActionOnSuspicious: realInstance.validateActionOnSuspicious.bind(realInstance),
                 getActionOnSuspicious: realInstance.getActionOnSuspicious.bind(realInstance),
-                getStrategyForMethod: realInstance.getStrategyForMethod.bind(realInstance),
                 isBodylessMethod: realInstance.isBodylessMethod.bind(realInstance),
                 sameSiteReferer: realInstance.sameSiteReferer.bind(realInstance),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
@@ -60,6 +59,9 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 isChallengeReplyAllowed: realInstance.isChallengeReplyAllowed.bind(realInstance),
                 errorMessage: realInstance.errorMessage.bind(realInstance),
             };
+            // The real getStrategyForRequest, run on this mock: it uses the mocked getActionStrategy for RTI's action.
+            service.getStrategyForRequest = real.RTIHelperService.prototype.getStrategyForRequest.bind(service);
+            return service;
         }),
     };
 });
@@ -694,12 +696,12 @@ describe('request-helper handle', () => {
             ['no Referer', {}],
             ['a Referer from another site', { Referer: 'https://evil.example/form' }],
             ['a Referer that is not a URL', { Referer: 'not a url' }],
-        ])('CHALLENGE with %s: the page is built for the request\'s own URL', async (_label, headers) => {
+        ])('CHALLENGE with %s: the page is built for the site\'s home page', async (_label, headers) => {
             const challenge = captchaVerdict();
             realStrategies();
             (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
             await handle(post('/api/login', headers), RequestType.VIEWER_REQUEST);
-            expect(challenge.mock.calls[0][0]).toMatchObject({ method: 'GET', uri: '/api/login', querystring: 'step=2' });
+            expect(challenge.mock.calls[0][0]).toMatchObject({ method: 'GET', uri: '/', querystring: '' });
         });
 
         it('CHALLENGE with a valid session: no CAPTCHA, forwarded with the real POST', async () => {
@@ -715,18 +717,18 @@ describe('request-helper handle', () => {
         });
 
         it.each([
-            [Action.CHALLENGE, 'CAPTCHA'],
-            [Action.BLOCK, 'ACCESS_DENIED'],
+            [Action.CHALLENGE, 'CHALLENGE'],
+            [Action.BLOCK, 'BLOCK'],
             [Action.REDIRECT, 'REDIRECT'],
-            [Action.ALLOW, 'ALLOW (forward)'],
-        ])('debug logs what actionOnSuspicious gives for a POST: %s', async (action, logged) => {
+            [Action.ALLOW, 'ALLOW'],
+        ])('debug logs what actionOnSuspicious says for a POST: %s', async (action, logged) => {
             captchaVerdict();
             realStrategies();
             (config as any).debug = true;
             const log = vi.spyOn(console, 'log').mockImplementation(() => {});
             (config as any).actionOnSuspicious = { methods: { POST: action } };
             await handle(post(), RequestType.VIEWER_REQUEST);
-            expect(log).toHaveBeenCalledWith(`POST request: actionOnSuspicious gives ${logged}`);
+            expect(log).toHaveBeenCalledWith(`POST request: actionOnSuspicious says ${logged}`);
             (config as any).debug = false;
         });
 

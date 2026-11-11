@@ -1,4 +1,5 @@
 import { Action } from "./action.model";
+import { ActionStrategy } from "./action-strategy.model";
 
 /**
  * The methods {@link ActionOnSuspicious} covers. GET and HEAD are not here: they always get the CAPTCHA page, since
@@ -14,6 +15,17 @@ export const CHALLENGEABLE_METHODS: readonly string[] = ["GET", "HEAD"];
 
 /** Every {@link BodyMethod}, for validation and loops. */
 export const BODY_METHODS: readonly BodyMethod[] = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/** What to do with a request: the answer of RTIHelperService.getStrategyForRequest. */
+export interface RequestStrategy {
+  /** The answer to send, or `null` to forward to the origin with the verdict. */
+  strategy: ActionStrategy | null;
+  /**
+   * Set only when {@link ActionOnSuspicious} decided (a request with a body and a CAPTCHA verdict): the Action it gave.
+   * For the debug log.
+   */
+  actionOnSuspicious?: Action;
+}
 
 /** One path rule of {@link ActionOnSuspicious}. */
 export interface ActionOnSuspiciousRule {
@@ -31,8 +43,8 @@ export interface ActionOnSuspiciousRule {
  * method's default, then ALLOW.
  *
  * - ALLOW: forwarded to the origin with `x-cheq-rti-result`, so the origin can decide.
- * - CHALLENGE: the CAPTCHA page, built for the page the visitor came from (Referer, same site only; else the request's
- *   own URL). After solving they are back on that page and can send the form again. The body itself is not kept.
+ * - CHALLENGE: the CAPTCHA page, built for the page the visitor came from (Referer, same site only; else the site's
+ *   home page). After solving they are back on that page and can send the form again. The body itself is not kept.
  * - BLOCK: the `blockingStrategy` answer (403 by default, or 404).
  * - REDIRECT: a 302 to `redirectLocation`.
  */

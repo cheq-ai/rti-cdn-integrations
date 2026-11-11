@@ -323,41 +323,51 @@ describe('RTIHelperService', () => {
     });
   });
 
-  describe('getStrategyForMethod', () => {
+  describe('getStrategyForRequest', () => {
     const svc = (config: any = {}) => new RTIHelperService(config);
 
-    test.each([ActionStrategy.ACCESS_DENIED, ActionStrategy.NOT_FOUND, ActionStrategy.REDIRECT, null])(
-      'strategy %s is kept for every method', (strategy) => {
-        const s = svc({ actionOnSuspicious: { methods: { POST: Action.BLOCK } } });
-        expect(s.getStrategyForMethod(strategy, 'POST', '/x')).toBe(strategy);
-        expect(s.getStrategyForMethod(strategy, 'GET', '/x')).toBe(strategy);
-      });
-
-    test('CAPTCHA stays CAPTCHA for GET and HEAD, whatever actionOnSuspicious says', () => {
-      const s = svc({ actionOnSuspicious: { rules: [{ path: '.*', action: Action.BLOCK }] } });
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'GET', '/x')).toBe(ActionStrategy.CAPTCHA);
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'HEAD', '/x')).toBe(ActionStrategy.CAPTCHA);
+    test('ALLOW is null (forward), for every method', () => {
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'GET', '/x')).toEqual({ strategy: null });
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'POST', '/x')).toEqual({ strategy: null });
     });
 
-    test('CAPTCHA for a body method with nothing set: null (forward with the verdict)', () => {
-      expect(svc().getStrategyForMethod(ActionStrategy.CAPTCHA, 'POST', '/x')).toBeNull();
+    test('maps RTI\'s action like getActionStrategy for GET and HEAD, whatever actionOnSuspicious says', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { rules: [{ path: '.*', action: Action.ALLOW }] } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'GET', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.REDIRECT, 'GET', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT });
     });
 
-    test('CAPTCHA for a body method follows actionOnSuspicious, mapped like any Action', () => {
+    test.each([Action.BLOCK, Action.REDIRECT])('%s on a body method is kept: actionOnSuspicious is only for a CAPTCHA', (action) => {
+      const s = svc({ actionOnSuspicious: { methods: { POST: Action.ALLOW } } });
+      expect(s.getStrategyForRequest(action, 'POST', '/x')).toEqual({ strategy: s.getActionStrategy(action) });
+    });
+
+    test('a CHALLENGE on a body method with nothing set: forward, and says ALLOW decided it', () => {
+      expect(svc().getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a CHALLENGE on a body method follows actionOnSuspicious, mapped like any Action', () => {
       const s = svc({
         blockingStrategy: ActionStrategy.NOT_FOUND,
         actionOnSuspicious: { methods: { POST: Action.BLOCK, PUT: Action.REDIRECT, PATCH: Action.CHALLENGE, DELETE: Action.ALLOW } },
       });
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'POST', '/x')).toBe(ActionStrategy.NOT_FOUND);
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'PUT', '/x')).toBe(ActionStrategy.REDIRECT);
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'PATCH', '/x')).toBe(ActionStrategy.CAPTCHA);
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'DELETE', '/x')).toBeNull();
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: Action.BLOCK });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PUT', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PATCH', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA, actionOnSuspicious: Action.CHALLENGE });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'DELETE', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a BLOCK shown as a CAPTCHA (blockingStrategy CAPTCHA) on a body method also follows actionOnSuspicious', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { methods: { POST: Action.REDIRECT } } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'POST', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
     });
 
     test('uses the path for rules', () => {
       const s = svc({ actionOnSuspicious: { rules: [{ path: '^/login$', action: Action.BLOCK }] } });
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'POST', '/login')).toBe(ActionStrategy.ACCESS_DENIED);
-      expect(s.getStrategyForMethod(ActionStrategy.CAPTCHA, 'POST', '/search')).toBeNull();
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/login').strategy).toBe(ActionStrategy.ACCESS_DENIED);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/search').strategy).toBeNull();
     });
   });
 

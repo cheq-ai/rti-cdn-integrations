@@ -835,6 +835,17 @@ The settings live in the `turnstileConfig` block at the top of [`src/config.ts`]
 
 `sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds, at most 34,560,000 (400 days, the most browsers keep a cookie); any other value (0, negative, fractional, a string, or more than 400 days) logs a warning and 300 is used.
 
+`allowedHostnames` (optional, e.g. `["example.com"]`): a solved CAPTCHA is accepted only if Cloudflare says it was
+solved on one of these hosts or a subdomain of one. `example.com` also covers `www.example.com` and `shop.eu.example.com`,
+but not look-alikes such as `evilexample.com` or `example.com.evil.net`. List only domains whose every subdomain you
+trust: a subdomain that serves other people's content would count too. Without the setting, the CAPTCHA must have been
+solved on exactly the request's own `Host`. Set it on
+origin-request with an origin request policy that doesn't forward `Host` (`OriginRequestPolicyAllExceptHost` or
+`OriginRequestPolicyNoHost`): the Lambda then sees the origin's hostname (an S3 bucket, a Lambda URL) and would reject
+every solve, a CAPTCHA loop with the warning `hostname '…' ≠ request host '…'`. Also set it for a site with several
+domains. Case and a `:port` are ignored. A list with anything but host names in it is ignored with a warning, and the
+`Host` check is used.
+
 `sessionBinding` (default `{ ip: "exact", userAgent: true }`) binds the session to the client that solved the challenge,
 so a copied cookie does not work elsewhere; see [Session binding](#session-binding). `ip` is `"exact"` or `"none"`,
 `userAgent` is `true` or `false`; any other value logs a warning and the default is used.
@@ -886,7 +897,7 @@ vendor outage. A fallback would have to trust the browser ("the widget failed"),
 | Action | What a request with a body gets |
 |---|---|
 | `Action.ALLOW` (default for every method) | Forwarded with `x-cheq-rti-result`, so the origin decides. |
-| `Action.CHALLENGE` | The CAPTCHA page, built for the page the visitor came from (the `Referer`, same site only; without one, the request's own URL). After solving they are back on that page and send the form again. The body itself is not kept. A visitor with a valid session is not challenged: the request is forwarded. |
+| `Action.CHALLENGE` | The CAPTCHA page, built for the page the visitor came from (the `Referer`, same site only; without one, or from another site, the site's home page `/`). After solving they are back on that page and send the form again. The body itself is not kept. A visitor with a valid session is not challenged: the request is forwarded. |
 | `Action.BLOCK` | The `blockingStrategy` answer (403 by default, or 404). |
 | `Action.REDIRECT` | A 302 to `redirectLocation`. |
 
@@ -907,7 +918,9 @@ actionOnSuspicious: {
 - A typo (a method that isn't one of these five, a value that isn't an `Action`, a bad regex) is logged as a warning once
   per cold start and counts as `ALLOW`, so it never blocks by mistake.
 - On origin-request, `CHALLENGE` needs the viewer's `Referer` in the origin request policy (the default policy forwards
-  all viewer headers). Without it, the CAPTCHA page is built for the request's own URL.
+  all viewer headers). Without it, the visitor goes to the site's home page after the CAPTCHA.
+- A `Referer` on another site is never used: the visitor goes to the home page instead. Sending them back to another
+  site would turn the CAPTCHA into an open redirect.
 
 `config.ts` passes them to `createTurnstileChallenge(turnstileConfig)`, which returns `challenge`, `validateChallenge` and `isChallengeResponse`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns none of them and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
