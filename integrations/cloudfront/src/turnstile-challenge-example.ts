@@ -30,6 +30,9 @@ const MAX_TOKEN_LENGTH = 2048;
 const VERIFICATION_FAILED_MESSAGE = "Verification failed. Please try again.";
 const VERIFICATION_UNAVAILABLE_MESSAGE = "We couldn't verify you right now. Please try again.";
 
+// How long _cq_rf and _cq_ref live after a solved CAPTCHA: only long enough for the landing page.
+const ORIGINAL_REFERER_COOKIE_MAX_AGE_SECONDS = 60;
+
 
 /** Settings for the example Turnstile challenge, set in config.ts. */
 export interface TurnstileSettings {
@@ -66,6 +69,13 @@ export interface TurnstileSettings {
      * and every solve would be rejected), or when the site has several domains. Case and a `:port` are ignored.
      */
     allowedHostnames?: string[];
+    /**
+     * How the original Referer (where the visitor came from before the CAPTCHA) reaches the site after a solve.
+     * - `"header"` (default): the origin and RTI get it in the `x-cheq-original-referer` request header. It is carried
+     *   from the 302 to the landing page in `_cq_rf`, a signed HttpOnly cookie, so page scripts can't read or plant it.
+     * - `"cookie"`: the site's own scripts read it from `_cq_ref` (not HttpOnly). The Lambda never reads it back.
+     */
+    originalRefererVia?: "header" | "cookie";
 }
 
 /** See {@link sessionBindingKey}. */
@@ -83,7 +93,10 @@ type ResolvedTurnstileSettings = TurnstileSettings & {
     siteverifyPauseSeconds: number;
     /** Normalized (lower case, no port). Empty: check against the request's Host. */
     allowedHostnames: string[];
+    originalRefererVia: "header" | "cookie";
 };
+
+const ORIGINAL_REFERER_MODES: readonly string[] = ["header", "cookie"];
 
 const DEFAULT_SESSION_BINDING: SessionBinding = { ip: "exact", userAgent: true };
 
@@ -246,7 +259,7 @@ function sessionBindingIp(mode: SessionBinding["ip"], clientIp: string): string 
  * the CAPTCHA is then disabled and challenged traffic is forwarded with `x-cheq-rti-result`, instead of
  * showing a broken widget or issuing sessions anyone could forge.
  */
-export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge" | "isChallengeResponse"> {
+export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge" | "isChallengeResponse" | "originalReferer"> {
     const missing = (["siteKey", "secretKey", "sessionSigningSecret"] as const).filter(k => isPlaceholder(settings[k]));
     if (missing.length > 0) {
         console.warn(`[turnstile] CAPTCHA disabled, not configured: ${missing.join(", ")} (set them in config.ts)`);
@@ -275,6 +288,10 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
     if (!hostnamesValid) {
         console.warn(`[turnstile] invalid allowedHostnames ${JSON.stringify(settings.allowedHostnames)}, checking against the request's Host instead (set a list of host names, e.g. ["www.example.com"], in config.ts)`);
     }
+    const refererModeValid = settings.originalRefererVia === undefined || ORIGINAL_REFERER_MODES.includes(settings.originalRefererVia);
+    if (!refererModeValid) {
+        console.warn(`[turnstile] invalid originalRefererVia ${JSON.stringify(settings.originalRefererVia)}, using "header" ("header" or "cookie", in config.ts)`);
+    }
     const resolved: ResolvedTurnstileSettings = {
         ...settings,
         sessionTtlSeconds: ttlValid ? settings.sessionTtlSeconds : DEFAULT_SESSION_TTL_SECONDS,
@@ -282,6 +299,7 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
         siteverifyErrorsToPause: integerSetting("siteverifyErrorsToPause", settings.siteverifyErrorsToPause, 0, DEFAULT_SITEVERIFY_ERRORS_TO_PAUSE),
         siteverifyPauseSeconds: integerSetting("siteverifyPauseSeconds", settings.siteverifyPauseSeconds, 1, DEFAULT_SITEVERIFY_PAUSE_SECONDS),
         allowedHostnames: hostnamesValid ? allowedHostnames : [],
+        originalRefererVia: refererModeValid && settings.originalRefererVia ? settings.originalRefererVia : "header",
     };
     const pause = new SiteverifyPause(resolved.siteverifyErrorsToPause, resolved.siteverifyPauseSeconds);
 
@@ -308,6 +326,7 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
             return turnstileValidateChallengeExample(resolved, request, isDebug, warnCloudFrontUserAgent);
         },
         isChallengeResponse: turnstileIsChallengeResponseExample,
+        originalReferer: resolved.originalRefererVia === "header" ? (request) => refererFromSignedCookie(resolved, request) : undefined,
     };
 }
 
@@ -329,7 +348,9 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
     if (!token) {
         // Not solved yet. The return URL keeps the query string (gclid, utm_*, ...): request.uri is only the path.
         const originalUrl = request.querystring ? `${request.uri}?${request.querystring}` : request.uri;
-        return challengePage(settings, response, originalUrl);
+        // Where the visitor came from, carried by the form: after the CAPTCHA the browser only knows this page.
+        const originalReferer = statelessUtils.originalReferer(request.headers["referer"]?.[0]?.value, request.headers["host"]?.[0]?.value);
+        return challengePage(settings, response, originalUrl, undefined, originalReferer);
     }
     // else : user already solved the challenge and submitted the form with the token. Verify it with Cloudflare's siteverify.
 
@@ -411,11 +432,19 @@ function unavailableAnswer(settings: ResolvedTurnstileSettings, pause: Siteverif
  * answering the reply that did not pause the CAPTCHA. Solving it returns to the same page.
  */
 function challengeRetryPage(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, errorMessage: string): CloudFrontResultResponse {
-    return challengePage(settings, response, returnPath(request, queryStringData), errorMessage);
+    return challengePage(settings, response, returnPath(request, queryStringData), errorMessage, carriedReferer(request, queryStringData));
 }
 
-/** The 403 page with the Turnstile widget. `originalUrl` is where the visitor goes once solved. */
-function challengePage(settings: ResolvedTurnstileSettings, response: RTIResponse, originalUrl: string, errorMessage?: string): CloudFrontResultResponse {
+/** The original_referer the challenge page carried, checked again: the client controls the query string. */
+function carriedReferer(request: CloudFrontRequest, queryStringData: URLSearchParams): string | undefined {
+    return statelessUtils.originalReferer(queryStringData.get("original_referer"), request.headers["host"]?.[0]?.value);
+}
+
+/**
+ * The 403 page with the Turnstile widget. `originalUrl` is where the visitor goes once solved. `originalReferer` is where
+ * they came from (see RTIStatelessUtils.originalReferer); it goes back in the _cq_ref cookie once the CAPTCHA is solved.
+ */
+function challengePage(settings: ResolvedTurnstileSettings, response: RTIResponse, originalUrl: string, errorMessage?: string, originalReferer?: string): CloudFrontResultResponse {
     const html = `<!DOCTYPE html>
                     <html lang="en">
                     <head>
@@ -650,6 +679,7 @@ function challengePage(settings: ResolvedTurnstileSettings, response: RTIRespons
                         <form id="captcha-form" method="GET">${/* No action: the form goes back to this page's own URL, exactly as the browser requested it. An action built from request.uri would send a path like "//evil.com/" (with the token) to another site. */ ""}
                             <input type="hidden" name="original_url" value="${escapeHtml(originalUrl)}">
                             <input type="hidden" name="request_id" value="${escapeHtml(response.ids.rayId)}">
+                            ${originalReferer ? `<input type="hidden" name="original_referer" value="${escapeHtml(originalReferer)}">` : ""}
                             
                             <div class="captcha-box">
                             <div class="cf-turnstile" 
@@ -860,6 +890,15 @@ function challengePassed(settings: ResolvedTurnstileSettings, request: CloudFron
         // subrequests (iframes, images, fetch) and cross-site POSTs. Do not change to Strict.
         "set-cookie": [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}` }],
     };
+    // Where the visitor came from before the CAPTCHA, for one of two readers (only one cookie is set):
+    // "header": _cq_rf, signed and HttpOnly, for the Lambda: on the landing request it becomes x-cheq-original-referer.
+    // "cookie": _cq_ref, readable, for the site's own scripts. 
+    const refererCookieToSet = settings.originalRefererVia === "header"
+        ? signedRefererCookie(settings, request, queryStringData) :
+        readableRefererCookie(request, queryStringData);
+    if (refererCookieToSet) {
+        headers["set-cookie"].push({ key: 'Set-Cookie', value: refererCookieToSet });
+    }
     // Adds x-cheq-rti-result (the verdict of this request), provided by the handler. This 302 goes to the BROWSER
     // (not the origin), so the client sees verdict, threat-type-code and ids. The redirected request is checked by
     // RTI again and gets its own header on the way to the origin.
@@ -869,6 +908,76 @@ function challengePassed(settings: ResolvedTurnstileSettings, request: CloudFron
         status: '302',
         headers,
     };
+}
+
+/**
+ * The _cq_ref cookie: where the visitor came from before the CAPTCHA, for the site's own scripts (document.referrer
+ * now shows the CAPTCHA page). Not HttpOnly, so scripts can read it. Only set on the 302 after a verified solve.
+ * Same format as version 1.0.0, so sites that already read it keep working: `{return URL}|{Referer}`, both
+ * URL-encoded, Path=/. 60 seconds (1.0.0 used 120). This code never reads it back, so a planted value can't reach RTI or the origin.
+ */
+function readableRefererCookie(request: CloudFrontRequest, queryStringData: URLSearchParams): string | undefined {
+    const referer = carriedReferer(request, queryStringData);
+    if (!referer) {
+        return undefined;
+    }
+    return `_cq_ref=${statelessUtils.originalRefererCookieValue(returnPath(request, queryStringData), referer)}; Path=/; Secure; SameSite=Lax; Max-Age=${ORIGINAL_REFERER_COOKIE_MAX_AGE_SECONDS}`;
+}
+
+const SIGNED_REFERER_COOKIE = "_cq_rf";
+
+/**
+ * The _cq_rf cookie (originalRefererVia "header"): the original Referer for the landing request, where
+ * refererFromSignedCookie turns it into the x-cheq-original-referer header. Signed like _cq_se, and also bound to the
+ * landing page, so it can't be made up, edited, or used from another client or page. HttpOnly: scripts can't see it.
+ * Format: `{expiresAt}.{signature}|{Referer, URL-encoded}`. It can't be deleted after use (a forwarded request has no
+ * response to set cookies on): it simply expires after 60 seconds.
+ */
+function signedRefererCookie(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, queryStringData: URLSearchParams): string | undefined {
+    const referer = carriedReferer(request, queryStringData);
+    if (!referer) {
+        return undefined;
+    }
+    const path = landingPath(request, queryStringData);
+    const expiresAt = Date.now() + ORIGINAL_REFERER_COOKIE_MAX_AGE_SECONDS * 1000;
+    const signature = signReferer(settings.sessionSigningSecret, expiresAt, referer, path, sessionBindingKey(settings, request));
+    return `${SIGNED_REFERER_COOKIE}=${expiresAt}.${signature}|${encodeURIComponent(referer)}; Path=${statelessUtils.cookiePath(path)}; HttpOnly; Secure; SameSite=Lax; Max-Age=${ORIGINAL_REFERER_COOKIE_MAX_AGE_SECONDS}`;
+}
+
+/**
+ * The original Referer from a valid _cq_rf cookie, or undefined: no cookie, a format other than the one issued,
+ * expired, or a signature that doesn't match (edited, made up, another client or another page).
+ */
+function refererFromSignedCookie(settings: ResolvedTurnstileSettings, request: CloudFrontRequest): string | undefined {
+    const raw = cookieValue(requestCookies(request), SIGNED_REFERER_COOKIE);
+    const separator = raw?.indexOf("|") ?? -1;
+    if (!raw || separator < 0) {
+        return undefined;
+    }
+    const parts = raw.slice(0, separator).split(".");
+    const expiresAt = statelessUtils.parseExpiresAt(parts[0]);
+    if (parts.length !== 2 || expiresAt === undefined || Date.now() > expiresAt) {
+        return undefined;
+    }
+    let referer: string;
+    try {
+        referer = decodeURIComponent(raw.slice(separator + 1));
+    } catch {
+        return undefined;
+    }
+    const expected = Buffer.from(signReferer(settings.sessionSigningSecret, expiresAt, referer, request.uri, sessionBindingKey(settings, request)));
+    const actual = Buffer.from(parts[1]);
+    return actual.length === expected.length && timingSafeEqual(actual, expected) ? referer : undefined;
+}
+
+// Like signSession, with its own label ("rf") so a session signature can never pass as a Referer one.
+function signReferer(secret: string, expiresAt: number, referer: string, path: string, bindingKey: string): string {
+    return createHmac("sha256", secret).update(JSON.stringify(["rf", expiresAt, referer, path, bindingKey])).digest("hex").slice(0, 32);
+}
+
+// The landing page's path: original_url without its query and #fragment.
+function landingPath(request: CloudFrontRequest, queryStringData: URLSearchParams): string {
+    return returnPath(request, queryStringData).split(/[?#]/)[0];
 }
 
 const turnstileValidateChallengeExample = async (settings: ResolvedTurnstileSettings, request: CloudFrontRequest, isDebug: boolean | undefined = false, warnCloudFrontUserAgent?: () => void): Promise<boolean> => {
@@ -904,11 +1013,9 @@ const turnstileValidateChallengeExample = async (settings: ResolvedTurnstileSett
                 return false; 
             }
 
-            // The only accepted spelling is the one challengePassed issues: `${expiresAt}` of a safe integer. Anything
-            // else reads as a number but is not what we wrote ("123abc" for parseInt, "0123", " 123", "+123", "1e13",
-            // "12.0" for Number), so the round trip rejects it; isSafeInteger rules out a value Number() rounded.
-            const expiresAt = Number(expiresAtStr);
-            if (!Number.isSafeInteger(expiresAt) || String(expiresAt) !== expiresAtStr) {
+            // Only the exact spelling challengePassed issues (see RTIStatelessUtils.parseExpiresAt).
+            const expiresAt = statelessUtils.parseExpiresAt(expiresAtStr);
+            if (expiresAt === undefined) {
                 if (isDebug) {
                     console.log("[validateChallenge] invalid expiresAt format, returning 'false'");
                 }

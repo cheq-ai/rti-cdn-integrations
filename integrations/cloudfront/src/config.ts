@@ -60,6 +60,15 @@ export interface CloudfrontConfig extends Config {
     isChallengeResponse?: (request: CloudFrontRequest) => boolean;
 
     /**
+     * Called on every request. Returns where the visitor came from before a CAPTCHA they just solved, or `undefined`.
+     * The value is added to the request as `x-cheq-original-referer`, so RTI and the origin get it. A copy sent by the
+     * client is always removed first. If it throws, the request goes on without the header and the error is logged.
+     * The Turnstile example returns it only with `originalRefererVia: "header"` (the default).
+     * @param request
+     */
+    originalReferer?: (request: CloudFrontRequest) => string | undefined;
+
+    /**
      * The list of headers to keep in the request that will be sent to RTI. 
      * This is optional and can be used to reduce the size of the request if there are many headers that are not needed. 
      * If not provided (meaning empty array, null or undefined are not allowed), all headers will be kept.
@@ -101,6 +110,11 @@ const turnstileConfig: TurnstileSettings = {
     //   fail closed: 0         - never skipped; visitors keep getting the CAPTCHA until Cloudflare is back
     siteverifyErrorsToPause: 3,
     siteverifyPauseSeconds: 60,
+
+    // After a CAPTCHA the browser's Referer is the CAPTCHA page. Where the visitor really came from reaches the site as:
+    //   "header" (default): the x-cheq-original-referer request header, for the origin and RTI (page scripts can't see it)
+    //   "cookie":           the _cq_ref cookie, for the site's own scripts (see "The original Referer" in the README)
+    originalRefererVia: "header",
 };
 
 // The three callbacks are undefined until the three secrets above are set.
@@ -125,6 +139,7 @@ export const config: CloudfrontConfig = {
     challenge: turnstileChallenge.challenge,
     validateChallenge: turnstileChallenge.validateChallenge,
     isChallengeResponse: turnstileChallenge.isChallengeResponse,
+    originalReferer: turnstileChallenge.originalReferer,
 
     // Example for ignored paths
     ignorePaths: [

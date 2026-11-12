@@ -2673,3 +2673,46 @@ describe('request-helper handle', () => {
         expect(event.Records[0].cf.request.querystring).toBe(replyQuery);
     });
 });
+
+describe('x-cheq-original-referer', () => {
+    const event = (headers: Record<string, string> = {}) => buildEvent('/page', 'example.com', '1.2.3.4', '', '', { extraHeaders: headers });
+    afterEach(() => { delete (config as any).originalReferer; });
+
+    it('a copy sent by the client is always removed', async () => {
+        mocks.shouldIgnore.mockReturnValueOnce(true); // returns before RTI: still removed
+        const e = event({ 'x-cheq-original-referer': 'https://evil.example' });
+        await handle(e, RequestType.VIEWER_REQUEST);
+        expect(e.Records[0].cf.request.headers['x-cheq-original-referer']).toBeUndefined();
+    });
+
+    it('set from config.originalReferer, before RTI is called (so RTI gets it too)', async () => {
+        (config as any).originalReferer = vi.fn().mockReturnValue('https://www.google.com');
+        mocks.shouldIgnore.mockReturnValueOnce(false);
+        let seenByRti: unknown;
+        mocks.callRTI.mockImplementationOnce(async (payload: any) => { seenByRti = payload.endUserParams.headers['x-cheq-original-referer']; throw new Error('stop'); });
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const e = event({ 'x-cheq-original-referer': 'https://evil.example' });
+        await handle(e, RequestType.VIEWER_REQUEST);
+        expect(e.Records[0].cf.request.headers['x-cheq-original-referer']).toEqual([{ key: 'x-cheq-original-referer', value: 'https://www.google.com' }]);
+        expect(seenByRti).toBe('https://www.google.com');
+    });
+
+    it('no value: no header', async () => {
+        (config as any).originalReferer = vi.fn().mockReturnValue(undefined);
+        mocks.shouldIgnore.mockReturnValueOnce(true);
+        const e = event();
+        await handle(e, RequestType.VIEWER_REQUEST);
+        expect(e.Records[0].cf.request.headers['x-cheq-original-referer']).toBeUndefined();
+    });
+
+    it('if it throws: no header, logged, and the request goes on', async () => {
+        (config as any).originalReferer = vi.fn(() => { throw new Error('boom'); });
+        mocks.shouldIgnore.mockReturnValueOnce(true);
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const e = event();
+        const result = await handle(e, RequestType.VIEWER_REQUEST);
+        expect(result).toBe(e.Records[0].cf.request);
+        expect(e.Records[0].cf.request.headers['x-cheq-original-referer']).toBeUndefined();
+        expect(error).toHaveBeenCalledWith(expect.stringContaining('[challenge] originalReferer failed'));
+    });
+});

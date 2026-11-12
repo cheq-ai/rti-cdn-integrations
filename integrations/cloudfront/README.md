@@ -846,6 +846,10 @@ every solve, a CAPTCHA loop with the warning `hostname '…' ≠ request host '�
 domains. Case and a `:port` are ignored. A list with anything but host names in it is ignored with a warning, and the
 `Host` check is used.
 
+`originalRefererVia` (default `"header"`): how the page the visitor came from before the CAPTCHA reaches the site,
+in the `x-cheq-original-referer` request header (`"header"`) or the `_cq_ref` cookie for the site's scripts
+(`"cookie"`); see [The original Referer](#the-original-referer). Any other value logs a warning and `"header"` is used.
+
 `sessionBinding` (default `{ ip: "exact", userAgent: true }`) binds the session to the client that solved the challenge,
 so a copied cookie does not work elsewhere; see [Session binding](#session-binding). `ip` is `"exact"` or `"none"`,
 `userAgent` is `true` or `false`; any other value logs a warning and the default is used.
@@ -946,7 +950,8 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
  Does the request have a `cf-turnstile-response` query parameter?
         │
    NO ──┤──► Return HTTP 403 with CAPTCHA challenge page
-        │       (Turnstile widget + hidden form; `original_url` holds the path and query string)
+        │       (Turnstile widget + hidden form; `original_url` holds the path and query string,
+        │        `original_referer` where the visitor came from, see The original Referer)
         │       User solves the CAPTCHA
         │       Turnstile widget injects hidden `cf-turnstile-response` input into the form
         │       Form (no action) submits (GET) to the page's own URL: the query becomes original_url,
@@ -977,6 +982,9 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
            same-site path, or the request's own path plus ?query / #fragment (kept even
            for a path like //page), otherwise the request URI is used)
           Set-Cookie: _cq_se={token}|{rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=300
+          Set-Cookie: _cq_rf={signed original Referer}; Path={landing path}; HttpOnly; Secure; SameSite=Lax; Max-Age=60
+          (only with an original_referer; with originalRefererVia: "cookie" instead
+           _cq_ref={return URL}|{Referer}; Path=/; Secure; SameSite=Lax; Max-Age=60; see The original Referer)
           x-cheq-rti-result: version=…;verdict=…;threat-type-code=…;ids={…}
 ```
 
@@ -1179,6 +1187,57 @@ that half of the binding means nothing (sessions still work, bound by IP only). 
 forward `user-agent` (`OriginRequestPolicy`, `OriginRequestPolicyNoHost`, the `TrustedIP` variants and
 `OriginRequestPolicyAllHeadersAllowed`); a custom policy must too. The example logs a warning once per cold start when it
 sees `User-Agent: Amazon CloudFront`. `request.clientIp` is the viewer's address on both triggers.
+
+### The original Referer
+
+After a CAPTCHA, the landing page's `Referer` (and `document.referrer`) is the CAPTCHA page, not the page the visitor
+came from (Google, an ad, a partner). The example carries the original Referer through the CAPTCHA:
+
+1. The challenge page puts it in a hidden field, `original_referer`, the way a browser sends a Referer by default:
+   - from another site, only its origin, as browsers send it: `https://www.google.com/`
+   - from this host, the full URL without the `#fragment`: `https://shop.com/category?page=2`
+   - cut to 420 characters (the most GA4 keeps for `page_referrer`), never in the middle of an encoded character
+   - nothing for no Referer, or one that is not an http(s) URL
+2. The form sends it with the token. It is in the answer's URL, like the Referer already is in CloudFront's logs.
+3. Only on the 302 after a **verified** solve, the Lambda checks it again (the client controls the URL) and hands it
+   on in a cookie (below). A failed token, a retry page or a paused CAPTCHA set nothing.
+
+`originalRefererVia` in `turnstileConfig` says who gets it:
+
+| `originalRefererVia` | Cookie on the 302 | Who gets the Referer |
+|---|---|---|
+| `"header"` (default) | `_cq_rf`, signed and `HttpOnly`, landing page only, 60 seconds | The origin and RTI: on the landing request the Lambda adds `x-cheq-original-referer: https://www.google.com/` |
+| `"cookie"` | `_cq_ref`, readable by scripts, `Path=/`, 60 seconds | The site's own scripts (snippet below). The Lambda never reads it back |
+
+**`"header"`:**
+
+- `_cq_rf={expiresAt}.{signature}|{Referer, URL-encoded}`. The signature is an HMAC with `sessionSigningSecret` over
+  the expiry, the Referer, the landing page's path and the client binding (IP and User-Agent, per `sessionBinding`),
+  like `_cq_se`. A made-up, edited, expired or copied cookie, or one sent to another page, adds no header.
+- An `x-cheq-original-referer` sent by the client is always removed first, so only a solved CAPTCHA can set it.
+- The header is added before the RTI call, so RTI gets it too (with `keepHeadersNames: []`).
+- The cookie can't be deleted after use (a forwarded request has no response to set it on), so a reload of the
+  landing page within 60 seconds gets the header again.
+- The origin must receive the header: the default `OriginRequestPolicy` forwards all viewer headers; a header-list
+  policy must list `x-cheq-original-referer`.
+- If the origin writes it into the HTML (for analytics), that page must not be cached, or the next visitor gets it too.
+- A custom challenge can set it the same way: `config.originalReferer(request)` is called on every request, and what it
+  returns becomes the header.
+
+- The landing page's path goes into `_cq_rf`'s `Path` (`/` if it has a `;`, `,` or a space).
+
+**`"cookie"`:** the same format as version 1.0.0, so a site that already reads it needs no change:
+`_cq_ref={return URL}|{Referer}`, both URL-encoded, `Path=/; Secure; SameSite=Lax; Max-Age=60` (1.0.0 used 120). Read it before the
+analytics tag reads the referrer:
+
+```js
+const carried = document.cookie.split('; ').find(c => c.startsWith('_cq_ref='));
+const originalReferrer = carried ? decodeURIComponent(carried.split('|')[1] ?? '') : document.referrer;
+```
+
+A planted or edited `_cq_ref` can only fool the site's own scripts: RTI and the origin never get its value.
+
+In both modes, **a request with a body** (`actionOnSuspicious` CHALLENGE) carries its own Referer, the form page.
 
 ### Implementing a Custom Challenge
 

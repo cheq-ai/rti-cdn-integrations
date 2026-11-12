@@ -15,6 +15,7 @@ import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers'
 import { randomUUID } from 'node:crypto';
 import { stringifyRedactedEvent } from './log-redaction';
 import { ResponseHeaders } from './response-headers';
+import { RTIStatelessUtils } from '../../core/services/rti-stateless-utils';
 
 export enum RequestType {
   VIEWER_REQUEST,
@@ -24,6 +25,9 @@ export enum RequestType {
 const logger = new RTIHttpsLoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIHttpsService(config);
+
+// Set only by a solved CAPTCHA (see restoreOriginalReferer), never by the client.
+const ORIGINAL_REFERER_HEADER = RTIStatelessUtils.ORIGINAL_REFERER_HEADER;
 
 // Our block, 404 and redirect answers are never cached.
 const responseHeaders = new ResponseHeaders();
@@ -59,6 +63,9 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
     // A client must not be able to hand the origin its own verdict: on paths that return without one (ignored
     // path, RTI error, challenge error) its copy would reach the origin. CloudFront lowercases header names.
     delete cfRequest.headers["x-cheq-rti-result"];
+    // Same for the original Referer: only a solved CAPTCHA sets it, never the client.
+    delete cfRequest.headers[ORIGINAL_REFERER_HEADER];
+    restoreOriginalReferer(cfRequest);
 
     try {
         // Filter out ignored paths. A valid challenge session does not skip RTI: it is checked only when RTI
@@ -347,6 +354,22 @@ function refererAfterChallengeRequest(request: CloudFrontRequest): CloudFrontReq
     const { body: _body, ...withoutBody } = request;
     const referer = rtiHelperService.sameSiteReferer(request.headers['referer']?.[0]?.value, request.headers['host']?.[0]?.value);
     return { ...withoutBody, method: 'GET', uri: referer?.path ?? '/', querystring: referer?.query ?? '' };
+}
+
+// After a solved CAPTCHA: where the visitor came from before it, as x-cheq-original-referer for RTI and the origin.
+// An error only means no header: the request goes on.
+function restoreOriginalReferer(request: CloudFrontRequest): void {
+    if (!config.originalReferer) {
+        return;
+    }
+    try {
+        const referer = config.originalReferer(request);
+        if (referer) {
+            request.headers[ORIGINAL_REFERER_HEADER] = [{ key: ORIGINAL_REFERER_HEADER, value: referer }];
+        }
+    } catch (e) {
+        console.error(`[challenge] originalReferer failed, forwarding without ${ORIGINAL_REFERER_HEADER}: ${rtiHelperService.errorMessage(e)}`);
+    }
 }
 
 // Our own 403 or 404 page for a blocked request.

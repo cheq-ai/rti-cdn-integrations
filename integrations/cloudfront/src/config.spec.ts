@@ -29,12 +29,13 @@ describe('shipped config.ts', () => {
         expect(warn).toHaveBeenCalledWith(expect.stringContaining('siteKey, secretKey, sessionSigningSecret'));
     });
 
-    it('passes the turnstile settings to createTurnstileChallenge and wires the three callbacks it returns', async () => {
+    it('passes the turnstile settings to createTurnstileChallenge and wires the four callbacks it returns', async () => {
         vi.resetModules();
         const challenge = vi.fn();
         const validateChallenge = vi.fn();
         const isChallengeResponse = vi.fn();
-        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge, isChallengeResponse }));
+        const originalReferer = vi.fn();
+        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge, isChallengeResponse, originalReferer }));
         vi.doMock('./turnstile-challenge-example', () => ({ createTurnstileChallenge }));
 
         const config = await loadConfig();
@@ -48,7 +49,9 @@ describe('shipped config.ts', () => {
             sessionBinding: { ip: 'exact', userAgent: true },
             siteverifyErrorsToPause: 3,
             siteverifyPauseSeconds: 60,
+            originalRefererVia: 'header',
         });
+        expect(config.originalReferer).toBe(originalReferer);
         expect(config.challenge).toBe(challenge);
         expect(config.validateChallenge).toBe(validateChallenge);
         expect(config.isChallengeResponse).toBe(isChallengeResponse);

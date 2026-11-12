@@ -124,10 +124,11 @@ async function issueSession(rayId: string, settings = testSettings, now?: number
 }
 
 describe('createTurnstileChallenge', () => {
-    it('returns exactly challenge, validateChallenge and isChallengeResponse when all settings are set, without warning', () => {
+    it('returns exactly challenge, validateChallenge, isChallengeResponse and originalReferer when all settings are set, without warning', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const result = createTurnstileChallenge(testSettings);
-        expect(Object.keys(result).sort()).toEqual(['challenge', 'isChallengeResponse', 'validateChallenge']);
+        expect(Object.keys(result).sort()).toEqual(['challenge', 'isChallengeResponse', 'originalReferer', 'validateChallenge']);
+        expect(result.originalReferer).toBeTypeOf('function'); // "header" is the default
         expect(result.challenge).toBeTypeOf('function');
         expect(result.validateChallenge).toBeTypeOf('function');
         expect(result.isChallengeResponse).toBeTypeOf('function');
@@ -2511,5 +2512,253 @@ describe('session binding: every spelling of an address (seeded random)', () => 
             expect(bind(v4, 'none')).toBe('');
             expect(bind(v6, 'none')).toBe('');
         }
+    });
+});
+
+describe('original Referer (_cq_ref)', () => {
+    // These tests are for originalRefererVia "cookie"; "header" (the default) is tested below.
+    const { challenge } = build({ ...testSettings, originalRefererVia: 'cookie' });
+    const withReferer = (referer: string | undefined, querystring = '', host = 'example.com'): CloudFrontRequest => {
+        const request = buildTurnstileRequest(querystring, host);
+        if (referer !== undefined) {
+            request.headers['referer'] = [{ key: 'Referer', value: referer }];
+        }
+        return request;
+    };
+    const entities: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+    const fieldOf = (body: string, name: string): string | undefined => body.match(new RegExp(`name="${name}" value="([^"]*)"`))?.[1]
+        .replace(/&(amp|lt|gt|quot|#39);/g, (_: string, e: string) => entities[e]);
+    const refererCookie = (result: any): string | undefined =>
+        result.headers?.['set-cookie']?.map((c: { value: string }) => c.value).find((v: string) => v.startsWith('_cq_ref='));
+    const solved = (fields: Record<string, string>) =>
+        new URLSearchParams({ original_url: '/page', request_id: 'ray-123', ...fields, 'cf-turnstile-response': 'valid-token' }).toString();
+
+    describe('the challenge page carries it in a hidden field', () => {
+        it.each([
+            ['another site: its origin only', 'https://www.google.com/search?q=shoes', 'https://www.google.com/'],
+            ['this host: the full URL without #', 'https://example.com/list?page=2&sort=a#top', 'https://example.com/list?page=2&sort=a'],
+        ])('%s', async (_name, referer, expected) => {
+            const page = await challenge(withReferer(referer), buildRTIResponse()) as any;
+            expect(fieldOf(page.body, 'original_referer')).toBe(expected);
+        });
+
+        it('HTML-escapes it', async () => {
+            const page = await challenge(withReferer('https://example.com/a?q="><script>x</script>'), buildRTIResponse()) as any;
+            expect(page.body).not.toContain('<script>x</script>');
+            expect(fieldOf(page.body, 'original_referer')).toBe('https://example.com/a?q=%22%3E%3Cscript%3Ex%3C/script%3E');
+        });
+
+        it.each([
+            ['no Referer', undefined],
+            ['not a URL', 'not a url'],
+            ['not http(s)', 'javascript:alert(1)'],
+        ])('%s: no field', async (_name, referer) => {
+            const page = await challenge(withReferer(referer), buildRTIResponse()) as any;
+            expect(page.body).not.toContain('original_referer');
+        });
+
+        it('cuts a long one to 420 characters', async () => {
+            const page = await challenge(withReferer(`https://example.com/s?q=${'a'.repeat(1000)}`), buildRTIResponse()) as any;
+            expect(fieldOf(page.body, 'original_referer')).toHaveLength(420);
+        });
+    });
+
+    describe('a solved CAPTCHA returns it in the _cq_ref cookie', () => {
+        it('in the same format as 1.0.0 ({return URL}|{Referer}, Path=/), 60 seconds, readable by scripts', async () => {
+            stubSiteverify(true);
+            const result = await challenge(buildTurnstileRequest(solved({ original_url: '/shop/item?x=1#a', original_referer: 'https://www.google.com' })), buildRTIResponse()) as any;
+            expect(result.status).toBe('302');
+            expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=/); // the session stays first
+            expect(refererCookie(result)).toBe('_cq_ref=%2Fshop%2Fitem%3Fx%3D1%23a|https%3A%2F%2Fwww.google.com%2F; Path=/; Secure; SameSite=Lax; Max-Age=60');
+            expect(refererCookie(result)).not.toContain('HttpOnly');
+        });
+
+        it('1.0.0\'s snippet reads it: the part after |, decoded', async () => {
+            stubSiteverify(true);
+            const result = await challenge(buildTurnstileRequest(solved({ original_referer: 'https://www.google.com/' })), buildRTIResponse()) as any;
+            const carried = refererCookie(result)!.split(';')[0];
+            expect(decodeURIComponent(carried.split('|')[1] ?? '')).toBe('https://www.google.com/');
+        });
+
+        it('the whole trip: page, then the form, then the cookie decodes to the Referer', async () => {
+            const original = withReferer('https://example.com/list?q=caf%C3%A9&n=1#x', 'utm_source=a');
+            const page = await challenge(original, buildRTIResponse()) as any;
+            const submitted = new URLSearchParams({ original_url: fieldOf(page.body, 'original_url')!, request_id: 'ray-123', original_referer: fieldOf(page.body, 'original_referer')!, 'cf-turnstile-response': 'tok' }).toString();
+
+            stubSiteverify(true);
+            const result = await challenge(buildTurnstileRequest(submitted), buildRTIResponse()) as any;
+            const [returnUrl, value] = refererCookie(result)!.split(';')[0].slice('_cq_ref='.length).split('|');
+            expect(decodeURIComponent(value)).toBe('https://example.com/list?q=caf%C3%A9&n=1');
+            expect(decodeURIComponent(returnUrl)).toBe('/page?utm_source=a');
+        });
+
+        it.each([
+            ['another site sent as a full URL: cut to its origin', 'https://www.google.com/search?q=private', 'https://www.google.com/'],
+            ['this host: kept', 'https://example.com/a?b=1', 'https://example.com/a?b=1'],
+            ['too long: cut to 420', `https://example.com/a?q=${'b'.repeat(900)}`, `https://example.com/a?q=${'b'.repeat(420 - 'https://example.com/a?q='.length)}`],
+        ])('checks the value again (the client controls the URL): %s', async (_name, sent, expected) => {
+            stubSiteverify(true);
+            const result = await challenge(buildTurnstileRequest(solved({ original_referer: sent })), buildRTIResponse()) as any;
+            expect(decodeURIComponent(refererCookie(result)!.split(';')[0].split('|')[1])).toBe(expected);
+        });
+
+        it.each([
+            ['no field', {}],
+            ['empty', { original_referer: '' }],
+            ['not http(s)', { original_referer: 'javascript:alert(1)' }],
+            ['not a URL', { original_referer: 'x' }],
+        ])('%s: no cookie, only the session', async (_name, fields) => {
+            stubSiteverify(true);
+            const result = await challenge(buildTurnstileRequest(solved(fields)), buildRTIResponse()) as any;
+            expect(result.headers['set-cookie']).toHaveLength(1);
+            expect(refererCookie(result)).toBeUndefined();
+        });
+    });
+
+    describe('only after a verified solve', () => {
+        it('a rejected token: no cookie, and the retry page keeps carrying it', async () => {
+            stubSiteverify(false);
+            const result = await challenge(buildTurnstileRequest(solved({ original_referer: 'https://www.google.com' })), buildRTIResponse()) as any;
+            expect(result.status).toBe('403');
+            expect(refererCookie(result)).toBeUndefined();
+            expect(fieldOf(result.body, 'original_referer')).toBe('https://www.google.com/');
+        });
+
+        it('siteverify down: the retry page keeps carrying it', async () => {
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const result = await challenge(buildTurnstileRequest(solved({ original_referer: 'https://www.google.com' })), buildRTIResponse()) as any;
+            expect(result.status).toBe('403');
+            expect(fieldOf(result.body, 'original_referer')).toBe('https://www.google.com/');
+        });
+
+        it('the CAPTCHA paused (fail open): a 302 without the cookie', async () => {
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 1, originalRefererVia: 'cookie' });
+            const result = await cb.challenge(buildTurnstileRequest(solved({ original_referer: 'https://www.google.com' })), buildRTIResponse()) as any;
+            expect(result.status).toBe('302');
+            expect(refererCookie(result)).toBeUndefined();
+        });
+    });
+
+    it('validateChallenge ignores _cq_ref: a planted value changes nothing', async () => {
+        const { cookie } = await issueSession('ray-1');
+        expect(await validateChallenge(buildRequest(`${cookie}; _cq_ref=https%3A%2F%2Fevil.example`), false)).toBe(true);
+        expect(await validateChallenge(buildRequest('_cq_ref=https%3A%2F%2Fevil.example'), false)).toBe(false);
+    });
+});
+
+describe('original Referer (originalRefererVia "header", the default)', () => {
+    const solved = (fields: Record<string, string>) =>
+        new URLSearchParams({ original_url: '/shop/item?x=1', request_id: 'ray-123', ...fields, 'cf-turnstile-response': 'valid-token' }).toString();
+    const rfCookie = (result: any): string | undefined =>
+        result.headers?.['set-cookie']?.map((c: { value: string }) => c.value).find((v: string) => v.startsWith('_cq_rf='));
+    const landing = (cookie: string | undefined, uri = '/shop/item', clientIp = '1.2.3.4', userAgent?: string): CloudFrontRequest => {
+        const request = buildTurnstileRequest('x=1', 'example.com', cookie);
+        (request as any).uri = uri;
+        (request as any).clientIp = clientIp;
+        if (userAgent) request.headers['user-agent'] = [{ key: 'User-Agent', value: userAgent }];
+        return request;
+    };
+    /** Solves the CAPTCHA and returns the _cq_rf cookie as the browser sends it back (`_cq_rf=...`). */
+    async function solve(referer = 'https://www.google.com', settings: TurnstileSettings = testSettings): Promise<string> {
+        stubSiteverify(true);
+        const result = await build(settings).challenge(buildTurnstileRequest(solved({ original_referer: referer })), buildRTIResponse()) as any;
+        return rfCookie(result)!.split(';')[0];
+    }
+
+    it('the 302 sets _cq_rf: signed, HttpOnly, for the landing page, 60 seconds; no _cq_ref', async () => {
+        stubSiteverify(true);
+        const result = await challenge(buildTurnstileRequest(solved({ original_referer: 'https://www.google.com' })), buildRTIResponse()) as any;
+        expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=/);
+        expect(rfCookie(result)).toMatch(/^_cq_rf=\d+\.[0-9a-f]{32}\|https%3A%2F%2Fwww\.google\.com%2F; Path=\/shop\/item; HttpOnly; Secure; SameSite=Lax; Max-Age=60$/);
+        expect(result.headers['set-cookie'].some((c: { value: string }) => c.value.startsWith('_cq_ref='))).toBe(false);
+    });
+
+    it('no original_referer: no _cq_rf', async () => {
+        stubSiteverify(true);
+        const result = await challenge(buildTurnstileRequest(solved({})), buildRTIResponse()) as any;
+        expect(result.headers['set-cookie']).toHaveLength(1);
+    });
+
+    it('the landing request gets the Referer back', async () => {
+        const cookie = await solve();
+        expect(build(testSettings).originalReferer!(landing(cookie))).toBe('https://www.google.com/');
+    });
+
+    it('a same-host Referer comes back whole', async () => {
+        const cookie = await solve('https://example.com/list?page=2&q=caf%C3%A9');
+        expect(build(testSettings).originalReferer!(landing(cookie))).toBe('https://example.com/list?page=2&q=caf%C3%A9');
+    });
+
+    it.each([
+        ['no cookie', () => undefined],
+        ['a made-up cookie', () => `_cq_rf=${Date.now() + 60000}.${'0'.repeat(32)}|https%3A%2F%2Fevil.example`],
+    ])('%s: undefined', async (_name, cookie) => {
+        expect(build(testSettings).originalReferer!(landing(cookie()))).toBeUndefined();
+    });
+
+    it('an edited Referer fails the signature', async () => {
+        const cookie = await solve();
+        const edited = cookie.replace('www.google.com', 'evil.example');
+        expect(build(testSettings).originalReferer!(landing(edited))).toBeUndefined();
+    });
+
+    it('an edited expiry fails the signature', async () => {
+        const cookie = await solve();
+        const edited = cookie.replace(/=(\d+)\./, (_m, t) => `=${Number(t) + 3600000}.`);
+        expect(build(testSettings).originalReferer!(landing(edited))).toBeUndefined();
+    });
+
+    it('expired after 60 seconds', async () => {
+        const start = Date.now();
+        vi.spyOn(Date, 'now').mockReturnValue(start);
+        const cookie = await solve();
+        vi.spyOn(Date, 'now').mockReturnValue(start + 60_001);
+        expect(build(testSettings).originalReferer!(landing(cookie))).toBeUndefined();
+    });
+
+    it('only for the landing page', async () => {
+        const cookie = await solve();
+        expect(build(testSettings).originalReferer!(landing(cookie, '/shop/item/other'))).toBeUndefined();
+    });
+
+    it('only for the same client (IP and User-Agent, per sessionBinding)', async () => {
+        const cookie = await solve();
+        const cb = build(testSettings);
+        expect(cb.originalReferer!(landing(cookie, '/shop/item', '5.6.7.8'))).toBeUndefined();
+        expect(cb.originalReferer!(landing(cookie, '/shop/item', '1.2.3.4', 'Other/1.0'))).toBeUndefined();
+    });
+
+    it('signed with sessionSigningSecret: another secret rejects it', async () => {
+        const cookie = await solve();
+        expect(build({ ...testSettings, sessionSigningSecret: 'another-secret' }).originalReferer!(landing(cookie))).toBeUndefined();
+    });
+
+    it.each([
+        ['no |', '_cq_rf=123.abc'],
+        ['three parts', '_cq_rf=1.2.3|x'],
+        ['expiry not a number', '_cq_rf=abc.0123456789abcdef0123456789abcdef|x'],
+        ['expiry with a leading zero', `_cq_rf=0${Date.now() + 60000}.0123456789abcdef0123456789abcdef|x`],
+        ['bad encoding', `_cq_rf=${Date.now() + 60000}.0123456789abcdef0123456789abcdef|%E0%A4%A`],
+    ])('a cookie in another format (%s): undefined, no throw', (_name, cookie) => {
+        expect(build(testSettings).originalReferer!(landing(cookie))).toBeUndefined();
+    });
+
+    it('a _cq_se signature never passes as a _cq_rf one', async () => {
+        const { expiresAt, signature } = await issueSession('ray-1');
+        expect(build(testSettings).originalReferer!(landing(`_cq_rf=${expiresAt}.${signature}|ray-1`))).toBeUndefined();
+    });
+
+    it('"cookie" mode returns no originalReferer callback', () => {
+        expect(createTurnstileChallenge({ ...testSettings, originalRefererVia: 'cookie' }).originalReferer).toBeUndefined();
+    });
+
+    it.each([['x'], [''], [null], [1]])('an invalid originalRefererVia %j: a warning, and "header" is used', (value) => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const result = createTurnstileChallenge({ ...testSettings, originalRefererVia: value as any });
+        expect(result.originalReferer).toBeTypeOf('function');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid originalRefererVia'));
     });
 });

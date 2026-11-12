@@ -327,6 +327,95 @@ export class RTIStatelessUtils {
     }
   }
 
+  /** The request header that gives the origin the original Referer after a solved CAPTCHA (see originalReferer). */
+  static readonly ORIGINAL_REFERER_HEADER = 'x-cheq-original-referer';
+
+  /** The longest Referer carried through a CAPTCHA: the most GA4 keeps for page_referrer. A longer one is cut. */
+  static readonly MAX_ORIGINAL_REFERER_LENGTH = 420;
+
+  /**
+   * The Referer to carry through a CAPTCHA, the way a browser sends it by default (strict-origin-when-cross-origin):
+   * from this host, the full URL without the #fragment; from another host, only its origin, written as browsers send
+   * it (`https://www.google.com/`).
+   * Cut to {@link MAX_ORIGINAL_REFERER_LENGTH} characters, never in the middle of an encoded character.
+   * `undefined` when there is none, or it is not an http(s) URL.
+   * @param referer the Referer (or the value the challenge page carried)
+   * @param host the request's Host header value
+   */
+  originalReferer(referer: string | null | undefined, host: string | null | undefined): string | undefined {
+    if (!referer) {
+      return undefined;
+    }
+    let url: URL;
+    try {
+      url = new URL(referer);
+    } catch {
+      return undefined;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return undefined;
+    }
+    const ownHost = RTIStatelessUtils.normalizeHost(host);
+    const sameHost = ownHost !== '' && RTIStatelessUtils.normalizeHost(url.host) === ownHost;
+    // Built from the parsed URL, so no user:password@ and no #fragment.
+    const value = sameHost ? `${url.origin}${url.pathname}${url.search}` : `${url.origin}/`;
+    return this.cutEncoded(value, RTIStatelessUtils.MAX_ORIGINAL_REFERER_LENGTH);
+  }
+
+  /**
+   * The value of the `_cq_ref` cookie: `{return URL}|{Referer}`, both URL-encoded, so neither can contain the `|`.
+   * The format of version 1.0.0, kept so sites that read it (the part after `|`) keep working on every CDN.
+   * @param returnUrl the page the visitor lands on after the CAPTCHA (path, query)
+   * @param referer where they came from ({@link originalReferer})
+   */
+  originalRefererCookieValue(returnUrl: string, referer: string): string {
+    return `${encodeURIComponent(returnUrl)}|${encodeURIComponent(referer)}`;
+  }
+
+  /**
+   * A safe cookie `Path` attribute for `path`: the path itself, or `/` when it has a character a cookie attribute
+   * can't hold (`;`, `,`, whitespace, control characters) or does not start with `/`.
+   * @param path a URL path, without query or fragment
+   */
+  cookiePath(path: string): string {
+    return /^\/[^;,\s\x00-\x1F\x7F]*$/.test(path) ? path : '/';
+  }
+
+  /**
+   * The expiry (ms since 1970) of a signed cookie we issued, or `undefined`. Only the exact spelling we write is
+   * accepted, `${expiresAt}` of a safe integer: "123abc", "0123", " 123", "+123", "1e13" or "12.0" read as numbers but
+   * were not written by us, so the round trip rejects them. Does not check whether it is past.
+   * @param value the expiry part of the cookie
+   */
+  parseExpiresAt(value: string | undefined): number | undefined {
+    if (!value) {
+      return undefined;
+    }
+    const expiresAt = Number(value);
+    return Number.isSafeInteger(expiresAt) && String(expiresAt) === value ? expiresAt : undefined;
+  }
+
+  // Cuts an encoded URL to `max` characters, dropping a %XX left half done, so the result still decodes.
+  private cutEncoded(value: string, max: number): string {
+    let cut = value.slice(0, max).replace(/%[0-9A-Fa-f]?$/, '');
+    // One character can be several %XX (é is %C3%A9): drop the last ones until the trailing run decodes.
+    let run = cut.match(/(?:%[0-9A-Fa-f]{2})+$/)?.[0];
+    while (run && !this.decodes(run)) {
+      cut = cut.slice(0, -3);
+      run = run.slice(0, -3);
+    }
+    return cut;
+  }
+
+  private decodes(value: string): boolean {
+    try {
+      decodeURIComponent(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** The query parameter that carries the Turnstile token when the challenge page's form is submitted. */
   static readonly TURNSTILE_RESPONSE_QUERY_PARAM = 'cf-turnstile-response';
 

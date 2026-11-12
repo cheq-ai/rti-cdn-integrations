@@ -1844,4 +1844,131 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion sameSiteReferer Method Tests
+
+  // #region originalReferer Method Tests
+  describe('originalReferer', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['another site: its origin only, as browsers send it (with /)', 'https://www.google.com/search?q=shoes', 'shop.com', 'https://www.google.com/'],
+      ['another site with a port: origin with the port', 'http://partner.net:8080/deal?id=7', 'shop.com', 'http://partner.net:8080/'],
+      ['a subdomain is another host', 'https://blog.shop.com/post/1', 'shop.com', 'https://blog.shop.com/'],
+      ['this host: full URL without the #fragment', 'https://shop.com/category/shoes?page=2#top', 'shop.com', 'https://shop.com/category/shoes?page=2'],
+      ['this host, any case and a port on Host', 'https://SHOP.com/a?b=1', 'Shop.com:443', 'https://shop.com/a?b=1'],
+      ['this host over http', 'http://shop.com/a', 'shop.com', 'http://shop.com/a'],
+      ['user:password@ is dropped', 'https://user:pass@shop.com/a', 'shop.com', 'https://shop.com/a'],
+      ['no Host: origin only', 'https://shop.com/a?b=1', undefined, 'https://shop.com/'],
+    ])('%s', (_name, referer, host, expected) => {
+      expect(utils.originalReferer(referer, host)).toBe(expected);
+    });
+
+    test.each([
+      ['no Referer', undefined],
+      ['empty', ''],
+      ['not a URL', 'not a url'],
+      ['a path only', '/cart'],
+      ['not http(s)', 'javascript:alert(1)'],
+      ['ftp', 'ftp://files.shop.com/a'],
+    ])('%s: undefined', (_name, referer) => {
+      expect(utils.originalReferer(referer, 'shop.com')).toBeUndefined();
+    });
+
+    test('cut to 420 characters', () => {
+      const value = utils.originalReferer(`https://shop.com/search?q=${'a'.repeat(1000)}`, 'shop.com');
+      expect(value).toHaveLength(RTIStatelessUtils.MAX_ORIGINAL_REFERER_LENGTH);
+      expect(value).toBe(`https://shop.com/search?q=${'a'.repeat(420 - 'https://shop.com/search?q='.length)}`);
+    });
+
+    test('a URL of exactly 420 characters is kept whole', () => {
+      const url = `https://shop.com/?q=${'a'.repeat(420 - 'https://shop.com/?q='.length)}`;
+      expect(utils.originalReferer(url, 'shop.com')).toBe(url);
+    });
+
+    test.each([0, 1, 2, 3, 4, 5, 6, 7, 8])('never cut in the middle of an encoded character (offset %i)', (offset) => {
+      // "é" is %C3%A9: whatever the cut position, the result decodes and ends on a whole character.
+      const prefix = `https://shop.com/?q=${'a'.repeat(420 - 'https://shop.com/?q='.length - offset)}`;
+      const value = utils.originalReferer(`${prefix}${'é'.repeat(10)}`, 'shop.com')!;
+      expect(value.length).toBeLessThanOrEqual(420);
+      expect(value.startsWith(prefix)).toBe(true);
+      expect(() => decodeURIComponent(value)).not.toThrow();
+      expect(decodeURIComponent(value.slice(prefix.length))).toMatch(/^é*$/);
+    });
+
+    test('an invalid %zz earlier in the URL does not stop the cut', () => {
+      const value = utils.originalReferer(`https://shop.com/?x=%zz&q=${'%C3%A9'.repeat(200)}`, 'shop.com')!;
+      expect(value.length).toBeLessThanOrEqual(420);
+      expect(value.endsWith('%C3%A9')).toBe(true);
+    });
+  });
+  // #endregion originalReferer Method Tests
+
+  // #region originalRefererCookieValue Method Tests
+  describe('originalRefererCookieValue', () => {
+    const utils = new RTIStatelessUtils();
+
+    test('{return URL}|{Referer}, both encoded (the 1.0.0 format)', () => {
+      expect(utils.originalRefererCookieValue('/product?gclid=1&a=b#top', 'https://www.google.com/'))
+        .toBe('%2Fproduct%3Fgclid%3D1%26a%3Db%23top|https%3A%2F%2Fwww.google.com%2F');
+    });
+
+    test('a | inside either part is encoded, so the part after the first | is always the Referer', () => {
+      const value = utils.originalRefererCookieValue('/a?x=1|2', 'https://shop.com/b?y=3|4');
+      expect(value.split('|')).toHaveLength(2);
+      expect(decodeURIComponent(value.split('|')[1])).toBe('https://shop.com/b?y=3|4');
+    });
+
+    test('no ; , or space in the value (a cookie value can\'t hold them)', () => {
+      expect(utils.originalRefererCookieValue('/a b;c,d', 'https://shop.com/x y')).not.toMatch(/[;, ]/);
+    });
+  });
+  // #endregion originalRefererCookieValue Method Tests
+
+  // #region cookiePath Method Tests
+  describe('cookiePath', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['/', '/'],
+      ['/shop/item', '/shop/item'],
+      ['/caf%C3%A9', '/caf%C3%A9'],
+      ['/a%20b', '/a%20b'],
+    ])('%s is kept', (path, expected) => {
+      expect(utils.cookiePath(path)).toBe(expected);
+    });
+
+    test.each([
+      ['a ;', '/a;b'],
+      ['a ,', '/a,b'],
+      ['a space', '/a b'],
+      ['a tab', '/a\tb'],
+      ['a newline', '/a\nb'],
+      ['a DEL', '/a\x7Fb'],
+      ['no leading /', 'a/b'],
+      ['empty', ''],
+    ])('%s: /', (_name, path) => {
+      expect(utils.cookiePath(path)).toBe('/');
+    });
+  });
+  // #endregion cookiePath Method Tests
+
+  // #region parseExpiresAt Method Tests
+  describe('parseExpiresAt', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([['1794500000000', 1794500000000], ['0', 0], ['1', 1]])('%s', (value, expected) => {
+      expect(utils.parseExpiresAt(value)).toBe(expected);
+    });
+
+    test.each([
+      [undefined], [''], ['abc'], ['123abc'], ['0123'], [' 123'], ['123 '], ['+123'], ['-1x'],
+      ['1e13'], ['12.0'], ['12.5'], ['0x10'], ['9007199254740993'], ['Infinity'], ['NaN'],
+    ])('%j: undefined', (value) => {
+      expect(utils.parseExpiresAt(value)).toBeUndefined();
+    });
+
+    test('does not check whether it is past', () => {
+      expect(utils.parseExpiresAt('1')).toBe(1);
+    });
+  });
+  // #endregion parseExpiresAt Method Tests
 });
