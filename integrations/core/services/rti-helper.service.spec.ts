@@ -444,6 +444,16 @@ describe('RTIHelperService', () => {
       const svc = new RTIHelperService({ actionOnSuspicious: { methods: { POST: 9 } } } as any);
       expect(svc.validateConfig()).toContain('actionOnSuspicious.methods.POST: 9 is not an Action');
     });
+
+    test('a rule without methods (every method) has no problem, and a wrong one still gets its own message', () => {
+      // Act
+      const found = new RTIHelperService({ actionOnSuspicious: {
+        rules: [{ path: '^/api/', action: Action.BLOCK }, { path: '([', action: Action.BLOCK }],
+      } } as any).validateActionOnSuspicious();
+
+      // Assert: only the second rule's regex
+      expect(found).toEqual(["actionOnSuspicious.rules[1].path: '([' is not a valid regex"]);
+    });
   });
 
   describe('validateConfig', () => {

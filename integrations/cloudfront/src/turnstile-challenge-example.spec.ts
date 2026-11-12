@@ -1013,6 +1013,21 @@ describe('challenge', () => {
             expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
         });
 
+        it('with debug on, logs that the paused CAPTCHA is waived; with debug off, logs nothing', async () => {
+            // Arrange: paused on the first error
+            const cb = build({ ...pauseSettings, siteverifyErrorsToPause: 1 });
+            failSiteverify();
+            await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            // Act & Assert
+            expect(await cb.validateChallenge(buildRequest(), true)).toBe(true);
+            expect(log.mock.calls).toEqual([['[validateChallenge] siteverify paused, waiving CAPTCHA']]);
+            log.mockClear();
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+            expect(log).not.toHaveBeenCalled();
+        });
+
         it('0 turns the pause off: errors never pause, siteverify is still called every time', async () => {
             const cb = build({ ...testSettings, siteverifyErrorsToPause: 0 });
             const siteverify = failSiteverify();
