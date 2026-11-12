@@ -1,8 +1,9 @@
-// cspell:ignore cheq rayid
+// cspell:ignore cheq rayid bodyless
 import { describe, test, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { RTIStatelessUtils } from './rti-stateless-utils';
 import { ActionStrategy } from '../models/action-strategy.model';
+import { Action } from '../models/action.model';
 
 describe('RTIStatelessUtils', () => {
   // #region Stateless Contract Tests
@@ -20,6 +21,10 @@ describe('RTIStatelessUtils', () => {
       utils.getCheqCookie('_cq=x');
       utils.getHeaderByName({ 'x-test': '1' }, 'X-Test');
       utils.isChallengeReplyAllowed(ActionStrategy.CAPTCHA);
+      utils.isBodylessMethod('GET');
+      utils.isAction(Action.BLOCK);
+      utils.pathMatches('/login', '^/login$');
+      utils.pathMatches('/login', '([');
       utils.errorMessage(new Error('boom'));
       utils.stringifyRedactedPayload({ endUserParams: { headers: { cookie: 'a=1' } } } as any);
       utils.buildRtiResultHeader({
@@ -71,6 +76,179 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion isChallengeReplyAllowed Method Tests
+
+  // #region isBodylessMethod Method Tests
+  describe('isBodylessMethod', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each(['GET', 'HEAD', 'get', 'Head'])('%s can get the CAPTCHA in place', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(true);
+    });
+
+    test.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'post'])('%s can not (it has a body)', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    test.each(['CONNECT', 'TRACE', '', ' GET', 'GETX'])('%j is not GET or HEAD, so it is not bodyless', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    // Every spelling of `name` in upper and lower case, letter by letter (2^letters of them).
+    const caseVariants = (name: string): string[] =>
+      [...name].reduce<string[]>((variants, ch) => variants.flatMap(prefix => [prefix + ch.toLowerCase(), prefix + ch.toUpperCase()]), ['']);
+
+    test('every upper/lower-case spelling of GET and HEAD is bodyless, and of every body method is not', () => {
+      // Act
+      const wrong = [
+        ...['GET', 'HEAD'].flatMap(caseVariants).filter(method => !utils.isBodylessMethod(method)),
+        ...['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].flatMap(caseVariants).filter(method => utils.isBodylessMethod(method)),
+      ];
+
+      // Assert
+      expect(caseVariants('HEAD')).toHaveLength(16);
+      expect(wrong).toEqual([]);
+    });
+
+    test.each([
+      ['a trailing space', 'GET '],
+      ['a trailing newline', 'GET\n'],
+      ['a CRLF', 'HEAD\r\n'],
+      ['a tab inside', 'G\tET'],
+      ['a NUL at the end', 'GET\0'],
+      ['a prefix of GET', 'GE'],
+      ['GET with a suffix', 'GETS'],
+      ['both joined', 'GETHEAD'],
+      ['a list', 'GET,HEAD'],
+      ['Cyrillic look-alikes (U+0415, U+0422)', 'GЕТ'],
+      ['fullwidth letters', 'ＧＥＴ'],
+      ['a combining mark on the T', 'GET̈'],
+    ])('%s (%j) is not bodyless: only the exact method name, in any case', (_, method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    test('no non-ASCII character stands in for a letter of GET or HEAD (toUpperCase maps none of them to G E T H A D)', () => {
+      // Arrange: every character from U+0080 to U+FFFF in place of each letter, in both cases
+      const wrong: string[] = [];
+
+      // Act
+      for (const method of ['GET', 'HEAD', 'get', 'head']) {
+        for (let i = 0; i < method.length; i++) {
+          for (let code = 0x80; code <= 0xFFFF; code++) {
+            const variant = method.slice(0, i) + String.fromCharCode(code) + method.slice(i + 1);
+            if (utils.isBodylessMethod(variant)) {
+              wrong.push(JSON.stringify(variant));
+            }
+          }
+        }
+      }
+
+      // Assert
+      expect(wrong).toEqual([]);
+    });
+  });
+  // #endregion isBodylessMethod Method Tests
+
+  // #region isAction Method Tests
+  describe('isAction', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT])('accepts Action %s', (action) => {
+      // Act & Assert
+      expect(utils.isAction(action)).toBe(true);
+    });
+
+    test('covers every Action (a new Action must be added to the table above)', () => {
+      // Act & Assert
+      expect(Object.values(Action).filter(v => typeof v === 'number').sort()).toEqual([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT].sort());
+    });
+
+    test.each([
+      ['undefined', undefined],
+      ['null', null],
+      ['an Action name', 'BLOCK'],
+      ['a numeric string', '2'],
+      ['a number past the last Action', 4],
+      ['a large number', 99],
+      ['a negative number', -1],
+      ['a fraction', 0.5],
+      ['NaN', NaN],
+      ['a boolean', true],
+      ['an object', {}],
+      ['an array holding an Action', [Action.BLOCK]],
+      ['Infinity', Infinity],
+      ['-Infinity', -Infinity],
+      ['the largest safe integer', Number.MAX_SAFE_INTEGER],
+      ['the smallest positive number', Number.MIN_VALUE],
+      ['a number just above an Action', 1.0000001],
+      ['a Number object holding an Action', new Number(Action.BLOCK)],
+      ['a bigint', 2n],
+      ['a symbol', Symbol('BLOCK')],
+      ['a function', () => Action.BLOCK],
+      ['an empty string', ''],
+      ['an Action name in lower case', 'block'],
+    ])('rejects %s', (_, value) => {
+      // Act & Assert
+      expect(utils.isAction(value)).toBe(false);
+    });
+
+    test('accepts -0 and 1.0: they are the numbers 0 (ALLOW) and 1 (CHALLENGE)', () => {
+      // Act & Assert
+      expect(utils.isAction(-0)).toBe(true);
+      expect(utils.isAction(1.0)).toBe(true);
+    });
+
+    test('of every integer from -1000 to 1000, exactly the Action values pass', () => {
+      // Arrange
+      const integers = Array.from({ length: 2001 }, (_, i) => i - 1000);
+
+      // Act & Assert
+      expect(integers.filter(n => utils.isAction(n))).toEqual([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT]);
+    });
+  });
+  // #endregion isAction Method Tests
+
+  // #region pathMatches Method Tests
+  describe('pathMatches', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['an anchored pattern on its exact path', '/login', '^/login$', true],
+      ['an anchored pattern on a longer path', '/login/x', '^/login$', false],
+      ['a prefix pattern', '/api/items', '^/api/', true],
+      ['an unanchored pattern anywhere in the path', '/a/login/b', 'login', true],
+      ['a pattern that does not match', '/search', '^/login', false],
+      ['a different case (no flags, so case-sensitive)', '/Login', '^/login$', false],
+      ['match-all', '/anything', '.*', true],
+      ['an empty pattern (matches everything)', '/x', '', true],
+      ['an empty path and an anchored empty pattern', '', '^$', true],
+      ['an empty path and a non-empty pattern', '', 'a', false],
+      ['"." in the pattern: any character', '/l0gin', '^/l.gin$', true],
+      ['an escaped dot: only a dot', '/l0gin', '^/l\\.gin$', false],
+      ['"+" in the pattern is a quantifier, not the character', '/aab', '^/a+b$', true],
+      ['so a path with a literal "+" does not match its own text', '/a+b', '^/a+b$', false],
+      ['a newline in the path: ^ is not multiline', '/a\n/b', '^/b', false],
+      ['non-ASCII in the path and the pattern', '/café/menu', 'é', true],
+      ['a lookbehind', '/api/v2', '(?<=/api/)v2', true],
+      ['a Unicode property escape without the u flag (a literal "p{L}")', '/p{L}', '\\p{L}', true],
+      ['a very long path', `/${'a'.repeat(100_000)}`, 'a$', true],
+    ])('%s', (_, path, pattern, expected) => {
+      // Act & Assert
+      expect(utils.pathMatches(path, pattern)).toBe(expected);
+    });
+
+    test.each(['([', '[', '(', '*', '+', '?', 'a{2,1}', '\\', '[z-a]', '(?i)login'])('a bad regex (%j) never matches, and does not throw', (pattern) => {
+      // Arrange: the pattern really is invalid
+      expect(() => new RegExp(pattern)).toThrow(SyntaxError);
+
+      // Act & Assert
+      expect(utils.pathMatches('/x', pattern)).toBe(false);
+    });
+  });
+  // #endregion pathMatches Method Tests
 
   // #region errorMessage Method Tests
   describe('errorMessage', () => {

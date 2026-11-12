@@ -22,7 +22,9 @@ export interface CloudfrontConfig extends Config {
      * `ids.customParam2` are the CloudFront request id, so `ids.rayId` is not an RTI ray id there; every other id is null.
      * If that id is not a plain, unique id, `ids.rayId` is a random `cf-fallback-<uuid>` instead (logged).
      * The example only signs the session with `ids.rayId`. Do not report it as an RTI ray id, and do not read other fields
-     * without checking them: a throw here is caught and the request is forwarded.
+     * without checking them: a throw here is caught and the request is forwarded. For a reply that means the origin gets
+     * the token and the form fields in place of the visitor's query string, so answer your own errors on a reply (the
+     * example handles them like a siteverify outage and never throws).
      * @param request
      * @param response
      * @param addRtiResultHeader sets `x-cheq-rti-result` (the verdict of this request: the one that triggered the
@@ -88,7 +90,8 @@ const turnstileConfig: TurnstileSettings = {
     // allowedHostnames: ["example.com"],
 
     // If Cloudflare's siteverify fails this many times in a row (timeout, network, 5xx; a 4xx doesn't count), the CAPTCHA is paused for
-    // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result.
+    // siteverifyPauseSeconds and challenged traffic is forwarded with x-cheq-rti-result. Any other error while answering
+    // a solved CAPTCHA (e.g. signing the session) counts too.
     // Counted per Lambda instance, not for the whole site: each instance pauses after its own 3 errors, so for a few
     // seconds some visitors may still get the CAPTCHA while others pass. See "Siteverify pause" in the README.
     // 0 turns the pause off: during an outage visitors get the CAPTCHA again, but it is never skipped.
@@ -166,6 +169,8 @@ export const config: CloudfrontConfig = {
             OPTIONS: Action.ALLOW, // CORS preflight: blocking it breaks the site's own cross-site API calls
         },
         // Per path (regex, like ignorePaths) and method. The first matching rule wins over the defaults above.
+        // Every rule needs a path, written as a string ('^/login$', not /^\/login$/): a rule without one matches EVERY
+        // path. Keep this exact shape (see "actionOnSuspicious" in the README).
         rules: [
             // { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
         ],

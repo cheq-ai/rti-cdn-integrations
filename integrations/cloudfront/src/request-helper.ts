@@ -1,4 +1,4 @@
-// cspell:ignore cheq duid pvid
+// cspell:ignore cheq duid pvid siteverify
 import { CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
 import { config } from './config';
 import { RTIHttpsLoggerService } from "../../core/services/rti-https-logger.service";
@@ -132,20 +132,16 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         // RTI's action as a strategy. A request with a body is never challenged in place: config.actionOnSuspicious
         // decides (see getStrategyForRequest).
         const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, cfRequest.method, requestURL.pathname);
-        // Set only when actionOnSuspicious decided: a request with a body and a CAPTCHA verdict.
-        if (isDebugEnabled && actionOnSuspicious !== undefined) {
-            console.log(`${cfRequest.method} request: actionOnSuspicious says ${Action[actionOnSuspicious]}`);
-        }
 
-
+        // Every value as its name and its raw value. Cannot throw: a value with no name (null, undefined, an unknown number)
+        // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (body method, CAPTCHA verdict).
         if (isDebugEnabled && action !== Action.ALLOW) {
-            console.log(`action strategy: ${actionStrategy !== null ? `${ActionStrategy[actionStrategy]} (${actionStrategy})` : "none (should not happen)"} `);
+            console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${cfRequest.method}`);
         }
 
         // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA) and
         // whatever session the visitor has, config.challenge answers it (the Turnstile example verifies the token and
-        // redirects to original_url). Forwarded instead, the origin would get the form fields in place of the visitor's
-        // query string.
+        // redirects to original_url). Forwarded instead, the origin would get the form fields in place of the visitor's query string.
         // Checked before the session waiver (two tabs, Back, refresh). Only for ALLOW or CAPTCHA (isChallengeReplyAllowed):
         // any other strategy (blocks, 404s, redirects) is enforced as usual.
         if (rtiHelperService.isChallengeReplyAllowed(actionStrategy) && await shouldAnswerChallengeReply(event, cfRequest)) {
@@ -246,7 +242,9 @@ async function shouldAnswerChallengeReply(event: CloudFrontRequestEvent, cfReque
     }
 }
 
-// Passes a challenge reply to config.challenge. If it throws, the request is forwarded (fail open).
+// Passes a challenge reply to config.challenge. If it throws, the request is forwarded (fail open): the origin gets the
+// reply as it is, the token and form fields in place of the visitor's query string. The Turnstile example never throws
+// here (it answers its own errors like a siteverify outage), so this is the last resort for a custom challenge.
 async function answerChallengeReply(event: CloudFrontRequestEvent, cfRequest: CloudFrontRequest, rtiResponse: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontRequestResult> {
     try {
         return await config.challenge!(cfRequest, rtiResponse, addRtiResultHeader);

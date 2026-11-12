@@ -1,14 +1,17 @@
-// cspell:ignore nums CHEQ duid pvid
+// cspell:ignore nums CHEQ duid pvid bodyless
 import { RTIResponse } from "../models/rti-response.model";
 import { RTIParams } from "../models/rti-params.model";
 import { HeadersMap } from "../models/headers-map.model";
 import { ActionStrategy } from "../models/action-strategy.model";
 import { RequestHeaders, RTIRequest } from "../models/rti-request.model";
+import { Action } from "../models/action.model";
+import { CHALLENGEABLE_METHODS } from "../models/action-on-suspicious.model";
 
 /**
  * The RTI helpers that need no configuration: cookie and header parsing, comma-separated list
- * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the challenge return-path
- * check, host normalization, debug-log redaction and safe error messages.
+ * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the bodyless-method and
+ * Action checks, safe regex path matching, the challenge return-path check, host normalization,
+ * debug-log redaction and safe error messages.
  *
  * Every method works only on its arguments. The class takes no constructor arguments, holds no
  * instance state and imports nothing but models, so it can be used on its own wherever no config
@@ -31,6 +34,37 @@ export class RTIStatelessUtils {
    */
   isChallengeReplyAllowed(actionStrategy: ActionStrategy | null): boolean {
     return actionStrategy === null || actionStrategy === ActionStrategy.CAPTCHA;
+  }
+
+  /** True for GET and HEAD: they can get the CAPTCHA page in place, since they have no body to lose. Any case. */
+  isBodylessMethod(method: string): boolean {
+    return CHALLENGEABLE_METHODS.includes(method.toUpperCase());
+  }
+
+  /**
+   * Whether a config value is a real {@link Action}: one of the enum's numbers. Config comes from JSON, env vars or
+   * hand-edited files, so a name like `"BLOCK"`, an out-of-range number or `null` can turn up where an Action belongs.
+   * @param value the value to check
+   */
+  isAction(value: unknown): value is Action {
+    return typeof value === "number" && Action[value] !== undefined;
+  }
+
+  /**
+   * Whether `path` matches the regex `pattern`. A bad regex never matches instead of throwing, so one typo in a rule
+   * doesn't fail every request (`RTIHelperService.validateActionOnSuspicious` reports it).
+   * Known limit: `pattern` must be a string, and that is not checked. Like `String.prototype.match`, it turns any other
+   * value into a regex: `undefined` (a rule without a path) matches every path, `null` the text "null", a number its
+   * digits. See ActionOnSuspiciousRule.path.
+   * @param path the request path
+   * @param pattern a regex source, e.g. `"^/login$"`
+   */
+  pathMatches(path: string, pattern: string): boolean {
+    try {
+      return path.match(pattern) !== null;
+    } catch {
+      return false;
+    }
   }
 
   /**

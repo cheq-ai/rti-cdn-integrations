@@ -1,4 +1,4 @@
-// cspell:ignore cheq siteverify duid unkeyed
+// cspell:ignore cheq siteverify duid unkeyed gclid
 import { CloudFrontHeaders, CloudFrontRequest, CloudFrontRequestResult, CloudFrontResponseResult, CloudFrontResultResponse } from "aws-lambda";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isIPv6, SocketAddress } from "node:net";
@@ -51,6 +51,7 @@ export interface TurnstileSettings {
     sessionBinding?: SessionBinding;
     /**
      * siteverify errors in a row (timeout, network, 5xx) before the CAPTCHA is paused. A 4xx doesn't count. Default 3.
+     * Any other error while answering a solved CAPTCHA (e.g. signing the session) counts too.
      * Counted per Lambda instance, not for the whole site (see SiteverifyPause).
      * 0 turns the pause off: during a Cloudflare outage visitors get the CAPTCHA again, but it is never skipped.
      */
@@ -114,7 +115,8 @@ let siteverifyClient: HttpsClient | undefined;
 const getSiteverifyClient = (): HttpsClient => (siteverifyClient ??= new HttpsClient(SITEVERIFY_URL, SITEVERIFY_IDLE_SOCKET_TIMEOUT_MS));
 
 /**
- * Pauses the CAPTCHA when siteverify keeps failing, so visitors don't loop on a check that can't pass.
+ * Pauses the CAPTCHA when siteverify keeps failing, so visitors don't loop on a check that can't pass. Any other error
+ * while answering a solved CAPTCHA counts too (see turnstileChallengeExample): it can't pass either.
  * After the pause it needs the same number of errors to pause again.
  *
  * The count lives in memory, so it is per Lambda instance: CloudFront runs many instances (several per edge region),
@@ -150,7 +152,7 @@ export class SiteverifyPause {
         if (this.errorsInRow >= this.errorsToPause) {
             this.errorsInRow = 0;
             this.pausedUntilTimestamp = Date.now() + this.pauseSeconds * 1000;
-            console.error(`[turnstile] siteverify failed ${this.errorsToPause} times in a row: CAPTCHA paused for ${this.pauseSeconds}s`);
+            console.error(`[turnstile] siteverify (or answering the reply) failed ${this.errorsToPause} times in a row: CAPTCHA paused for ${this.pauseSeconds}s`);
         }
     }
 }
@@ -331,6 +333,20 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
     }
     // else : user already solved the challenge and submitted the form with the token. Verify it with Cloudflare's siteverify.
 
+    // A reply is never answered by throwing: request-helper would forward it to the origin as it is (fail open), with the
+    // token and the form fields in place of the visitor's own query string (gclid, utm_*, ...). An error answering it (a
+    // bug or an unexpected input, e.g. while signing the session) is handled like a siteverify outage instead, and counts
+    // toward the pause: an error on every reply then can't keep visitors on the CAPTCHA (unless siteverifyErrorsToPause is 0).
+    try {
+        return await answerReply(settings, pause, request, response, queryStringData, token, addRtiResultHeader);
+    } catch (e) {
+        console.error(`[turnstile] error answering the challenge reply: ${statelessUtils.errorMessage(e)}`);
+        return unavailableAnswer(settings, pause, request, response, queryStringData);
+    }
+};
+
+/** Answers the reply to the challenge page: `token` is the solved CAPTCHA, sent to Cloudflare's siteverify. */
+async function answerReply(settings: ResolvedTurnstileSettings, pause: SiteverifyPause, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, token: string, addRtiResultHeader?: (headers: CloudFrontHeaders) => void): Promise<CloudFrontResultResponse> {
     // Too long to be a real token: show the widget again, without calling Cloudflare and without counting toward the pause.
     if (token.length > MAX_TOKEN_LENGTH) {
         return challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_FAILED_MESSAGE);
@@ -344,7 +360,6 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
     let verified: boolean;
     try {
         verified = await verifyTurnstileToken(settings, token, request);
-        pause.recordSuccess();
     } catch (e) {
         // A 4xx doesn't count toward the pause: a flood of junk tokens could get us rate limited (429), and that
         // must not let anyone switch the CAPTCHA off. It's a failed check: show the widget again.
@@ -353,27 +368,47 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
             return challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_FAILED_MESSAGE);
         }
         // Timeout, network error, 5xx or a bad answer: not the visitor's fault. Never forward the token to the origin.
-        pause.recordError();
-        console.error(`[turnstile] siteverify error: ${e instanceof Error ? e.message : String(e)}`);
-        // This error started the pause (fail open): back to the page, where the CAPTCHA is now waived.
-        if (pause.isPaused()) {
-            return challengeUnavailableFailOpen(request, queryStringData);
-        }
-        // Not paused (below the limit, or fail closed with 0): the CAPTCHA again, saying it was not their fault.
-        return challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_UNAVAILABLE_MESSAGE);
+        console.error(`[turnstile] siteverify error: ${statelessUtils.errorMessage(e)}`);
+        return unavailableAnswer(settings, pause, request, response, queryStringData);
     }
 
-    if (verified) {
-        return challengePassed(settings, request, response, queryStringData, addRtiResultHeader);
-    }
-
-    // Wrong, reused or expired token: show the widget again instead of a dead end.
-    return challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_FAILED_MESSAGE);
-};
+    // Verified: back to the page with a session. Wrong, reused or expired token: the widget again instead of a dead end.
+    const answer = verified
+        ? challengePassed(settings, request, response, queryStringData, addRtiResultHeader)
+        : challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_FAILED_MESSAGE);
+    // Reset only once the answer is built: an error building it (e.g. signing the session) counts toward the pause in
+    // turnstileChallengeExample's catch. Reset before, it would be undone by every such reply, and a step that always
+    // fails would show the CAPTCHA again forever instead of pausing it.
+    pause.recordSuccess();
+    return answer;
+}
 
 /**
- * The challenge page again, with `errorMessage`, after a token that did not pass or a siteverify error that did not
- * pause the CAPTCHA. Solving it returns to the same page.
+ * Counts a reply that could not be checked (siteverify down, or an error answering it) as one error toward the
+ * pause, then answers it. Not the visitor's fault, and never the token to the origin:
+ * - not paused (below the limit, or fail closed with 0): the widget again, with "We couldn't verify you right now",
+ *   and `original_url` kept for the next try
+ * - this error started the pause, or it already runs (fail open): a 302 to `original_url`, without a session, where
+ *   the CAPTCHA is waived while the pause lasts
+ * If even the retry page throws, the 302 is sent anyway: that request has no token, and RTI checks it as usual.
+ */
+function unavailableAnswer(settings: ResolvedTurnstileSettings, pause: SiteverifyPause, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams): CloudFrontResultResponse {
+    pause.recordError();
+
+    if (!pause.isPaused()) {
+        try {
+            return challengeRetryPage(settings, request, response, queryStringData, VERIFICATION_UNAVAILABLE_MESSAGE);
+        } catch (e) {
+            console.error(`[turnstile] error building the retry page, redirecting to original_url instead: ${statelessUtils.errorMessage(e)}`);
+        }
+    }
+
+    return challengeUnavailableFailOpen(request, queryStringData);
+}
+
+/**
+ * The challenge page again, with `errorMessage`, after a token that did not pass, or a siteverify error or an error
+ * answering the reply that did not pause the CAPTCHA. Solving it returns to the same page.
  */
 function challengeRetryPage(settings: ResolvedTurnstileSettings, request: CloudFrontRequest, response: RTIResponse, queryStringData: URLSearchParams, errorMessage: string): CloudFrontResultResponse {
     return challengePage(settings, response, returnPath(request, queryStringData), errorMessage);
@@ -687,7 +722,8 @@ function challengePage(settings: ResolvedTurnstileSettings, response: RTIRespons
 }
 
 /**
- * Fail open: siteverify is down and the CAPTCHA is paused (see SiteverifyPause), so the token can't be checked.
+ * Fail open: the CAPTCHA is paused (see SiteverifyPause: siteverify is down, or answering replies keeps failing), so the
+ * token can't be checked; or the retry page itself could not be built (see unavailableAnswer).
  * 302 back to the page without the token and without a session. There RTI is called as usual and validateChallenge
  * waives the CAPTCHA while the pause lasts, so the request goes on with x-cheq-rti-result.
  */

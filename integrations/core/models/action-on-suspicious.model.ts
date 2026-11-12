@@ -29,7 +29,12 @@ export interface RequestStrategy {
 
 /** One path rule of {@link ActionOnSuspicious}. */
 export interface ActionOnSuspiciousRule {
-  /** Regex matched against the request path, like {@link Config.ignorePaths}. */
+  /**
+   * Regex matched against the request path, like {@link Config.ignorePaths}, written as a string: `"^/login$"`, not
+   * `/^\/login$/`. Required, and not checked at run time: `String.prototype.match` turns any other value into a regex,
+   * so a rule without a path matches EVERY path (`{ methods: ["POST"], action: Action.BLOCK }` blocks every suspicious
+   * POST), and `null` matches paths containing "null". RTIHelperService.validateActionOnSuspicious does not report it.
+   */
   path: string;
   /** The methods this rule applies to. Leave it out for all of them. */
   methods?: BodyMethod[];
@@ -47,6 +52,15 @@ export interface ActionOnSuspiciousRule {
  *   home page). After solving they are back on that page and can send the form again. The body itself is not kept.
  * - BLOCK: the `blockingStrategy` answer (403 by default, or 404).
  * - REDIRECT: a 302 to `redirectLocation`.
+ *
+ * Known limit: the shape is not checked at run time; TypeScript enforces it in config.ts. A value forced past it (a
+ * cast, or a config built in plain JS) is used as it is:
+ * - a rule without a `path`, or one that is not a string: see {@link ActionOnSuspiciousRule.path} (matches every path)
+ * - `rules` that are not a list, a rule that is not an object (`null`, a hole in the list), `methods` that are not a
+ *   list, or a value JSON can't write (a bigint, a circular object, a Symbol): can throw. In
+ *   RTIHelperService.validateActionOnSuspicious, which CloudFront runs at module load, the Lambda then does not start;
+ *   in RTIHelperService.getActionOnSuspicious, each request it applies to fails open (forwarded without a verdict)
+ * - `methods: "POST"` as a string: matched as a substring, not as a list
  */
 export interface ActionOnSuspicious {
   /** The default per method. A method not listed is ALLOW. */

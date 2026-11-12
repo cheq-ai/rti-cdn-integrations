@@ -313,16 +313,6 @@ describe('RTIHelperService', () => {
   // #endregion getActionStrategy Method Tests
 
   // #region validateConfig Method Tests
-  describe('isBodylessMethod', () => {
-    test.each(['GET', 'HEAD', 'get', 'Head'])('%s can get the CAPTCHA in place', (method) => {
-      expect(new RTIHelperService({} as any).isBodylessMethod(method)).toBe(true);
-    });
-
-    test.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'post'])('%s can not (it has a body)', (method) => {
-      expect(new RTIHelperService({} as any).isBodylessMethod(method)).toBe(false);
-    });
-  });
-
   describe('getStrategyForRequest', () => {
     const svc = (config: any = {}) => new RTIHelperService(config);
 
@@ -522,6 +512,83 @@ describe('RTIHelperService', () => {
   describe('inheritance', () => {
     test('extends RTIStatelessUtils, so the config-free helpers are available on the service', () => {
       expect(new RTIHelperService({} as any)).toBeInstanceOf(RTIStatelessUtils);
+    });
+
+    /**
+     * The methods, getters and setters a class declares itself that do not use the config: neither read `this.config`
+     * nor call (or read) another member of the class that does, through a chain of any length. Read from the source
+     * (Function.prototype.toString), through the property descriptors, so a getter is never run.
+     */
+    const membersWithoutConfig = (cls: { prototype: object }): string[] => {
+      const sources = new Map<string, string>();
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(cls.prototype))) {
+        if (name === 'constructor') {
+          continue;
+        }
+        const parts = [descriptor.value, descriptor.get, descriptor.set].filter(part => typeof part === 'function');
+        sources.set(name, parts.map(part => part.toString()).join('\n'));
+      }
+      const usesConfig = new Set<string>();
+      // \b: `this.configuration` or `this.configFree` is not the config
+      const reads = (source: string, member: string) => new RegExp(`\\bthis\\.${member}\\b`).test(source);
+      let found = true;
+      while (found) {
+        found = false;
+        for (const [name, source] of sources) {
+          if (!usesConfig.has(name) && (reads(source, 'config') || [...usesConfig].some(other => reads(source, other)))) {
+            usesConfig.add(name);
+            found = true;
+          }
+        }
+      }
+      return [...sources.keys()].filter(name => !usesConfig.has(name));
+    };
+
+    test('declares only methods that use the config: a config-free helper belongs in RTIStatelessUtils', () => {
+      // getStrategyForRequest reads no config itself: it calls getActionStrategy and getActionOnSuspicious, which do
+      expect(Object.getOwnPropertyNames(RTIHelperService.prototype).length).toBeGreaterThan(1);
+      expect(membersWithoutConfig(RTIHelperService)).toEqual([]);
+    });
+
+    test('declares no static members: a static method has no instance, so no config, and belongs in RTIStatelessUtils', () => {
+      // Act: what every class has (length, name, prototype) aside
+      const statics = Object.getOwnPropertyNames(RTIHelperService).filter(name => !['length', 'name', 'prototype'].includes(name));
+
+      // Assert
+      expect(statics).toEqual([]);
+    });
+
+    test('holds no instance state but the config: a helper in an arrow-function field would escape the checks above', () => {
+      // Act & Assert
+      expect(Object.getOwnPropertyNames(new RTIHelperService({} as any))).toEqual(['config']);
+    });
+
+    test('the check finds every config-free member of a class, and only those', () => {
+      // Arrange: each member is one case the check must get right
+      class Example {
+        config = {};
+        configuration = {};
+        readsConfig() { return this.config; }
+        callsReader() { return this.readsConfig(); }
+        callsCaller() { return this.callsReader(); }
+        get configGetter() { return this.config; }
+        readsGetter() { return this.configGetter; }
+        free(path: string) { return path.trim(); }
+        readsAnotherField() { return this.configuration; }
+        get freeGetter() { return 1; }
+        set freeSetter(value: number) { void value; }
+        loopA(): unknown { return this.loopB(); }
+        loopB(): unknown { return this.loopA(); }
+      }
+
+      // Act & Assert
+      expect(membersWithoutConfig(Example).sort()).toEqual(['free', 'freeGetter', 'freeSetter', 'loopA', 'loopB', 'readsAnotherField'].sort());
+    });
+
+    test.each(['isBodylessMethod', 'isAction', 'pathMatches'])('%s is inherited from RTIStatelessUtils, not declared here', (name) => {
+      // Act & Assert
+      expect(Object.getOwnPropertyNames(RTIHelperService.prototype)).not.toContain(name);
+      expect((new RTIHelperService({} as any) as any)[name]).toBe((RTIStatelessUtils.prototype as any)[name]);
     });
   });
   // #endregion Inheritance Tests

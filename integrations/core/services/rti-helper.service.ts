@@ -1,11 +1,11 @@
-// cspell:ignore CHEQ
+// cspell:ignore CHEQ bodyless
 import { Config } from "../models/config.interface";
 import { EventType } from "../models/event-type.model";
 import { RTIResponse } from "../models/rti-response.model";
 import { Action } from "../models/action.model";
 import { Mode } from "../models/mode.model";
 import { ActionStrategy } from "../models/action-strategy.model";
-import { BODY_METHODS, BodyMethod, CHALLENGEABLE_METHODS, RequestStrategy } from "../models/action-on-suspicious.model";
+import { BODY_METHODS, BodyMethod, RequestStrategy } from "../models/action-on-suspicious.model";
 import { RTIStatelessUtils } from "./rti-stateless-utils";
 
 /**
@@ -14,15 +14,16 @@ import { RTIStatelessUtils } from "./rti-stateless-utils";
  * response leads to, and whether the config itself is valid.
  *
  * The config-free helpers (cookies, headers, list parsing, the `x-cheq-rti-result` header, the
- * challenge-reply check and error messages) live in {@link RTIStatelessUtils}, which this class
+ * challenge-reply check, the bodyless-method and Action checks, safe path matching and error
+ * messages) live in {@link RTIStatelessUtils}, which this class
  * extends. The integrations only ever create this service and call everything through it, so the
  * split is invisible to them: `rtiHelperService.parseCookies(...)` and
  * `RTIHelperService.parseNumberList(...)` keep working through inheritance.
  *
- * Put a new method here only if it reads `this.config`; otherwise it belongs in
- * {@link RTIStatelessUtils}. The inheritance test in `rti-helper.service.spec.ts` guards the
- * `extends` link, because the helpers' own tests check the base class directly and would not
- * notice if this service lost them.
+ * Put a new method here only if it reads `this.config` (directly, or through another method of
+ * this class); otherwise it belongs in {@link RTIStatelessUtils}. The inheritance tests in
+ * `rti-helper.service.spec.ts` enforce this, and guard the `extends` link, because the helpers'
+ * own tests check the base class directly and would not notice if this service lost them.
  */
 export class RTIHelperService extends RTIStatelessUtils {
   config: Config;
@@ -91,11 +92,6 @@ export class RTIHelperService extends RTIStatelessUtils {
     return null;
   }
 
-  /** True for GET and HEAD: they can get the CAPTCHA page in place, since they have no body to lose. Any case. */
-  isBodylessMethod(method: string): boolean {
-    return CHALLENGEABLE_METHODS.includes(method.toUpperCase());
-  }
-
   /**
    * What to do with this request: RTI's {@link Action} mapped to a strategy ({@link getActionStrategy}).
    * A CAPTCHA page can't carry a request body through (login, payment, the bank's 3DS return), so a POST, PUT, PATCH,
@@ -122,6 +118,8 @@ export class RTIHelperService extends RTIStatelessUtils {
    * matching rule, else the method's default, else {@link Action.ALLOW}. A method that is not a {@link BodyMethod}
    * (GET, HEAD, anything else) is ALLOW: GET and HEAD get the CAPTCHA page through the usual flow.
    * A value that is not an {@link Action} counts as ALLOW, so a typo never blocks.
+   * Expects the documented shape, which is not checked here: a rule without a string `path` matches every path, and
+   * some other shapes throw (see the known limit on {@link ActionOnSuspicious}).
    * @param method the request method, any case
    * @param path the request path, matched against each rule's regex
    */
@@ -134,19 +132,6 @@ export class RTIHelperService extends RTIStatelessUtils {
     const rule = settings?.rules?.find(r => (!r.methods || r.methods.includes(upperMethod)) && this.pathMatches(path, r.path));
     const action = rule ? rule.action : settings?.methods?.[upperMethod];
     return this.isAction(action) ? action : Action.ALLOW;
-  }
-
-  private isAction(value: unknown): value is Action {
-    return typeof value === "number" && Action[value] !== undefined;
-  }
-
-  // A rule with a bad regex never matches (validateActionOnSuspicious reports it), so one typo doesn't fail every request.
-  private pathMatches(path: string, pattern: string): boolean {
-    try {
-      return path.match(pattern) !== null;
-    } catch {
-      return false;
-    }
   }
 
   /**
@@ -166,6 +151,9 @@ export class RTIHelperService extends RTIStatelessUtils {
   /**
    * Problems in {@link Config.actionOnSuspicious}, one message each. Wrong values are ALLOW at run time
    * (see {@link getActionOnSuspicious}); this says what to fix. Integrations log it once per cold start.
+   * Known limit: it expects the documented shape. A missing or non-string `path` is not reported (it matches every
+   * path), and `rules`, a rule or `methods` of another shape, or a value JSON can't write, can make it throw. CloudFront
+   * calls it at module load, so that throw stops the Lambda from starting (see {@link ActionOnSuspicious}).
    */
   validateActionOnSuspicious(): string[] {
     const errors: string[] = [];

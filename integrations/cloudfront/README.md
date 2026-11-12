@@ -852,8 +852,9 @@ so a copied cookie does not work elsewhere; see [Session binding](#session-bindi
 
 `siteverifyErrorsToPause` (default 3) and `siteverifyPauseSeconds` (default 60): when Cloudflare's siteverify fails that
 many times in a row (timeout, network error, 5xx or a body that is not JSON), the CAPTCHA is paused for that many
-seconds and challenged traffic is forwarded with `x-cheq-rti-result`. A siteverify answer (even a rejected token) resets
-the count. A 4xx (e.g. a 429 rate limit) never counts: it is shown as a failed check, so flooding junk tokens can't
+seconds and challenged traffic is forwarded with `x-cheq-rti-result`. Any other error while answering a solved CAPTCHA
+(a bug or an unexpected input, e.g. while signing the session) counts the same way, so a step that always fails can't
+keep visitors on the CAPTCHA. A reply answered without an error (even a rejected token) resets the count. A 4xx (e.g. a 429 rate limit) never counts: it is shown as a failed check, so flooding junk tokens can't
 switch the CAPTCHA off. `siteverifyErrorsToPause: 0` turns the pause off: during a Cloudflare
 outage visitors get the CAPTCHA again and again, but it is never skipped. `siteverifyErrorsToPause` must be a whole number
 from 0, `siteverifyPauseSeconds` from 1; any other value logs a warning and the default is used.
@@ -917,6 +918,16 @@ actionOnSuspicious: {
 - `OPTIONS` is the browser's CORS preflight, sent before a cross-site call. Blocking or challenging it breaks that call.
 - A typo (a method that isn't one of these five, a value that isn't an `Action`, a bad regex) is logged as a warning once
   per cold start and counts as `ALLOW`, so it never blocks by mistake.
+- **Known limit: keep exactly the shape shown above.** `config.ts` is TypeScript, which enforces it. A value forced past
+  it (`as any`, or a config built in plain JS) is not checked when the Lambda runs:
+  - **Every rule needs a `path`, written as a string** (`'^/login$'`, not `/^\/login$/`). JavaScript turns any other
+    value into a regex: a rule **without** a `path` matches **every** path, so `{ methods: ['POST'], action:
+    Action.BLOCK }` blocks every suspicious `POST`, and `path: null` matches paths containing `null`. The cold-start
+    warning does not catch it.
+  - `rules` that aren't a list, a rule that isn't an object (`null`, a hole in the list), `methods` that aren't a list,
+    or a value that JSON can't write (a bigint, a circular object) can throw. During the cold-start check the Lambda
+    then fails to start, so every request fails; during a request it fails open (forwarded without `x-cheq-rti-result`).
+  - `methods: 'POST'` as a string, not a list, is matched as a substring.
 - On origin-request, `CHALLENGE` needs the viewer's `Referer` in the origin request policy (the default policy forwards
   all viewer headers). Without it, the visitor goes to the site's home page after the CAPTCHA.
 - A `Referer` on another site is never used: the visitor goes to the home page instead. Sending them back to another
@@ -944,9 +955,11 @@ Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blo
         │
    YES ──► POST token to Cloudflare siteverify API (server-side, 1.5 s timeout)
                │
-          siteverify error ──► 302 back to original_url, no session (the token never reaches
-          (timeout, network,      the origin). Enough errors in a row pause the CAPTCHA
-           5xx, not JSON)         (siteverifyErrorsToPause / siteverifyPauseSeconds)
+          siteverify error ──► 403 with the widget again and "We couldn't verify you right now".
+          (timeout, network,      Enough errors in a row pause the CAPTCHA (siteverifyErrorsToPause /
+           5xx, not JSON,         siteverifyPauseSeconds): then a 302 back to original_url, no session.
+           or any error           Never thrown, so the token never reaches the origin.
+           answering it)
                │
           Verification fails ──► Return 403 with the widget again and "Verification failed. Please try again."
           (or hostname / action
@@ -1059,7 +1072,8 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
                          Verified → 302 to original_url with a new _cq_se session (same sessionTtlSeconds)
                          Failed (used, expired or forged token, or one solved on another site or widget:
                                  see Token checks) → 403 with the widget again and an error message
-                         siteverify error → 302 to original_url, no session
+                         siteverify error, or any error answering it → 403 with the widget again, or once the
+                                 CAPTCHA is paused, 302 to original_url, no session
 ```
 
 - **The challenge recognizes its own reply.** `config.isChallengeResponse` comes with the challenge (the Turnstile
@@ -1089,8 +1103,13 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
   - **Cost:** while RTI is failing, each reply makes a siteverify call that a plain fail-open forward would not.
 - It never lengthens a session or skips RTI: a new `_cq_se` still needs a token that Cloudflare verifies, and the
   redirected request is checked by RTI again. `MONITORING` mode forwards replies unchanged, like everything else.
-- A siteverify error is handled by the example itself: a 302 back to `original_url` without a session, so the token
-  never reaches the origin. If a custom `config.challenge` throws, the reply is forwarded (fail-open).
+- **The example never throws on a reply.** A siteverify error, or any other error answering the reply (a bug or an
+  unexpected input, e.g. while signing the session), gets the widget again with "We couldn't verify you right now", and
+  counts toward the pause (see [Siteverify pause](#siteverify-pause)). Once paused: a 302 back to `original_url` without
+  a session, where the CAPTCHA is waived. Either way the token never reaches the origin, and the visitor's own query
+  string comes back with `original_url`. If a custom `config.challenge` throws, the reply is forwarded (fail-open): the
+  origin gets `?original_url=…&request_id=…&cf-turnstile-response=…` instead of the visitor's query string, so a custom
+  challenge should answer its own errors the same way.
 
 ### Session Cookie Format
 
@@ -1196,7 +1215,7 @@ request it recognizes, also when RTI allows it, when the visitor has a valid ses
 `addRtiResultHeader`: see the **RTI down** item there). Without `isChallengeResponse`, replies are not recognized (a warning is
 logged once per cold start): in `BLOCKING` mode a reply that RTI allows then reaches the origin with the form fields.
 
-> **Note:** If `config.challenge` throws, the error is caught and the request is passed through (fail-open). Errors are logged via `console.error`, and to the RTI logger unless `logErrors` is `false`.
+> **Note:** If `config.challenge` throws, the error is caught and the request is passed through (fail-open). Errors are logged via `console.error`, and to the RTI logger unless `logErrors` is `false`. For a reply to the challenge page, passing it through means the origin gets the token and the form fields in place of the visitor's query string: handle errors on a reply inside `challenge` instead (the Turnstile example shows the widget again, then redirects to `original_url` once paused).
 
 ---
 

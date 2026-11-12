@@ -17,15 +17,18 @@ function stubSiteverifyClient<T extends (...args: any[]) => any>(fetchLike: T): 
     return fetchLike;
 }
 
-// Pass-through spy on timingSafeEqual, so a test can check the signature compare is constant-time.
+// Pass-through spies: on timingSafeEqual, so a test can check the signature compare is constant-time; on createHmac, so
+// a test can make signing the session throw.
 vi.mock('node:crypto', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:crypto')>();
-    return { ...actual, timingSafeEqual: vi.fn(actual.timingSafeEqual) };
+    return { ...actual, timingSafeEqual: vi.fn(actual.timingSafeEqual), createHmac: vi.fn(actual.createHmac) };
 });
 
 afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    // Back to the real createHmac (mockReset restores the implementation given to vi.fn), after a test that broke it.
+    vi.mocked(createHmac).mockReset();
 });
 
 const testSettings: TurnstileSettings = {
@@ -1039,6 +1042,271 @@ describe('challenge', () => {
             const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
             build({ ...testSettings, siteverifyErrorsToPause: value });
             expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid siteverifyErrorsToPause'));
+        });
+    });
+
+    // --- An error answering the reply: never thrown, so request-helper never forwards the token to the origin ---
+
+    describe('an error answering the reply', () => {
+        // siteverify verifies the token, then signing the session throws: a bug, not a Cloudflare outage.
+        const breakSigning = () => {
+            vi.mocked(createHmac).mockImplementation(() => { throw new Error('signing broken'); });
+            return stubSiteverify(true);
+        };
+        // An RTI response without ids: signing the session and building the retry page both read ids.rayId, so both throw.
+        const responseWithoutIds = () => ({ ...buildRTIResponse(), ids: undefined }) as unknown as RTIResponse;
+
+        it('shows the widget again, saying it was not the visitor\'s fault, without the token or a session', async () => {
+            const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            breakSigning();
+            const result = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+            expect(result.status).toBe('403');
+            expect(result.body).toContain('class="cf-turnstile"');
+            expect(result.body).toContain(UNAVAILABLE);
+            expect(result.body).toContain('name="original_url" value="/target?a=1"');
+            expect(result.body).not.toContain('valid-token');
+            expect(result.headers['set-cookie']).toBeUndefined();
+            expect(result.headers['cache-control'][0].value).toContain('no-store');
+            expect(error).toHaveBeenCalledWith('[turnstile] error answering the challenge reply: signing broken');
+        });
+
+        it.each([
+            [0, ['retry', 'retry', 'retry', 'retry']],
+            [1, ['fail open', 'fail open', 'fail open', 'fail open']],
+            [3, ['retry', 'retry', 'fail open', 'fail open']],
+        ] as const)('counts toward the pause like a siteverify error (siteverifyErrorsToPause %s), although siteverify works', async (errorsToPause, expected) => {
+            // Arrange: siteverify answers every time, so only the errors after it can start the pause
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: errorsToPause });
+            breakSigning();
+
+            // Act
+            const got: string[] = [];
+            for (let i = 0; i < expected.length; i++) {
+                const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+                expect(result.headers['set-cookie']).toBeUndefined();
+                if (result.status === '302') {
+                    expect(result.headers.location[0].value).toBe('https://example.com/target?a=1');
+                }
+                got.push(result.status === '302' ? 'fail open' : result.status === '403' && result.body.includes(UNAVAILABLE) ? 'retry' : `unexpected ${result.status}`);
+            }
+
+            // Assert
+            expect(got).toEqual(expected);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(errorsToPause > 0);
+        });
+
+        it('the 302 once paused restores the visitor\'s own query string and drops every challenge field', async () => {
+            // Arrange: the reply the challenge page sends for /landing?gclid=abc&utm_source=google
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 1 });
+            breakSigning();
+            const reply = new URLSearchParams({ original_url: '/landing?gclid=abc&utm_source=google', request_id: 'ray-123', 'cf-turnstile-response': 'valid-token' }).toString();
+
+            // Act
+            const result = await cb.challenge({ ...buildTurnstileRequest(reply, 'example.com'), uri: '/landing' }, buildRTIResponse()) as any;
+
+            // Assert
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('https://example.com/landing?gclid=abc&utm_source=google');
+        });
+
+        it('a reply that answers fine again resets the count', async () => {
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 2 });
+            breakSigning();
+            await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            vi.mocked(createHmac).mockReset(); // signing works again
+            const passed = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+            expect(passed.status).toBe('302');
+            expect(passed.headers['set-cookie']).toHaveLength(1);
+            breakSigning();
+            const retry = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+            expect(retry.body).toContain(UNAVAILABLE); // 1 error since the reset, not 2
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it('if the retry page throws too, a 302 to original_url instead, without a session', async () => {
+            // Arrange
+            const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build(testSettings);
+            stubSiteverify(true);
+
+            // Act
+            const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), responseWithoutIds()) as any;
+
+            // Assert: below the limit (1 of 3), so not paused: the redirected request gets RTI and the CAPTCHA as usual
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('https://example.com/target?a=1');
+            expect(result.headers['set-cookie']).toBeUndefined();
+            expect(error).toHaveBeenCalledWith(expect.stringContaining('[turnstile] error answering the challenge reply:'));
+            expect(error).toHaveBeenCalledWith(expect.stringContaining('[turnstile] error building the retry page, redirecting to original_url instead:'));
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it('a siteverify error whose retry page throws: a 302 to original_url, and the error counts once', async () => {
+            // Arrange: counted twice, 2 would start the pause
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 2 });
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('siteverify unreachable')));
+
+            // Act
+            const result = await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), responseWithoutIds()) as any;
+
+            // Assert
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('https://example.com/target?a=1');
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it('siteverify errors and errors answering the reply add up to one count', async () => {
+            // Arrange
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 3 });
+            const reply = () => cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as Promise<any>;
+
+            // Act: siteverify error, signing error, siteverify error
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const first = await reply();
+            breakSigning();
+            const second = await reply();
+            vi.mocked(createHmac).mockReset();
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const third = await reply();
+
+            // Assert
+            expect([first.status, second.status, third.status]).toEqual(['403', '403', '302']);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+        });
+
+        it('a refused (4xx) or too-long token neither counts nor resets the count', async () => {
+            // Arrange
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 3 });
+            const reply = (query = errorQuery) => cb.challenge(buildTurnstileRequest(query, 'example.com'), buildRTIResponse()) as Promise<any>;
+            const tooLong = new URLSearchParams({ 'cf-turnstile-response': 'x'.repeat(2049), 'original_url': '/target?a=1' }).toString();
+
+            // Act: 2 errors, a 4xx, a too-long token, then the 3rd error
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            await reply();
+            await reply();
+            stubSiteverifyClient(vi.fn().mockResolvedValue({ status: 429, json: async () => ({}) }));
+            const refused = await reply();
+            const long = await reply(tooLong);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const third = await reply();
+
+            // Assert
+            expect(refused.body).toContain('Verification failed. Please try again.');
+            expect(long.body).toContain('Verification failed. Please try again.');
+            expect(third.status).toBe('302');
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+        });
+
+        it.each([
+            ['a refused (4xx) token', () => stubSiteverifyClient(vi.fn().mockResolvedValue({ status: 429, json: async () => ({}) })), 'valid-token'],
+            ['a rejected token', () => stubSiteverify(false), 'valid-token'],
+            ['a too-long token', () => stubSiteverify(true), 'x'.repeat(2049)],
+        ])('%s whose retry page throws: a 302 to original_url, counted once (an async rejection is caught too)', async (_, stub, token) => {
+            // Arrange: counted twice, 2 would start the pause
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            vi.spyOn(console, 'warn').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 2 });
+            stub();
+            const query = new URLSearchParams({ 'cf-turnstile-response': token, 'original_url': '/target?a=1' }).toString();
+
+            // Act
+            const result = await cb.challenge(buildTurnstileRequest(query, 'example.com'), responseWithoutIds()) as any;
+
+            // Assert
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('https://example.com/target?a=1');
+            expect(result.headers['set-cookie']).toBeUndefined();
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it.each([
+            ['a protocol-relative URL', '//evil.com/x'],
+            ['an absolute URL', 'https://evil.com/x'],
+            ['a backslash after the slash', '/\\evil.com'],
+            ['a tab after the slash (the browser deletes it)', '/\t/evil.com'],
+            ['a CRLF (header injection)', '/x\r\nSet-Cookie: a=1'],
+            ['a javascript: URL', 'javascript:alert(1)'],
+        ])('never leaves the site on the error path: original_url with %s falls back to the request path', async (_, originalUrl) => {
+            // Arrange
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            breakSigning();
+            const query = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': originalUrl }).toString();
+
+            // Act: once as the retry page (below the limit), once as the 302 (paused)
+            const retry = await build(testSettings).challenge(buildTurnstileRequest(query, 'example.com'), buildRTIResponse()) as any;
+            const redirect = await build({ ...testSettings, siteverifyErrorsToPause: 1 }).challenge(buildTurnstileRequest(query, 'example.com'), buildRTIResponse()) as any;
+
+            // Assert
+            expect(retry.body).toContain('name="original_url" value="/page"');
+            expect(redirect.headers.location[0].value).toBe('https://example.com/page');
+        });
+
+        it('without a Host header the 302 is relative, still the checked original_url', async () => {
+            // Arrange: no Host, so siteverify's answer can't be checked; its error is what reaches the error path
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 1 });
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+
+            // Act
+            const result = await cb.challenge(buildTurnstileRequest(errorQuery, null), buildRTIResponse()) as any;
+
+            // Assert
+            expect(result.status).toBe('302');
+            expect(result.headers.location[0].value).toBe('/target?a=1');
+        });
+
+        it('never sets x-cheq-rti-result on the error path: the verdict header goes only on a solved 302', async () => {
+            // Arrange
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const addRtiResultHeader = vi.fn();
+            breakSigning();
+
+            // Act
+            const retry = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse(), addRtiResultHeader) as any;
+            const redirect = await build({ ...testSettings, siteverifyErrorsToPause: 1 }).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse(), addRtiResultHeader) as any;
+
+            // Assert
+            expect([retry.status, redirect.status]).toEqual(['403', '302']);
+            expect(addRtiResultHeader).not.toHaveBeenCalled();
+        });
+
+        it('once the pause ends, errors answering the reply count from 0 again', async () => {
+            // Arrange
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 2, siteverifyPauseSeconds: 60 });
+            const reply = () => cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as Promise<any>;
+            breakSigning();
+            const start = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(start);
+
+            // Act: 2 errors pause it; 60 s later one more error is 1 of 2 again
+            const before = [(await reply()).status, (await reply()).status];
+            vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
+            const after = (await reply()).status;
+
+            // Assert
+            expect(before).toEqual(['403', '302']);
+            expect(after).toBe('403');
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it('never rejects, whatever is thrown', async () => {
+            vi.spyOn(console, 'error').mockImplementation(() => {});
+            stubSiteverify(true);
+            for (const thrown of [undefined, null, 'text', 42, Object.create(null)]) {
+                vi.mocked(createHmac).mockImplementation(() => { throw thrown; });
+                const result = await build(testSettings).challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse()) as any;
+                expect(result.status).toBe('403');
+                expect(result.body).toContain(UNAVAILABLE);
+            }
         });
     });
 
