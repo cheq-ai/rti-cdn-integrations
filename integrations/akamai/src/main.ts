@@ -121,7 +121,8 @@ export async function onClientRequest(request: EWRequest): Promise<void> {
         payload.endUserParams.headers.cheq_geo_region = request.userLocation?.region || undefined;
 
         if (config.debug) {
-            log.log(`[cheq] payload: ${JSON.stringify(payload)}`);
+            // Redacted (cookie names only, no session token or credentials): see RTIStatelessUtils.stringifyRedactedPayload
+            log.log(`[cheq] payload: ${rtiHelper.stringifyRedactedPayload(payload)}`);
         }
 
         const startRTI = Date.now();

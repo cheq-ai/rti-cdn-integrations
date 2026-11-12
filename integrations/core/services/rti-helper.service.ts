@@ -1,16 +1,34 @@
-// cspell:ignore nums CHEQ duid pvid
+// cspell:ignore CHEQ bodyless
 import { Config } from "../models/config.interface";
 import { EventType } from "../models/event-type.model";
 import { RTIResponse } from "../models/rti-response.model";
 import { Action } from "../models/action.model";
 import { Mode } from "../models/mode.model";
-import { RTIParams } from "../models/rti-params.model";
-import { HeadersMap } from "../models/headers-map.model";
 import { ActionStrategy } from "../models/action-strategy.model";
+import { BODY_METHODS, BodyMethod, RequestStrategy } from "../models/action-on-suspicious.model";
+import { RTIStatelessUtils } from "./rti-stateless-utils";
 
-export class RTIHelperService {
+/**
+ * The RTI decisions that depend on the integration's {@link Config}: whether a path is ignored,
+ * which event type a request maps to, which {@link Action} and {@link ActionStrategy} an RTI
+ * response leads to, and whether the config itself is valid.
+ *
+ * The config-free helpers (cookies, headers, list parsing, the `x-cheq-rti-result` header, the
+ * challenge-reply check, the bodyless-method and Action checks, safe path matching and error
+ * messages) live in {@link RTIStatelessUtils}, which this class
+ * extends. The integrations only ever create this service and call everything through it, so the
+ * split is invisible to them: `rtiHelperService.parseCookies(...)` and
+ * `RTIHelperService.parseNumberList(...)` keep working through inheritance.
+ *
+ * Put a new method here only if it reads `this.config` (directly, or through another method of
+ * this class); otherwise it belongs in {@link RTIStatelessUtils}. The inheritance tests in
+ * `rti-helper.service.spec.ts` enforce this, and guard the `extends` link, because the helpers'
+ * own tests check the base class directly and would not notice if this service lost them.
+ */
+export class RTIHelperService extends RTIStatelessUtils {
   config: Config;
   constructor(config: Config) {
+    super();
     this.config = config;
   }
 
@@ -75,177 +93,45 @@ export class RTIHelperService {
   }
 
   /**
-   * Parses a raw Cookie header string and extracts the three CHEQ RTI cookies.
-   * Uses substring (not split) so base64-padded values with `=` are preserved intact.
-   *
-   * Edge cases:
-   * - Empty string or no matching cookies → all three fields are `undefined`
-   * - Cookie present but with an empty value (e.g. `_cq_s=`) → field is `undefined`
-   * - `_cq_se` (challenge session cookie) does NOT match `_cq_s` — prefix is exact
-   * - Duplicate cookie names → first occurrence wins
-   *
-   * @param cookieHeader raw Cookie header value (e.g. `"_cq_duid=abc; _cq_s=xyz=="`)
-   * @returns object with `duidCookie`, `pvidCookie`, `sCookie` — each `undefined` when absent
+   * What to do with this request: RTI's {@link Action} mapped to a strategy ({@link getActionStrategy}).
+   * A CAPTCHA page can't carry a request body through (login, payment, the bank's 3DS return), so a POST, PUT, PATCH,
+   * DELETE or OPTIONS is never challenged in place: when the strategy is CAPTCHA, {@link getActionOnSuspicious} decides
+   * instead, mapped the same way. `strategy: null` means forward to the origin with the verdict.
+   * @param action RTI's action for this request ({@link getAction})
+   * @param method the request method
+   * @param path the request path, for actionOnSuspicious rules
    */
-  parseCookies(cookieHeader: string): { duidCookie?: string; pvidCookie?: string; sCookie?: string } {
-    if (!cookieHeader) {
-      return {};
+  getStrategyForRequest(action: Action, method: string, path: string): RequestStrategy {
+    const strategy = action !== Action.ALLOW ? this.getActionStrategy(action) : null;
+    if (strategy !== ActionStrategy.CAPTCHA || this.isBodylessMethod(method)) {
+      return { strategy };
     }
-
-    // NOTE: does not normalize spaces around '=' (e.g. "name = value") — RFC 6265 forbids it so compliant servers won't send it
-    const cookies = cookieHeader.split(";").map(c => c.trim());
-    
-    // duidCookie and pvidCookie are v4.0 cookies, sCookie is a v4.1 cookie
+    const bodyAction = this.getActionOnSuspicious(method, path);
     return {
-      duidCookie: this.getCookieValue(cookies, "_cq_duid="),
-      pvidCookie: this.getCookieValue(cookies, "_cq_pvid="),
-      sCookie:    this.getCookieValue(cookies, "_cq_s="),
+      strategy: bodyAction === Action.ALLOW ? null : this.getActionStrategy(bodyAction),
+      actionOnSuspicious: bodyAction,
     };
   }
 
   /**
-   * Extracts a cookie value from a pre-split cookie array by exact prefix match.
-   * The `nameWithEqualSign` parameter must include the trailing `=` (e.g. `"_cq_s="`),
-   * which prevents false-positive matches on similarly-named cookies (e.g. `_cq_se`).
-   *
-   * Edge cases:
-   * - Cookie not found → `undefined`
-   * - Cookie present but with an empty value (e.g. `_cq_s=`) → `undefined` (falsy)
-   * - Values containing `=` (e.g. base64 padding) → preserved intact via `substring`
-   * - Duplicate names → first occurrence wins
-   *
-   * @param cookies pre-split and trimmed cookie tokens (e.g. from `cookieHeader.split(";").map(c => c.trim())`)
-   * @param nameWithEqualSign cookie name including `=` (e.g. `"_cq_duid="`)
-   * @returns the cookie value, or `undefined` when absent or empty
+   * What to do with a request with a body when RTI says CHALLENGE ({@link Config.actionOnSuspicious}): the first
+   * matching rule, else the method's default, else {@link Action.ALLOW}. A method that is not a {@link BodyMethod}
+   * (GET, HEAD, anything else) is ALLOW: GET and HEAD get the CAPTCHA page through the usual flow.
+   * A value that is not an {@link Action} counts as ALLOW, so a typo never blocks.
+   * Expects the documented shape, which is not checked here: a rule without a string `path` matches every path, and
+   * some other shapes throw (see the known limit on {@link ActionOnSuspicious}).
+   * @param method the request method, any case
+   * @param path the request path, matched against each rule's regex
    */
-  getCookieValue(cookies: string[], nameWithEqualSign: string): string | undefined {
-    // NOTE: does not strip surrounding quotes from values (e.g. name="value") — our cookies never use quoted values
-    return cookies.find(c => c.startsWith(nameWithEqualSign))?.substring(nameWithEqualSign.length) || undefined;
-  }
-
-  /**
-   * Returns CHEQ cookie value
-   * @param cookie
-   */
-  getCheqCookie(cookie: string) {
-    return !cookie
-        ? undefined
-        : (
-            cookie
-            .split(';')
-            .map(c => c.trim())
-            .find(c => c.includes(RTIParams.CHEQ_COOKIE_NAME)) || ''
-        ).substring(RTIParams.CHEQ_COOKIE_NAME.length + 1);
-  }
-
-  /**
-   * Returns capitalized string and substrings
-   * @param str
-   * @param splitter
-   */
-  capitalize(str = '', splitter = ' ') {
-    return str
-        .split(splitter)
-        .map(s => `${s.charAt(0).toUpperCase()}${s.substring(1)}`)
-        .join(splitter);
-  }
-
-  /**
-   * Returns header ignoring case
-   * @param headers
-   * @param name
-   * @param defaultValue
-   */
-  getHeaderByName(headers: HeadersMap, name = '', defaultValue: string | number | undefined = undefined) {
-    return headers[name.toLowerCase()] || headers[this.capitalize(name, '-')] || defaultValue;
-  }
-
-  /**
-   * Parses a comma-separated string of integers into a number array.
-   * Non-numeric entries and empty segments are silently skipped.
-   * Returns undefined when the input is absent or yields no valid numbers.
-   * @param val comma-separated string (e.g. "4,5,6")
-   */
-  static parseNumberList(val: string | undefined): number[] | undefined {
-    if (!val) {
-      return undefined;
+  getActionOnSuspicious(method: string, path: string): Action {
+    const upperMethod = method.toUpperCase() as BodyMethod;
+    if (!BODY_METHODS.includes(upperMethod)) {
+      return Action.ALLOW;
     }
-    const nums = val.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
-    return nums.length > 0 ? nums : undefined;
-  }
-
-  /**
-   * Parses a comma-separated string into a string array.
-   * Empty and whitespace-only segments are filtered out.
-   * Returns undefined when the input is absent, blank, or yields no non-empty strings.
-   * @param val comma-separated string (e.g. "/health,/ping")
-   */
-  static parseStringList(val: string | undefined): string[] | undefined {
-    if (!val) {
-      return undefined;
-    }
-    const items = val.split(',').map(s => s.trim()).filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-
-  /**
-   * Maximum length of the `rule-name` field. Rule names are operator-defined free text
-   * with no length bound, and the whole header shares the CDN's header size budget.
-   */
-  private static readonly RULE_NAME_MAX_LENGTH = 128;
-
-  /**
-   * Makes a rule name safe to carry inside a `;`-delimited header value.
-   *
-   * `decision.ruleName` is operator-defined free text, so it can contain anything:
-   * - CR/LF is a header-injection vector. Cloudflare's `Headers.set` throws on it, but
-   *   Akamai's `setHeader` and CloudFront's header array do not - dropped here along
-   *   with every other control and non-ASCII character.
-   * - a literal `;` would split the field and desync any parser - mapped to `,`.
-   * - unbounded length - truncated to {@link RULE_NAME_MAX_LENGTH}.
-   *
-   * `=` is deliberately left alone: `rule-name` is the last field, and parsers split on
-   * `;` first and then on the FIRST `=`, so an embedded `=` stays inside the value.
-   *
-   * @param ruleName raw {@link Decision.ruleName}, which is `null` when no rule matched
-   * @returns printable-ASCII, delimiter-free, length-capped text (`''` when absent)
-   */
-  private static sanitizeRuleName(ruleName: string | null): string {
-    if (!ruleName) {
-      return '';
-    }
-    return ruleName
-      .replace(/[^\x20-\x7E]/g, '')
-      .replace(/;/g, ',')
-      .substring(0, RTIHelperService.RULE_NAME_MAX_LENGTH);
-  }
-
-  /**
-   * Builds the `x-cheq-rti-result` header value from an RTI response.
-   *
-   * Format: `version=X;verdict=Y;threat-type-code=Z;ids={...}`
-   * With `includeDebugData`: `...;ids={...};reasons=N,N,N;rule-name=S`
-   *
-   * @param rtiResponse the RTI response object
-   * @param includeDebugData appends the detection reason codes and the name of the rule
-   *   that produced the verdict. Off by default, so every caller that omits it gets a
-   *   byte-for-byte unchanged header. Only the Akamai integration opts in, per request
-   *   via the `PMUSER_CHEQ_RTI_DEBUG_DATA` property variable.
-   */
-  buildRtiResultHeader(rtiResponse: RTIResponse, includeDebugData = false): string {
-    const parts = [
-      `version=${rtiResponse.metadata.version}`,
-      `verdict=${rtiResponse.decision.verdict}`,
-      `threat-type-code=${rtiResponse.classification.code}`,
-      `ids=${JSON.stringify(rtiResponse.ids)}`,
-    ];
-
-    if (includeDebugData) {
-      parts.push(`reasons=${rtiResponse.cheqDetection.reasons.join(',')}`);
-      parts.push(`rule-name=${RTIHelperService.sanitizeRuleName(rtiResponse.decision.ruleName)}`);
-    }
-
-    return parts.join(';');
+    const settings = this.config.actionOnSuspicious;
+    const rule = settings?.rules?.find(r => (!r.methods || r.methods.includes(upperMethod)) && this.pathMatches(path, r.path));
+    const action = rule ? rule.action : settings?.methods?.[upperMethod];
+    return this.isAction(action) ? action : Action.ALLOW;
   }
 
   /**
@@ -258,6 +144,43 @@ export class RTIHelperService {
         (this.config.redirectLocation && !this.config.redirectReasons)) {
           errors.push("For redirecting as an Action you must define both redirectCodes and redirectLocation");
     }
+    errors.push(...this.validateActionOnSuspicious());
+    return errors;
+  }
+
+  /**
+   * Problems in {@link Config.actionOnSuspicious}, one message each. Wrong values are ALLOW at run time
+   * (see {@link getActionOnSuspicious}); this says what to fix. Integrations log it once per cold start.
+   * Known limit: it expects the documented shape. A missing or non-string `path` is not reported (it matches every
+   * path), and `rules`, a rule or `methods` of another shape, or a value JSON can't write, can make it throw. CloudFront
+   * calls it at module load, so that throw stops the Lambda from starting (see {@link ActionOnSuspicious}).
+   */
+  validateActionOnSuspicious(): string[] {
+    const errors: string[] = [];
+    const settings = this.config.actionOnSuspicious;
+    for (const [method, action] of Object.entries(settings?.methods ?? {})) {
+      if (!BODY_METHODS.includes(method as BodyMethod)) {
+        errors.push(`actionOnSuspicious.methods: '${method}' is not one of ${BODY_METHODS.join(", ")}`);
+      }
+      if (!this.isAction(action)) {
+        errors.push(`actionOnSuspicious.methods.${method}: ${JSON.stringify(action)} is not an Action`);
+      }
+    }
+    (settings?.rules ?? []).forEach((rule, i) => {
+      try {
+        new RegExp(rule.path);
+      } catch {
+        errors.push(`actionOnSuspicious.rules[${i}].path: '${rule.path}' is not a valid regex`);
+      }
+      for (const method of rule.methods ?? []) {
+        if (!BODY_METHODS.includes(method)) {
+          errors.push(`actionOnSuspicious.rules[${i}].methods: '${method}' is not one of ${BODY_METHODS.join(", ")}`);
+        }
+      }
+      if (!this.isAction(rule.action)) {
+        errors.push(`actionOnSuspicious.rules[${i}].action: ${JSON.stringify(rule.action)} is not an Action`);
+      }
+    });
     return errors;
   }
 }

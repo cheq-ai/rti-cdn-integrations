@@ -72,6 +72,7 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 validateConfig: mocks.validateConfig,
                 buildRtiResultHeader: realInstance.buildRtiResultHeader.bind(realInstance),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
+                stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
             };
         }),
     };
@@ -249,6 +250,11 @@ const akamaiAdapter: TestAdapter = {
 
     assertNotDebugLogged() {
         expect(mocks.logLog).not.toHaveBeenCalled();
+    },
+
+    assertNotInDebugLogs(substring: string) {
+        const leaked = mocks.logLog.mock.calls.map((args: any[]) => args.map(String).join(' ')).filter((line: string) => line.includes(substring));
+        expect(leaked, `expected no debug log containing "${substring}"`).toEqual([]);
     },
 
     assertErrorLogged(substring: string) {

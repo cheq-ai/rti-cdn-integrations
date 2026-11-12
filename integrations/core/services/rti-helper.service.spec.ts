@@ -1,6 +1,7 @@
 // cspell:ignore cheq rayid
 import { describe, test, expect } from 'vitest';
 import { RTIHelperService } from './rti-helper.service';
+import { RTIStatelessUtils } from './rti-stateless-utils';
 import { Mode } from '../models/mode.model';
 import { Action } from '../models/action.model';
 import { ActionStrategy } from '../models/action-strategy.model';
@@ -311,127 +312,150 @@ describe('RTIHelperService', () => {
   });
   // #endregion getActionStrategy Method Tests
 
-  // #region getCheqCookie Method Tests
-  describe('getCheqCookie', () => {
-    const svc = new RTIHelperService({} as any);
-
-    test('returns undefined for empty string', () => {
-      // Act & Assert
-      expect(svc.getCheqCookie('')).toBeUndefined();
-    });
-
-    test('returns cookie value when present', () => {
-      // Act & Assert
-      expect(svc.getCheqCookie('_cheq_rti=abc123; other=1')).toBe('abc123');
-    });
-
-    test('returns empty string when _cheq_rti is not in cookie string', () => {
-      // Act & Assert
-      expect(svc.getCheqCookie('session=xyz; theme=dark')).toBe('');
-    });
-
-    test('finds _cheq_rti when not the first cookie', () => {
-      // Act & Assert
-      expect(svc.getCheqCookie('session=xyz; _cheq_rti=token99')).toBe('token99');
-    });
-  });
-  // #endregion getCheqCookie Method Tests
-
-  // #region capitalize Method Tests
-  describe('capitalize', () => {
-    const svc = new RTIHelperService({} as any);
-
-    test('capitalizes each word with default space splitter', () => {
-      // Act & Assert
-      expect(svc.capitalize('hello world')).toBe('Hello World');
-    });
-
-    test('capitalizes single word', () => {
-      // Act & Assert
-      expect(svc.capitalize('hello')).toBe('Hello');
-    });
-
-    test('capitalizes with custom splitter', () => {
-      // Act & Assert
-      expect(svc.capitalize('x-y-z', '-')).toBe('X-Y-Z');
-    });
-
-    test('returns empty string when called with no arguments', () => {
-      // Act & Assert
-      expect(svc.capitalize()).toBe('');
-    });
-
-    test('handles already-capitalized input', () => {
-      // Act & Assert
-      expect(svc.capitalize('Hello')).toBe('Hello');
-    });
-
-    test('capitalizes header-style name with hyphen splitter', () => {
-      // Act & Assert
-      expect(svc.capitalize('x-forwarded-for', '-')).toBe('X-Forwarded-For');
-    });
-
-    test('handles single character', () => {
-      // Act & Assert
-      expect(svc.capitalize('a')).toBe('A');
-    });
-  });
-  // #endregion capitalize Method Tests
-
-  // #region getHeaderByName Method Tests
-  describe('getHeaderByName', () => {
-    const svc = new RTIHelperService({} as any);
-    const headers: any = { 'content-type': 'text/html', 'X-Custom-Header': 'value' };
-
-    test('finds header by lowercase name', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers, 'content-type')).toBe('text/html');
-    });
-
-    test('finds header by capitalized name', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers, 'x-custom-header')).toBe('value');
-    });
-
-    test('returns provided default when header is missing', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers, 'missing', 'fallback')).toBe('fallback');
-    });
-
-    test('returns undefined when header is missing and no default provided', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers, 'missing')).toBeUndefined();
-    });
-
-    test('returns undefined when called without name argument (uses default empty string)', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers)).toBeUndefined();
-    });
-
-    test('prefers lowercase key over title-case key when both exist', () => {
-      // Arrange
-      const h: any = { 'content-type': 'lower', 'Content-Type': 'title' };
-
-      // Act & Assert
-      expect(svc.getHeaderByName(h, 'content-type')).toBe('lower');
-    });
-
-    test('returns title-cased header (X-Forwarded-For) via lowercase lookup', () => {
-      // Arrange
-      const h: any = { 'X-Forwarded-For': '1.2.3.4' };
-
-      // Act & Assert
-      expect(svc.getHeaderByName(h, 'x-forwarded-for')).toBe('1.2.3.4');
-    });
-
-    test('returns numeric defaultValue when header is missing', () => {
-      // Act & Assert
-      expect(svc.getHeaderByName(headers, 'missing', 0)).toBe(0);
-    });
-  });
-  // #endregion getHeaderByName Method Tests
-
   // #region validateConfig Method Tests
+  describe('getStrategyForRequest', () => {
+    const svc = (config: any = {}) => new RTIHelperService(config);
+
+    test('ALLOW is null (forward), for every method', () => {
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'GET', '/x')).toEqual({ strategy: null });
+      expect(svc().getStrategyForRequest(Action.ALLOW, 'POST', '/x')).toEqual({ strategy: null });
+    });
+
+    test('maps RTI\'s action like getActionStrategy for GET and HEAD, whatever actionOnSuspicious says', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { rules: [{ path: '.*', action: Action.ALLOW }] } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'GET', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA });
+      expect(s.getStrategyForRequest(Action.REDIRECT, 'GET', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT });
+    });
+
+    test.each([Action.BLOCK, Action.REDIRECT])('%s on a body method is kept: actionOnSuspicious is only for a CAPTCHA', (action) => {
+      const s = svc({ actionOnSuspicious: { methods: { POST: Action.ALLOW } } });
+      expect(s.getStrategyForRequest(action, 'POST', '/x')).toEqual({ strategy: s.getActionStrategy(action) });
+    });
+
+    test('a CHALLENGE on a body method with nothing set: forward, and says ALLOW decided it', () => {
+      expect(svc().getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a CHALLENGE on a body method follows actionOnSuspicious, mapped like any Action', () => {
+      const s = svc({
+        blockingStrategy: ActionStrategy.NOT_FOUND,
+        actionOnSuspicious: { methods: { POST: Action.BLOCK, PUT: Action.REDIRECT, PATCH: Action.CHALLENGE, DELETE: Action.ALLOW } },
+      });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/x')).toEqual({ strategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: Action.BLOCK });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PUT', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'PATCH', '/x')).toEqual({ strategy: ActionStrategy.CAPTCHA, actionOnSuspicious: Action.CHALLENGE });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'DELETE', '/x')).toEqual({ strategy: null, actionOnSuspicious: Action.ALLOW });
+    });
+
+    test('a BLOCK shown as a CAPTCHA (blockingStrategy CAPTCHA) on a body method also follows actionOnSuspicious', () => {
+      const s = svc({ blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { methods: { POST: Action.REDIRECT } } });
+      expect(s.getStrategyForRequest(Action.BLOCK, 'POST', '/x')).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+    });
+
+    test('uses the path for rules', () => {
+      const s = svc({ actionOnSuspicious: { rules: [{ path: '^/login$', action: Action.BLOCK }] } });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/login').strategy).toBe(ActionStrategy.ACCESS_DENIED);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/search').strategy).toBeNull();
+    });
+  });
+
+  describe('getActionOnSuspicious', () => {
+    const svc = (actionOnSuspicious?: any) => new RTIHelperService({ actionOnSuspicious } as any);
+
+    test('every method is ALLOW when nothing is set', () => {
+      for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+        expect(svc().getActionOnSuspicious(method, '/x')).toBe(Action.ALLOW);
+      }
+    });
+
+    test('uses the method default; a method not listed is ALLOW', () => {
+      const s = svc({ methods: { POST: Action.BLOCK, PUT: Action.CHALLENGE } });
+      expect(s.getActionOnSuspicious('POST', '/x')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('PUT', '/x')).toBe(Action.CHALLENGE);
+      expect(s.getActionOnSuspicious('DELETE', '/x')).toBe(Action.ALLOW);
+    });
+
+    test('matches the method in any case', () => {
+      expect(svc({ methods: { POST: Action.BLOCK } }).getActionOnSuspicious('post', '/x')).toBe(Action.BLOCK);
+    });
+
+    test('a matching rule wins over the method default; the first match wins', () => {
+      const s = svc({
+        methods: { POST: Action.ALLOW },
+        rules: [
+          { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+          { path: '^/log', action: Action.BLOCK },
+        ],
+      });
+      expect(s.getActionOnSuspicious('POST', '/login')).toBe(Action.CHALLENGE);
+      expect(s.getActionOnSuspicious('PUT', '/login')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/logout')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/search')).toBe(Action.ALLOW);
+    });
+
+    test('a rule with methods applies only to them', () => {
+      const s = svc({ rules: [{ path: '^/api/', methods: ['DELETE'], action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious('DELETE', '/api/item')).toBe(Action.BLOCK);
+      expect(s.getActionOnSuspicious('POST', '/api/item')).toBe(Action.ALLOW);
+    });
+
+    test('a rule with a bad regex never matches; the next rule or the default is used', () => {
+      const s = svc({ methods: { POST: Action.REDIRECT }, rules: [{ path: '([', action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious('POST', '/x')).toBe(Action.REDIRECT);
+    });
+
+    test.each(['GET', 'HEAD', 'CONNECT', 'TRACE'])('%s is always ALLOW here (not a body method)', (method) => {
+      const s = svc({ rules: [{ path: '.*', action: Action.BLOCK }] });
+      expect(s.getActionOnSuspicious(method, '/x')).toBe(Action.ALLOW);
+    });
+
+    test.each([undefined, 'BLOCK', 99, -1, null])('a value that is not an Action (%j) is ALLOW, so a typo never blocks', (value) => {
+      expect(svc({ methods: { POST: value } }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
+      expect(svc({ rules: [{ path: '.*', action: value }] }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
+    });
+  });
+
+  describe('validateActionOnSuspicious', () => {
+    test('no problems for a valid setting, or none at all', () => {
+      expect(new RTIHelperService({} as any).validateActionOnSuspicious()).toEqual([]);
+      expect(new RTIHelperService({ actionOnSuspicious: {
+        methods: { POST: Action.CHALLENGE, OPTIONS: Action.ALLOW },
+        rules: [{ path: '^/login$', methods: ['POST'], action: Action.BLOCK }],
+      } } as any).validateActionOnSuspicious()).toEqual([]);
+    });
+
+    test('names every problem: an unknown method, a value that is not an Action, a bad regex', () => {
+      const problems = new RTIHelperService({ actionOnSuspicious: {
+        methods: { GET: Action.BLOCK, POST: 'BLOCK' },
+        rules: [{ path: '([', methods: ['HEAD'], action: 7 }],
+      } } as any).validateActionOnSuspicious();
+      expect(problems).toEqual([
+        "actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        'actionOnSuspicious.methods.POST: "BLOCK" is not an Action',
+        "actionOnSuspicious.rules[0].path: '([' is not a valid regex",
+        "actionOnSuspicious.rules[0].methods: 'HEAD' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        'actionOnSuspicious.rules[0].action: 7 is not an Action',
+      ]);
+    });
+
+    test('validateConfig includes these problems', () => {
+      const svc = new RTIHelperService({ actionOnSuspicious: { methods: { POST: 9 } } } as any);
+      expect(svc.validateConfig()).toContain('actionOnSuspicious.methods.POST: 9 is not an Action');
+    });
+
+    test('a rule without methods (every method) has no problem, and a wrong one still gets its own message', () => {
+      // Act
+      const found = new RTIHelperService({ actionOnSuspicious: {
+        rules: [{ path: '^/api/', action: Action.BLOCK }, { path: '([', action: Action.BLOCK }],
+      } } as any).validateActionOnSuspicious();
+
+      // Assert: only the second rule's regex
+      expect(found).toEqual(["actionOnSuspicious.rules[1].path: '([' is not a valid regex"]);
+    });
+  });
+
   describe('validateConfig', () => {
     test('returns error when redirectReasons defined but redirectLocation is not', () => {
       // Arrange
@@ -490,557 +514,92 @@ describe('RTIHelperService', () => {
   });
   // #endregion validateConfig Method Tests
 
-  // #region parseCookies Method Tests
-  describe('parseCookies', () => {
-    const svc = new RTIHelperService({} as any);
 
-    // --- Empty / missing input ---
-
-    test('returns all undefined for empty string', () => {
-      // Act
-      const result = svc.parseCookies('');
-
-      // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBeUndefined();
+  // #region Inheritance Tests
+  // The method tests for the config-free helpers live in rti-stateless-utils.spec.ts and test that class directly,
+  // so none of them would notice if this class stopped extending it. The integrations call those helpers through
+  // RTIHelperService (e.g. rtiHelperService.parseCookies, RTIHelperService.parseNumberList), so this checks the link.
+  describe('inheritance', () => {
+    test('extends RTIStatelessUtils, so the config-free helpers are available on the service', () => {
+      expect(new RTIHelperService({} as any)).toBeInstanceOf(RTIStatelessUtils);
     });
 
-    test('does not throw when called with null (runtime guard)', () => {
-      // Act
-      const result = svc.parseCookies(null as any);
+    /**
+     * The methods, getters and setters a class declares itself that do not use the config: neither read `this.config`
+     * nor call (or read) another member of the class that does, through a chain of any length. Read from the source
+     * (Function.prototype.toString), through the property descriptors, so a getter is never run.
+     */
+    const membersWithoutConfig = (cls: { prototype: object }): string[] => {
+      const sources = new Map<string, string>();
+      for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(cls.prototype))) {
+        if (name === 'constructor') {
+          continue;
+        }
+        const parts = [descriptor.value, descriptor.get, descriptor.set].filter(part => typeof part === 'function');
+        sources.set(name, parts.map(part => part.toString()).join('\n'));
+      }
+      const usesConfig = new Set<string>();
+      // \b: `this.configuration` or `this.configFree` is not the config
+      const reads = (source: string, member: string) => new RegExp(`\\bthis\\.${member}\\b`).test(source);
+      let found = true;
+      while (found) {
+        found = false;
+        for (const [name, source] of sources) {
+          if (!usesConfig.has(name) && (reads(source, 'config') || [...usesConfig].some(other => reads(source, other)))) {
+            usesConfig.add(name);
+            found = true;
+          }
+        }
+      }
+      return [...sources.keys()].filter(name => !usesConfig.has(name));
+    };
 
-      // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBeUndefined();
+    test('declares only methods that use the config: a config-free helper belongs in RTIStatelessUtils', () => {
+      // getStrategyForRequest reads no config itself: it calls getActionStrategy and getActionOnSuspicious, which do
+      expect(Object.getOwnPropertyNames(RTIHelperService.prototype).length).toBeGreaterThan(1);
+      expect(membersWithoutConfig(RTIHelperService)).toEqual([]);
     });
 
-    test('does not throw when called with undefined (runtime guard)', () => {
-      // Act
-      const result = svc.parseCookies(undefined as any);
+    test('declares no static members: a static method has no instance, so no config, and belongs in RTIStatelessUtils', () => {
+      // Act: what every class has (length, name, prototype) aside
+      const statics = Object.getOwnPropertyNames(RTIHelperService).filter(name => !['length', 'name', 'prototype'].includes(name));
 
       // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBeUndefined();
+      expect(statics).toEqual([]);
     });
 
-    test('returns all undefined when no CHEQ cookies are present', () => {
-      // Act
-      const result = svc.parseCookies('session=abc123; theme=dark; other=ignored');
-
-      // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBeUndefined();
+    test('holds no instance state but the config: a helper in an arrow-function field would escape the checks above', () => {
+      // Act & Assert
+      expect(Object.getOwnPropertyNames(new RTIHelperService({} as any))).toEqual(['config']);
     });
 
-    // --- Individual cookie extraction ---
+    test('the check finds every config-free member of a class, and only those', () => {
+      // Arrange: each member is one case the check must get right
+      class Example {
+        config = {};
+        configuration = {};
+        readsConfig() { return this.config; }
+        callsReader() { return this.readsConfig(); }
+        callsCaller() { return this.callsReader(); }
+        get configGetter() { return this.config; }
+        readsGetter() { return this.configGetter; }
+        free(path: string) { return path.trim(); }
+        readsAnotherField() { return this.configuration; }
+        get freeGetter() { return 1; }
+        set freeSetter(value: number) { void value; }
+        loopA(): unknown { return this.loopB(); }
+        loopB(): unknown { return this.loopA(); }
+      }
 
-    test('extracts only _cq_duid when present', () => {
-      // Act
-      const result = svc.parseCookies('_cq_duid=4.16a154e6ae45bc91bf9a49b365beb989');
-
-      // Assert
-      expect(result.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBeUndefined();
+      // Act & Assert
+      expect(membersWithoutConfig(Example).sort()).toEqual(['free', 'freeGetter', 'freeSetter', 'loopA', 'loopB', 'readsAnotherField'].sort());
     });
 
-    test('extracts only _cq_pvid when present', () => {
-      // Act
-      const result = svc.parseCookies('_cq_pvid=4.247bcdf08360a9de9dee2196c1a36631');
-
-      // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
-      expect(result.sCookie).toBeUndefined();
-    });
-
-    test('extracts only _cq_s when present', () => {
-      // Act
-      const result = svc.parseCookies('_cq_s=simple-value');
-
-      // Assert
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.sCookie).toBe('simple-value');
-    });
-
-    // --- All three together ---
-
-    test('extracts all three cookies when all present', () => {
-      // Act
-      const b64 = 'Ll7dvXH3YTlLM7nA:0pSlsKE44ASXSpI4yGmRpP+Rdwm3eR4RvkFIY60Jz1E/mWlZSilQ7METgbQuPTv1nfazHTyvz6qWSGx6GEeMYj9gTIIS38l/v7sO/xjLE7QVlUGtCQQS+5thTzsVRLejEV/3lrOQspnfY9sp5D5lGaEYa+k3yxdOjLp1kEVk/m7RQh2Nb1+Vbn+NaSRQ6CGIgJ/5BnEkYA==';
-
-      const result = svc.parseCookies(`_cq_duid=4.16a154e6ae45bc91bf9a49b365beb989; _cq_pvid=4.247bcdf08360a9de9dee2196c1a36631; _cq_s=${b64}`);
-
-      // Assert
-      expect(result.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
-      expect(result.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
-      expect(result.sCookie).toBe(b64);
-    });
-
-    // --- Noise cookies around CHEQ cookies ---
-
-    test('ignores unrelated cookies when extracting all three', () => {
-      // Arrange
-      const b64 = 'Ll7dvXH3YTlLM7nA:0pSlsKE44ASXSpI4yGmRpP+Rdwm3eR4RvkFIY60Jz1E/mWlZSilQ7METgbQuPTv1nfazHTyvz6qWSGx6GEeMYj9gTIIS38l/v7sO/xjLE7QVlUGtCQQS+5thTzsVRLejEV/3lrOQspnfY9sp5D5lGaEYa+k3yxdOjLp1kEVk/m7RQh2Nb1+Vbn+NaSRQ6CGIgJ/5BnEkYA==:uAmNscAbgD/vSVVN3OE4Ow==';
-
-      // Act
-      const result = svc.parseCookies(`session=abc123; _cq_duid=d-uuid-xyz; theme=dark; _cq_pvid=pv-ulid-abc; _cq_s=${b64}; other=ignored`);
-
-      // Assert
-      expect(result.duidCookie).toBe('d-uuid-xyz');
-      expect(result.pvidCookie).toBe('pv-ulid-abc');
-      expect(result.sCookie).toBe(b64);
-    });
-
-    // --- Base64 padding in _cq_s ---
-
-    test('preserves base64 = padding characters in _cq_s', () => {
-      // Arrange
-      const b64 = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
-
-      // Act
-      const result = svc.parseCookies(`_cq_s=${b64}`);
-
-      // Assert
-      expect(result.sCookie).toBe(b64);
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-    });
-
-    test('preserves base64 = padding in _cq_s when mixed with other cookies', () => {
-      // Arrange
-      const b64 = 'Qxr2YUViJVxjN/Lj:/ZN3E52EztskUvgEC4J+kf4iZ5bM0INszRKC8IWXUzH2Qm2K4ByU/oBBroRABQOUoSPEqH8kulCnl7oy3AcaXS/RlwFPROQ7YzzGVwxWos6lTFMMbRgDlTkC7uwA50UwqlkWjrmEmmimz5gEQQc0HaDHw7TDo7INomrDm2vnJFMyKieBu0sD8k6cM1f9ORUphNF+Lezms73AyIgC7YV1RK3T3T8kpIkePoTrjzCFtM4rWQ9IHmk4Qcb39TUK+TOIyr38Sb/oODE25SLwyCgQY1KDVjyb452nlo1+E55bxXMmkocgnqDqyOOjTqtoYqROmYRhQcrjVr13gX4NPj/1OOp3pwSUsR0E1ji0VfArMzRZ6H4TfL610HnxF87NNVlyIwg+2lXu5md4PaC2pCck7q7q3fEcB+QkeA+fdlhuiI6s++MQ4+2FNyqZiIoLz/2vrLdVDgbVchS9kb3vJljm4gAswQbZHT50zrQKpXJZtduxYsWIbNOyrF2VGrzTDwyBpTumYaA+jcisuSax/Gntjtl5thWkFaq6iRYdIEFLDDK7SyMlylFGEHg8O4/Sh8ha0j3CX3Q=:GwUKuinki4bX6547azx1Rw==';
-
-      // Act
-      const result = svc.parseCookies(`session=abc; _cq_duid=d-uuid; _cq_pvid=pv-ulid; _cq_s=${b64}`);
-
-      // Assert
-      expect(result.duidCookie).toBe('d-uuid');
-      expect(result.pvidCookie).toBe('pv-ulid');
-      expect(result.sCookie).toBe(b64);
-    });
-
-    // --- Prefix overlap: _cq_se must not match _cq_s ---
-
-    test('does not extract _cq_se as _cq_s', () => {
-      // Act
-      const result = svc.parseCookies('_cq_se=token|rayid; _cq_s=real-value');
-
-      // Assert
-      expect(result.sCookie).toBe('real-value');
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-    });
-
-    test('returns undefined for _cq_s when only _cq_se is present', () => {
-      // Act
-      const result = svc.parseCookies('_cq_se=token|rayid');
-
-      // Assert
-      expect(result.sCookie).toBeUndefined();
-      expect(result.duidCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-    });
-
-    // --- Special characters in values ---
-
-    test('preserves / + : characters in _cq_s value', () => {
-      // Act
-      const result = svc.parseCookies('_cq_s=abc/def+ghi:jkl');
-
-      // Assert
-      expect(result.sCookie).toBe('abc/def+ghi:jkl');
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.duidCookie).toBeUndefined();
-    });
-
-    // --- Whitespace handling ---
-
-    test('trims leading/trailing whitespace around each cookie token', () => {
-      // Act
-      const result = svc.parseCookies('  _cq_duid=d-abc  ;  _cq_pvid=pv-xyz  ;  _cq_s=s-val  ');
-
-      // Assert
-      expect(result.duidCookie).toBe('d-abc');
-      expect(result.pvidCookie).toBe('pv-xyz');
-      expect(result.sCookie).toBe('s-val');
-    });
-
-    // --- Empty cookie value ---
-
-    test('returns undefined when _cq_s has no value', () => {
-      // Act
-      const result = svc.parseCookies('_cq_s=');
-
-      // Assert
-      expect(result.sCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.duidCookie).toBeUndefined();
-
-    });
-
-    test('returns undefined when _cq_duid has no value', () => {
-      // Act
-      const result = svc.parseCookies('_cq_duid=');
-
-      // Assert
-      expect(result.sCookie).toBeUndefined();
-      expect(result.pvidCookie).toBeUndefined();
-      expect(result.duidCookie).toBeUndefined();
-    });
-
-    // --- Empty segments (double semicolons) ---
-
-    test('handles empty segments from double semicolons gracefully', () => {
-      // Act
-      const result = svc.parseCookies('_cq_duid=d-abc;; _cq_s=s-val');
-
-      // Assert
-      expect(result.duidCookie).toBe('d-abc');
-      expect(result.sCookie).toBe('s-val');
-      expect(result.pvidCookie).toBeUndefined();
-    });
-
-    // --- Duplicate cookie names ---
-
-    test('returns first match when _cq_s appears twice', () => {
-      // Act
-      const result = svc.parseCookies('_cq_s=first; _cq_s=second');
-
-      // Assert
-      expect(result.sCookie).toBe('first');
+    test.each(['isBodylessMethod', 'isAction', 'pathMatches'])('%s is inherited from RTIStatelessUtils, not declared here', (name) => {
+      // Act & Assert
+      expect(Object.getOwnPropertyNames(RTIHelperService.prototype)).not.toContain(name);
+      expect((new RTIHelperService({} as any) as any)[name]).toBe((RTIStatelessUtils.prototype as any)[name]);
     });
   });
-  // #endregion parseCookies Method Tests
-
-  // #region buildRtiResultHeader Method Tests
-  describe('buildRtiResultHeader', () => {
-    const svc = new RTIHelperService({} as any);
-
-    function buildResponse(overrides: { verdict?: string; code?: number; version?: string; ids?: any; reasons?: number[]; ruleName?: string | null } = {}) {
-      return {
-        metadata: { version: overrides.version ?? '4.1' },
-        decision: { verdict: overrides.verdict ?? 'benign', ruleName: overrides.ruleName ?? null },
-        classification: { code: overrides.code ?? 0 },
-        ids: overrides.ids ?? { rayId: 'ray-1', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam2: null },
-        cheqDetection: { reasons: overrides.reasons ?? [] },
-      } as any;
-    }
-
-    const defaultIds = { rayId: 'ray-1', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam2: null };
-
-    test('produces correct output for default response', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse());
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('produces correct output with version 4.1', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1' }));
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('produces correct output with malicious verdict', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ verdict: 'malicious' }));
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=malicious;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('produces correct output with threat-type-code 5', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ code: 5 }));
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=5;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('preserves null pageViewId in ids JSON', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse());
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('produces correct output matching real benign response shape', () => {
-      // Arrange
-      const ids = { rayId: 'd07fd4d7105b1bf24912745b1fde2c55', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: 'page_load', customParam2: 'a024abc8ff1b2674' };
-
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1', verdict: 'benign', code: 0, ids }));
-
-      // Assert
-      expect(result).toBe('version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":"d07fd4d7105b1bf24912745b1fde2c55","pageViewId":null,"duid":null,"uniqueVisitId":null,"customParam1":"page_load","customParam2":"a024abc8ff1b2674"}');
-    });
-
-    test('produces correct full output for all fields combined', () => {
-      // Arrange
-      const ids = { rayId: 'f3a1c2e4b5d6789012345678abcdef01', pageViewId: '9e8d7c6b5a4f3e2d', duid: '4.16a154e6ae45bc91bf9a49b365beb989', uniqueVisitId: 'uv-4f3e2d1c0b9a8765', customParam1: 'page_load', customParam2: 'cf-ray-abc123' };
-
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1', verdict: 'malicious', code: 6, ids }));
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=malicious;threat-type-code=6;ids=${JSON.stringify(ids)}`);
-    });
-
-    // --- includeDebugData: appends reasons + rule-name (Akamai opt-in) ---
-
-    const CR = String.fromCharCode(13);
-    const LF = String.fromCharCode(10);
-
-    test('omits debug data by default even when reasons and ruleName are present', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2], ruleName: 'Suspicious UA' }));
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
-    });
-
-    test('appends reasons and rule-name when includeDebugData is true', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2, 3], ruleName: 'Suspicious UA' }), true);
-
-      // Assert
-      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)};reasons=1,2,3;rule-name=Suspicious UA`);
-    });
-
-    test('emits an empty reasons value when the reasons array is empty', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [], ruleName: 'Rule A' }), true);
-
-      // Assert
-      expect(result).toContain(';reasons=;rule-name=Rule A');
-    });
-
-    test('emits an empty rule-name when ruleName is null', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [7], ruleName: null }), true);
-
-      // Assert
-      expect(result).toContain(';reasons=7;rule-name=');
-    });
-
-    test('replaces semicolons in ruleName so they cannot split the header', () => {
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: 'block;allow' }), true);
-
-      // Assert
-      expect(result).toContain(';rule-name=block,allow');
-    });
-
-    test('strips CR and LF from ruleName to prevent header injection', () => {
-      // Arrange
-      const ruleName = 'evil' + CR + LF + 'x-injected: 1';
-
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
-
-      // Assert
-      expect(result).toContain(';rule-name=evilx-injected: 1');
-      expect(result).not.toContain(CR);
-      expect(result).not.toContain(LF);
-    });
-
-    test('strips non-printable and non-ASCII characters from ruleName', () => {
-      // Arrange - e-acute (233) is non-ASCII, BEL (7) is a control character
-      const ruleName = 'caf' + String.fromCharCode(233) + String.fromCharCode(7) + 'rule';
-
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
-
-      // Assert
-      expect(result).toContain(';rule-name=cafrule');
-    });
-
-    test('truncates ruleName at 128 characters', () => {
-      // Arrange
-      const longName = 'a'.repeat(200);
-
-      // Act
-      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: longName }), true);
-
-      // Assert
-      expect(result).toContain(`;rule-name=${'a'.repeat(128)}`);
-      expect(result).not.toContain('a'.repeat(129));
-    });
-  });
-  // #endregion buildRtiResultHeader Method Tests
-
-  // #region parseNumberList Method Tests
-  describe('parseNumberList', () => {
-    test('returns undefined for undefined input', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList(undefined)).toBeUndefined();
-    });
-
-    test('returns undefined for null input', () => {
-      const input: any = null;
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList(input)).toBeUndefined();
-    });
-
-    test('returns undefined for empty string', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('')).toBeUndefined();
-    });
-
-    test('parses a single number', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('5')).toEqual([5]);
-    });
-
-    test('parses multiple comma-separated numbers', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('4,5,6')).toEqual([4, 5, 6]);
-    });
-
-    test('trims spaces around each value', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList(' 4 , 5 , 6 ')).toEqual([4, 5, 6]);
-    });
-
-    test('filters trailing comma', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('4,5,')).toEqual([4, 5]);
-    });
-
-    test('filters leading comma', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList(',4,5')).toEqual([4, 5]);
-    });
-
-    test('skips non-numeric entries', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('4,abc,6')).toEqual([4, 6]);
-    });
-
-    test('returns undefined when all entries are non-numeric', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('abc,def')).toBeUndefined();
-    });
-
-    test('parses negative numbers', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('-1,3')).toEqual([-1, 3]);
-    });
-
-    test('truncates decimals via parseInt', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseNumberList('4.7,5.2')).toEqual([4, 5]);
-    });
-  });
-  // #endregion parseNumberList Method Tests
-
-  // #region parseStringList Method Tests
-  describe('parseStringList', () => {
-    test('returns undefined for undefined input', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList(undefined)).toBeUndefined();
-    });
-
-    test('returns undefined for null input', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList(null as any)).toBeUndefined();
-    });
-
-    test('returns undefined for empty string', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('')).toBeUndefined();
-    });
-
-    test('returns undefined for whitespace-only entries', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList(' , , ')).toBeUndefined();
-    });
-
-    test('parses a single value', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('/health')).toEqual(['/health']);
-    });
-
-    test('parses multiple comma-separated values', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('/health,/ping')).toEqual(['/health', '/ping']);
-    });
-
-    test('trims spaces around each value', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList(' /health , /ping ')).toEqual(['/health', '/ping']);
-    });
-
-    test('filters trailing comma', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('/health,')).toEqual(['/health']);
-    });
-
-    test('filters leading comma', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList(',/health')).toEqual(['/health']);
-    });
-
-    test('filters consecutive empty entries', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('/a,,/b')).toEqual(['/a', '/b']);
-    });
-
-    test('preserves regex-like patterns intact', () => {
-      // Act & Assert
-      expect(RTIHelperService.parseStringList('\\.css$,\\.js$')).toEqual(['\\.css$', '\\.js$']);
-    });
-  });
-  // #endregion parseStringList Method Tests
-
-  // #region getCookieValue Method Tests
-  describe('getCookieValue', () => {
-    const svc = new RTIHelperService({} as any);
-
-    test('returns value for matching cookie', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['_cq_duid=abc123'], '_cq_duid=')).toBe('abc123');
-    });
-
-    test('returns undefined when cookie not found', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['other=val'], '_cq_duid=')).toBeUndefined();
-    });
-
-    test('returns undefined for empty array', () => {
-      // Act & Assert
-      expect(svc.getCookieValue([], '_cq_s=')).toBeUndefined();
-    });
-
-    test('returns undefined when value is empty', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['_cq_s='], '_cq_s=')).toBeUndefined();
-    });
-
-    test('preserves = characters in value (base64)', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['_cq_s=abc=='], '_cq_s=')).toBe('abc==');
-    });
-
-    test('does not match prefix overlap (_cq_se vs _cq_s)', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['_cq_se=token'], '_cq_s=')).toBeUndefined();
-    });
-
-    test('returns first match when duplicates exist', () => {
-      // Act & Assert
-      expect(svc.getCookieValue(['_cq_s=first', '_cq_s=second'], '_cq_s=')).toBe('first');
-    });
-  });
-  // #endregion getCookieValue Method Tests
+  // #endregion Inheritance Tests
 });

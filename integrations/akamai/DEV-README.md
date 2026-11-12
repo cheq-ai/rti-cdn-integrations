@@ -331,7 +331,7 @@ These fields override the default verdict-based routing. All accept arrays of nu
 |-------|------|---------|-------------|
 | `timeout` | `number` | `300` | RTI API request timeout in milliseconds |
 | `rtiLoggerHost` | `string` | `undefined` | Akamai-proxied logger hostname. When set, enables error logging unconditionally and telemetry logging when `telemetry: true`. |
-| `debug` | `boolean` | `false` | Log payload and verdict to `log.log()`, and echo `x-cheq-rti-result` on the response via `onClientResponse`. **Disable in production.** |
+| `debug` | `boolean` | `false` | Log payload (cookie values, the challenge session token and credentials redacted) and verdict to `log.log()`, and echo `x-cheq-rti-result` on the response via `onClientResponse`. **Disable in production.** |
 | `telemetry` | `boolean` | `false` | Send RTI duration (`rti_duration: {ms}`) to `rtiLoggerHost` after each call. Requires `rtiLoggerHost` to be set. |
 
 ---

@@ -2,6 +2,7 @@ import { TextEncoder } from 'encoding';
 import URLSearchParams from 'url-search-params';
 import { httpRequest } from 'http-request';
 import { RTIResponse } from '../../core/models/rti-response.model';
+import { RTIStatelessUtils } from '../../core/services/rti-stateless-utils';
 import { sign, issueGrant, hasValidGrant } from './challenge-signing';
 
 /**
@@ -68,15 +69,13 @@ const DEFAULT_SCORE_THRESHOLD = 0.5;
 const DEFAULT_V3_ACTION = 'cheq_challenge';
 
 /**
- * Accepts `original_url` only when it is a same-origin absolute path.
+ * Decodes `original_url` and accepts it only when it is a same-origin absolute path.
  *
- * It arrives as a query parameter, so any link can carry any value. Reflected into `Location`
- * verbatim it turns a PASSED CAPTCHA into an open redirect - a strong phishing primitive,
- * because the victim really did just prove they are human on the genuine site. Returning null
- * makes the caller fall back to the current path.
- *
- * `//host` and `/\host` are rejected too: browsers read both as protocol-relative and would
- * leave the site despite the leading slash.
+ * The page encodes the path into the hidden field, so it arrives still percent-encoded and is
+ * decoded here. The safety rules - a path, not `//host` or `/\host`, and no control characters
+ * such as a decoded `%09` tab or `%0D%0A` CRLF - are shared with CloudFront in
+ * RTIStatelessUtils.safeReturnPath, which explains each one. Returning null makes the caller
+ * fall back to the current path.
  */
 function safeReturnPath(raw: string | null): string | null {
     if (!raw) return null;
@@ -88,11 +87,7 @@ function safeReturnPath(raw: string | null): string | null {
         return null; // malformed percent-encoding
     }
 
-    if (!decoded.startsWith('/') || decoded.startsWith('//') || decoded.startsWith('/\\')) {
-        return null;
-    }
-
-    return decoded;
+    return RTIStatelessUtils.safeReturnPath(decoded) ?? null;
 }
 
 /**
