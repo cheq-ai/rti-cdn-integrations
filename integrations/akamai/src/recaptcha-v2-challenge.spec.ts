@@ -333,6 +333,10 @@ describe('return-URL safety', () => {
         ['a protocol-relative URL', '//evil.example.com/steal'],
         ['a backslash-prefixed URL', String.raw`/\evil.example.com/steal`],
         ['a scheme-only payload', 'javascript:alert(1)'],
+        // Browsers delete tab, LF and CR before parsing, so these read as //evil.example.com
+        ['a tab after the slash', '/\t/evil.example.com/steal'],
+        ['an LF after the slash', '/\n/evil.example.com/steal'],
+        ['a CR before a backslash', '/\r\\evil.example.com/steal'],
     ])('refuses %s and stays on this host', async (_label, hostile) => {
         const location = (await passWith(hostile)).headers['Location'];
 

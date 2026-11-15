@@ -1,0 +1,1974 @@
+// cspell:ignore cheq rayid bodyless
+import { describe, test, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { RTIStatelessUtils } from './rti-stateless-utils';
+import { ActionStrategy } from '../models/action-strategy.model';
+import { Action } from '../models/action.model';
+
+describe('RTIStatelessUtils', () => {
+  // #region Stateless Contract Tests
+  // These guard the contract in the class name: no constructor inputs, no instance state, and no
+  // imports beyond plain models - so config or a service can't creep back in unnoticed.
+  describe('stateless contract', () => {
+    test('takes no constructor arguments', () => {
+      expect(RTIStatelessUtils.length).toBe(0);
+    });
+
+    test('holds no instance state after its methods run', () => {
+      const utils = new RTIStatelessUtils();
+
+      utils.parseCookies('_cq_duid=a; _cq_pvid=b; _cq_s=c');
+      utils.getCheqCookie('_cq=x');
+      utils.getHeaderByName({ 'x-test': '1' }, 'X-Test');
+      utils.isChallengeReplyAllowed(ActionStrategy.CAPTCHA);
+      utils.isBodylessMethod('GET');
+      utils.isAction(Action.BLOCK);
+      utils.pathMatches('/login', '^/login$');
+      utils.pathMatches('/login', '([');
+      utils.errorMessage(new Error('boom'));
+      utils.stringifyRedactedPayload({ endUserParams: { headers: { cookie: 'a=1' } } } as any);
+      utils.buildRtiResultHeader({
+        metadata: { version: '4.1' },
+        decision: { verdict: 'benign', ruleName: 'rule' },
+        classification: { code: 0 },
+        ids: { rayId: 'ray-1' },
+        cheqDetection: { reasons: [1] },
+      } as any, true);
+
+      expect(Object.getOwnPropertyNames(utils)).toEqual([]);
+    });
+
+    test('imports only from models, and never the config', () => {
+      const source = readFileSync(new URL('./rti-stateless-utils.ts', import.meta.url), 'utf8');
+      const imports = [...source.matchAll(/^import\s.*?from\s+["'](.+?)["']/gm)].map(m => m[1]);
+
+      expect(imports.length).toBeGreaterThan(0);
+      for (const path of imports) {
+        expect(path).toMatch(/^\.\.\/models\//);
+        expect(path).not.toMatch(/config/);
+      }
+    });
+  });
+  // #endregion Stateless Contract Tests
+
+  // #region isChallengeReplyAllowed Method Tests
+  describe('isChallengeReplyAllowed', () => {
+    test.each([
+      [true, 'no strategy (ALLOW)', null],
+      [true, 'CAPTCHA', ActionStrategy.CAPTCHA],
+      [false, 'ACCESS_DENIED', ActionStrategy.ACCESS_DENIED],
+      [false, 'NOT_FOUND', ActionStrategy.NOT_FOUND],
+      [false, 'REDIRECT', ActionStrategy.REDIRECT],
+    ])('returns %s for %s', (expected, _, strategy) => {
+      // Arrange
+      const svc = new RTIStatelessUtils();
+
+      // Act & Assert
+      expect(svc.isChallengeReplyAllowed(strategy)).toBe(expected);
+    });
+
+    test('covers every ActionStrategy (a new strategy must be added to the table above)', () => {
+      // Arrange
+      const tested = [ActionStrategy.CAPTCHA, ActionStrategy.ACCESS_DENIED, ActionStrategy.NOT_FOUND, ActionStrategy.REDIRECT];
+
+      // Act & Assert
+      expect(Object.values(ActionStrategy).filter(v => typeof v === 'number').sort()).toEqual([...tested].sort());
+    });
+  });
+  // #endregion isChallengeReplyAllowed Method Tests
+
+  // #region isBodylessMethod Method Tests
+  describe('isBodylessMethod', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each(['GET', 'HEAD', 'get', 'Head'])('%s can get the CAPTCHA in place', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(true);
+    });
+
+    test.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'post'])('%s can not (it has a body)', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    test.each(['CONNECT', 'TRACE', '', ' GET', 'GETX'])('%j is not GET or HEAD, so it is not bodyless', (method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    // Every spelling of `name` in upper and lower case, letter by letter (2^letters of them).
+    const caseVariants = (name: string): string[] =>
+      [...name].reduce<string[]>((variants, ch) => variants.flatMap(prefix => [prefix + ch.toLowerCase(), prefix + ch.toUpperCase()]), ['']);
+
+    test('every upper/lower-case spelling of GET and HEAD is bodyless, and of every body method is not', () => {
+      // Act
+      const wrong = [
+        ...['GET', 'HEAD'].flatMap(caseVariants).filter(method => !utils.isBodylessMethod(method)),
+        ...['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].flatMap(caseVariants).filter(method => utils.isBodylessMethod(method)),
+      ];
+
+      // Assert
+      expect(caseVariants('HEAD')).toHaveLength(16);
+      expect(wrong).toEqual([]);
+    });
+
+    test.each([
+      ['a trailing space', 'GET '],
+      ['a trailing newline', 'GET\n'],
+      ['a CRLF', 'HEAD\r\n'],
+      ['a tab inside', 'G\tET'],
+      ['a NUL at the end', 'GET\0'],
+      ['a prefix of GET', 'GE'],
+      ['GET with a suffix', 'GETS'],
+      ['both joined', 'GETHEAD'],
+      ['a list', 'GET,HEAD'],
+      ['Cyrillic look-alikes (U+0415, U+0422)', 'GЕТ'],
+      ['fullwidth letters', 'ＧＥＴ'],
+      ['a combining mark on the T', 'GET̈'],
+    ])('%s (%j) is not bodyless: only the exact method name, in any case', (_, method) => {
+      // Act & Assert
+      expect(utils.isBodylessMethod(method)).toBe(false);
+    });
+
+    test('no non-ASCII character stands in for a letter of GET or HEAD (toUpperCase maps none of them to G E T H A D)', () => {
+      // Arrange: every character from U+0080 to U+FFFF in place of each letter, in both cases
+      const wrong: string[] = [];
+
+      // Act
+      for (const method of ['GET', 'HEAD', 'get', 'head']) {
+        for (let i = 0; i < method.length; i++) {
+          for (let code = 0x80; code <= 0xFFFF; code++) {
+            const variant = method.slice(0, i) + String.fromCharCode(code) + method.slice(i + 1);
+            if (utils.isBodylessMethod(variant)) {
+              wrong.push(JSON.stringify(variant));
+            }
+          }
+        }
+      }
+
+      // Assert
+      expect(wrong).toEqual([]);
+    });
+  });
+  // #endregion isBodylessMethod Method Tests
+
+  // #region isAction Method Tests
+  describe('isAction', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT])('accepts Action %s', (action) => {
+      // Act & Assert
+      expect(utils.isAction(action)).toBe(true);
+    });
+
+    test('covers every Action (a new Action must be added to the table above)', () => {
+      // Act & Assert
+      expect(Object.values(Action).filter(v => typeof v === 'number').sort()).toEqual([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT].sort());
+    });
+
+    test.each([
+      ['undefined', undefined],
+      ['null', null],
+      ['an Action name', 'BLOCK'],
+      ['a numeric string', '2'],
+      ['a number past the last Action', 4],
+      ['a large number', 99],
+      ['a negative number', -1],
+      ['a fraction', 0.5],
+      ['NaN', NaN],
+      ['a boolean', true],
+      ['an object', {}],
+      ['an array holding an Action', [Action.BLOCK]],
+      ['Infinity', Infinity],
+      ['-Infinity', -Infinity],
+      ['the largest safe integer', Number.MAX_SAFE_INTEGER],
+      ['the smallest positive number', Number.MIN_VALUE],
+      ['a number just above an Action', 1.0000001],
+      ['a Number object holding an Action', new Number(Action.BLOCK)],
+      ['a bigint', 2n],
+      ['a symbol', Symbol('BLOCK')],
+      ['a function', () => Action.BLOCK],
+      ['an empty string', ''],
+      ['an Action name in lower case', 'block'],
+    ])('rejects %s', (_, value) => {
+      // Act & Assert
+      expect(utils.isAction(value)).toBe(false);
+    });
+
+    test('accepts -0 and 1.0: they are the numbers 0 (ALLOW) and 1 (CHALLENGE)', () => {
+      // Act & Assert
+      expect(utils.isAction(-0)).toBe(true);
+      expect(utils.isAction(1.0)).toBe(true);
+    });
+
+    test('of every integer from -1000 to 1000, exactly the Action values pass', () => {
+      // Arrange
+      const integers = Array.from({ length: 2001 }, (_, i) => i - 1000);
+
+      // Act & Assert
+      expect(integers.filter(n => utils.isAction(n))).toEqual([Action.ALLOW, Action.CHALLENGE, Action.BLOCK, Action.REDIRECT]);
+    });
+  });
+  // #endregion isAction Method Tests
+
+  // #region pathMatches Method Tests
+  describe('pathMatches', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['an anchored pattern on its exact path', '/login', '^/login$', true],
+      ['an anchored pattern on a longer path', '/login/x', '^/login$', false],
+      ['a prefix pattern', '/api/items', '^/api/', true],
+      ['an unanchored pattern anywhere in the path', '/a/login/b', 'login', true],
+      ['a pattern that does not match', '/search', '^/login', false],
+      ['a different case (no flags, so case-sensitive)', '/Login', '^/login$', false],
+      ['match-all', '/anything', '.*', true],
+      ['an empty pattern (matches everything)', '/x', '', true],
+      ['an empty path and an anchored empty pattern', '', '^$', true],
+      ['an empty path and a non-empty pattern', '', 'a', false],
+      ['"." in the pattern: any character', '/l0gin', '^/l.gin$', true],
+      ['an escaped dot: only a dot', '/l0gin', '^/l\\.gin$', false],
+      ['"+" in the pattern is a quantifier, not the character', '/aab', '^/a+b$', true],
+      ['so a path with a literal "+" does not match its own text', '/a+b', '^/a+b$', false],
+      ['a newline in the path: ^ is not multiline', '/a\n/b', '^/b', false],
+      ['non-ASCII in the path and the pattern', '/café/menu', 'é', true],
+      ['a lookbehind', '/api/v2', '(?<=/api/)v2', true],
+      ['a Unicode property escape without the u flag (a literal "p{L}")', '/p{L}', '\\p{L}', true],
+      ['a very long path', `/${'a'.repeat(100_000)}`, 'a$', true],
+    ])('%s', (_, path, pattern, expected) => {
+      // Act & Assert
+      expect(utils.pathMatches(path, pattern)).toBe(expected);
+    });
+
+    test.each(['([', '[', '(', '*', '+', '?', 'a{2,1}', '\\', '[z-a]', '(?i)login'])('a bad regex (%j) never matches, and does not throw', (pattern) => {
+      // Arrange: the pattern really is invalid
+      expect(() => new RegExp(pattern)).toThrow(SyntaxError);
+
+      // Act & Assert
+      expect(utils.pathMatches('/x', pattern)).toBe(false);
+    });
+  });
+  // #endregion pathMatches Method Tests
+
+  // #region errorMessage Method Tests
+  describe('errorMessage', () => {
+    // A Proxy that throws on every operation: instanceof, property reads, Symbol.toStringTag and conversion all fail.
+    const hostileProxy = () => new Proxy({}, {
+      get() { throw new Error('get trap'); },
+      getPrototypeOf() { throw new Error('getPrototypeOf trap'); },
+      has() { throw new Error('has trap'); },
+    });
+
+    class CustomError extends Error {}
+
+    test.each([
+      // Errors: their message
+      ['an Error', () => new Error('boom'), 'boom'],
+      ['a TypeError', () => new TypeError('bad type'), 'bad type'],
+      ['an Error subclass', () => new CustomError('custom'), 'custom'],
+      ['an Error with an empty message', () => new Error(''), ''],
+      ['an AbortSignal timeout DOMException', () => new DOMException('The operation was aborted due to timeout', 'TimeoutError'), 'The operation was aborted due to timeout'],
+      // Primitives: String()
+      ['undefined', () => undefined, 'undefined'],
+      ['null', () => null, 'null'],
+      ['a string', () => 'boom', 'boom'],
+      ['an empty string', () => '', ''],
+      ['a number', () => 42, '42'],
+      ['NaN', () => NaN, 'NaN'],
+      ['a boolean', () => false, 'false'],
+      ['a bigint', () => 10n, '10'],
+      ['a symbol', () => Symbol('s'), 'Symbol(s)'],
+      // Objects: String(), which uses toString / Symbol.toStringTag
+      ['a plain object', () => ({ a: 1 }), '[object Object]'],
+      ['an error-like object (not an Error, so no .message)', () => ({ message: 'looks like an error' }), '[object Object]'],
+      ['an object with its own toString', () => ({ toString: () => 'custom string' }), 'custom string'],
+      ['an object with Symbol.toStringTag', () => ({ [Symbol.toStringTag]: 'Tagged' }), '[object Tagged]'],
+      ['an array', () => [1, 'two'], '1,two'],
+      ['a Date', () => new Date(0), new Date(0).toString()],
+      // String() throws: fall back to Object.prototype.toString
+      ['a null-prototype object', () => Object.create(null), '[object Object]'],
+      ['an object whose toString throws', () => ({ toString() { throw new Error('toString failed'); } }), '[object Object]'],
+      ['an object whose toString returns an object', () => ({ toString: () => ({}), valueOf: () => ({}) }), '[object Object]'],
+      ['an Error whose message getter throws', () => Object.defineProperty(new Error(), 'message', { get() { throw new Error('getter'); } }), '[object Error]'],
+      // An Error whose message is not a string: converted, or a caller's `${...}` would throw on it
+      ['an Error with a number message', () => Object.assign(new Error(), { message: 42 }), '42'],
+      ['an Error with a Symbol message', () => Object.assign(new Error(), { message: Symbol('s') }), 'Symbol(s)'],
+      ['an Error with an undefined message', () => Object.assign(new Error(), { message: undefined }), 'undefined'],
+      ['an Error with an object message whose toString throws', () => Object.assign(new Error(), { message: { toString() { throw new Error('x'); } } }), '[object Error]'],
+      // Everything throws: a fixed text
+      ['a Proxy that throws on every operation', hostileProxy, 'unknown error'],
+      ['a revoked Proxy', () => { const { proxy, revoke } = Proxy.revocable({}, {}); revoke(); return proxy; }, 'unknown error'],
+    ])('returns the message of %s', (_, value, expected) => {
+      // Arrange
+      const svc = new RTIStatelessUtils();
+
+      // Act & Assert
+      expect(svc.errorMessage(value())).toBe(expected);
+    });
+
+    test('returns the message of an Error from another realm (e.g. vm), through String()', async () => {
+      // Arrange: instanceof Error is false across realms, so the message comes from Error.prototype.toString
+      const { runInNewContext } = await import('node:vm');
+      const foreign = runInNewContext('new Error("from vm")');
+      const svc = new RTIStatelessUtils();
+
+      // Act & Assert
+      expect(foreign instanceof Error).toBe(false);
+      expect(svc.errorMessage(foreign)).toBe('Error: from vm');
+    });
+
+    test('always returns a string that a template literal can embed', () => {
+      // Arrange
+      const svc = new RTIStatelessUtils();
+      const values = [
+        undefined, null, 0, '', Symbol(), 1n, {}, [], Object.create(null), hostileProxy(), new Error(),
+        Object.assign(new Error(), { message: Symbol() }),
+        Object.assign(new Error(), { message: { toString() { throw new Error('x'); } } }),
+      ];
+
+      // Act & Assert
+      for (const value of values) {
+        const message = svc.errorMessage(value);
+        expect(typeof message).toBe('string');
+        expect(() => `log: ${message}`).not.toThrow();
+      }
+    });
+  });
+  // #endregion errorMessage Method Tests
+
+  // #region getCheqCookie Method Tests
+  describe('getCheqCookie', () => {
+    const svc = new RTIStatelessUtils();
+
+    test('returns undefined for empty string', () => {
+      // Act & Assert
+      expect(svc.getCheqCookie('')).toBeUndefined();
+    });
+
+    test('returns cookie value when present', () => {
+      // Act & Assert
+      expect(svc.getCheqCookie('_cheq_rti=abc123; other=1')).toBe('abc123');
+    });
+
+    test('returns empty string when _cheq_rti is not in cookie string', () => {
+      // Act & Assert
+      expect(svc.getCheqCookie('session=xyz; theme=dark')).toBe('');
+    });
+
+    test('finds _cheq_rti when not the first cookie', () => {
+      // Act & Assert
+      expect(svc.getCheqCookie('session=xyz; _cheq_rti=token99')).toBe('token99');
+    });
+  });
+  // #endregion getCheqCookie Method Tests
+
+  // #region capitalize Method Tests
+  describe('capitalize', () => {
+    const svc = new RTIStatelessUtils();
+
+    test('capitalizes each word with default space splitter', () => {
+      // Act & Assert
+      expect(svc.capitalize('hello world')).toBe('Hello World');
+    });
+
+    test('capitalizes single word', () => {
+      // Act & Assert
+      expect(svc.capitalize('hello')).toBe('Hello');
+    });
+
+    test('capitalizes with custom splitter', () => {
+      // Act & Assert
+      expect(svc.capitalize('x-y-z', '-')).toBe('X-Y-Z');
+    });
+
+    test('returns empty string when called with no arguments', () => {
+      // Act & Assert
+      expect(svc.capitalize()).toBe('');
+    });
+
+    test('handles already-capitalized input', () => {
+      // Act & Assert
+      expect(svc.capitalize('Hello')).toBe('Hello');
+    });
+
+    test('capitalizes header-style name with hyphen splitter', () => {
+      // Act & Assert
+      expect(svc.capitalize('x-forwarded-for', '-')).toBe('X-Forwarded-For');
+    });
+
+    test('handles single character', () => {
+      // Act & Assert
+      expect(svc.capitalize('a')).toBe('A');
+    });
+  });
+  // #endregion capitalize Method Tests
+
+  // #region getHeaderByName Method Tests
+  describe('getHeaderByName', () => {
+    const svc = new RTIStatelessUtils();
+    const headers: any = { 'content-type': 'text/html', 'X-Custom-Header': 'value' };
+
+    test('finds header by lowercase name', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers, 'content-type')).toBe('text/html');
+    });
+
+    test('finds header by capitalized name', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers, 'x-custom-header')).toBe('value');
+    });
+
+    test('returns provided default when header is missing', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers, 'missing', 'fallback')).toBe('fallback');
+    });
+
+    test('returns undefined when header is missing and no default provided', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers, 'missing')).toBeUndefined();
+    });
+
+    test('returns undefined when called without name argument (uses default empty string)', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers)).toBeUndefined();
+    });
+
+    test('prefers lowercase key over title-case key when both exist', () => {
+      // Arrange
+      const h: any = { 'content-type': 'lower', 'Content-Type': 'title' };
+
+      // Act & Assert
+      expect(svc.getHeaderByName(h, 'content-type')).toBe('lower');
+    });
+
+    test('returns title-cased header (X-Forwarded-For) via lowercase lookup', () => {
+      // Arrange
+      const h: any = { 'X-Forwarded-For': '1.2.3.4' };
+
+      // Act & Assert
+      expect(svc.getHeaderByName(h, 'x-forwarded-for')).toBe('1.2.3.4');
+    });
+
+    test('returns numeric defaultValue when header is missing', () => {
+      // Act & Assert
+      expect(svc.getHeaderByName(headers, 'missing', 0)).toBe(0);
+    });
+  });
+  // #endregion getHeaderByName Method Tests
+
+  // #region parseCookies Method Tests
+  describe('parseCookies', () => {
+    const svc = new RTIStatelessUtils();
+
+    // --- Empty / missing input ---
+
+    test('returns all undefined for empty string', () => {
+      // Act
+      const result = svc.parseCookies('');
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    test('does not throw when called with null (runtime guard)', () => {
+      // Act
+      const result = svc.parseCookies(null as any);
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    test('does not throw when called with undefined (runtime guard)', () => {
+      // Act
+      const result = svc.parseCookies(undefined as any);
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    test('returns all undefined when no CHEQ cookies are present', () => {
+      // Act
+      const result = svc.parseCookies('session=abc123; theme=dark; other=ignored');
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    // --- Individual cookie extraction ---
+
+    test('extracts only _cq_duid when present', () => {
+      // Act
+      const result = svc.parseCookies('_cq_duid=4.16a154e6ae45bc91bf9a49b365beb989');
+
+      // Assert
+      expect(result.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    test('extracts only _cq_pvid when present', () => {
+      // Act
+      const result = svc.parseCookies('_cq_pvid=4.247bcdf08360a9de9dee2196c1a36631');
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
+      expect(result.sCookie).toBeUndefined();
+    });
+
+    test('extracts only _cq_s when present', () => {
+      // Act
+      const result = svc.parseCookies('_cq_s=simple-value');
+
+      // Assert
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.sCookie).toBe('simple-value');
+    });
+
+    // --- All three together ---
+
+    test('extracts all three cookies when all present', () => {
+      // Act
+      const b64 = 'Ll7dvXH3YTlLM7nA:0pSlsKE44ASXSpI4yGmRpP+Rdwm3eR4RvkFIY60Jz1E/mWlZSilQ7METgbQuPTv1nfazHTyvz6qWSGx6GEeMYj9gTIIS38l/v7sO/xjLE7QVlUGtCQQS+5thTzsVRLejEV/3lrOQspnfY9sp5D5lGaEYa+k3yxdOjLp1kEVk/m7RQh2Nb1+Vbn+NaSRQ6CGIgJ/5BnEkYA==';
+
+      const result = svc.parseCookies(`_cq_duid=4.16a154e6ae45bc91bf9a49b365beb989; _cq_pvid=4.247bcdf08360a9de9dee2196c1a36631; _cq_s=${b64}`);
+
+      // Assert
+      expect(result.duidCookie).toBe('4.16a154e6ae45bc91bf9a49b365beb989');
+      expect(result.pvidCookie).toBe('4.247bcdf08360a9de9dee2196c1a36631');
+      expect(result.sCookie).toBe(b64);
+    });
+
+    // --- Noise cookies around CHEQ cookies ---
+
+    test('ignores unrelated cookies when extracting all three', () => {
+      // Arrange
+      const b64 = 'Ll7dvXH3YTlLM7nA:0pSlsKE44ASXSpI4yGmRpP+Rdwm3eR4RvkFIY60Jz1E/mWlZSilQ7METgbQuPTv1nfazHTyvz6qWSGx6GEeMYj9gTIIS38l/v7sO/xjLE7QVlUGtCQQS+5thTzsVRLejEV/3lrOQspnfY9sp5D5lGaEYa+k3yxdOjLp1kEVk/m7RQh2Nb1+Vbn+NaSRQ6CGIgJ/5BnEkYA==:uAmNscAbgD/vSVVN3OE4Ow==';
+
+      // Act
+      const result = svc.parseCookies(`session=abc123; _cq_duid=d-uuid-xyz; theme=dark; _cq_pvid=pv-ulid-abc; _cq_s=${b64}; other=ignored`);
+
+      // Assert
+      expect(result.duidCookie).toBe('d-uuid-xyz');
+      expect(result.pvidCookie).toBe('pv-ulid-abc');
+      expect(result.sCookie).toBe(b64);
+    });
+
+    // --- Base64 padding in _cq_s ---
+
+    test('preserves base64 = padding characters in _cq_s', () => {
+      // Arrange
+      const b64 = 'c0hdForhWGaRercD:kc/eGTcRHnanstWrlbv6fnBWg/kICuKe+hRiK6x9lCwkrSdhpKIohwyd7/JHH3aA81pNurK0WfbwmJfGwL61DFBsgrr3wYpT8muwEt/xhOrFe3Ejee4W86fnE/fe0l1b1+ld6JwCiA7tueF0weoJStmpVEKW8PTz+JTkOf9jMfEE/HYNMrG22F+h7w68Td+JeCURnRPp48TbVAtusLvNuwWwWSyuI/7OfV6akdMrey+Mr2b8i8+w9Cm58M+Ttq1ydQPcQbHGOPfI5InnCSqHbGT0mUMxdodBMXFmvQgTN07lge/+zjGSH2+s+a0b60QlNOa6rw==:Ki6FWCQbEiMijlXZ/6/BNQ==';
+
+      // Act
+      const result = svc.parseCookies(`_cq_s=${b64}`);
+
+      // Assert
+      expect(result.sCookie).toBe(b64);
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+    });
+
+    test('preserves base64 = padding in _cq_s when mixed with other cookies', () => {
+      // Arrange
+      const b64 = 'Qxr2YUViJVxjN/Lj:/ZN3E52EztskUvgEC4J+kf4iZ5bM0INszRKC8IWXUzH2Qm2K4ByU/oBBroRABQOUoSPEqH8kulCnl7oy3AcaXS/RlwFPROQ7YzzGVwxWos6lTFMMbRgDlTkC7uwA50UwqlkWjrmEmmimz5gEQQc0HaDHw7TDo7INomrDm2vnJFMyKieBu0sD8k6cM1f9ORUphNF+Lezms73AyIgC7YV1RK3T3T8kpIkePoTrjzCFtM4rWQ9IHmk4Qcb39TUK+TOIyr38Sb/oODE25SLwyCgQY1KDVjyb452nlo1+E55bxXMmkocgnqDqyOOjTqtoYqROmYRhQcrjVr13gX4NPj/1OOp3pwSUsR0E1ji0VfArMzRZ6H4TfL610HnxF87NNVlyIwg+2lXu5md4PaC2pCck7q7q3fEcB+QkeA+fdlhuiI6s++MQ4+2FNyqZiIoLz/2vrLdVDgbVchS9kb3vJljm4gAswQbZHT50zrQKpXJZtduxYsWIbNOyrF2VGrzTDwyBpTumYaA+jcisuSax/Gntjtl5thWkFaq6iRYdIEFLDDK7SyMlylFGEHg8O4/Sh8ha0j3CX3Q=:GwUKuinki4bX6547azx1Rw==';
+
+      // Act
+      const result = svc.parseCookies(`session=abc; _cq_duid=d-uuid; _cq_pvid=pv-ulid; _cq_s=${b64}`);
+
+      // Assert
+      expect(result.duidCookie).toBe('d-uuid');
+      expect(result.pvidCookie).toBe('pv-ulid');
+      expect(result.sCookie).toBe(b64);
+    });
+
+    // --- Prefix overlap: _cq_se must not match _cq_s ---
+
+    test('does not extract _cq_se as _cq_s', () => {
+      // Act
+      const result = svc.parseCookies('_cq_se=token|rayid; _cq_s=real-value');
+
+      // Assert
+      expect(result.sCookie).toBe('real-value');
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+    });
+
+    test('returns undefined for _cq_s when only _cq_se is present', () => {
+      // Act
+      const result = svc.parseCookies('_cq_se=token|rayid');
+
+      // Assert
+      expect(result.sCookie).toBeUndefined();
+      expect(result.duidCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+    });
+
+    // --- Special characters in values ---
+
+    test('preserves / + : characters in _cq_s value', () => {
+      // Act
+      const result = svc.parseCookies('_cq_s=abc/def+ghi:jkl');
+
+      // Assert
+      expect(result.sCookie).toBe('abc/def+ghi:jkl');
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.duidCookie).toBeUndefined();
+    });
+
+    // --- Whitespace handling ---
+
+    test('trims leading/trailing whitespace around each cookie token', () => {
+      // Act
+      const result = svc.parseCookies('  _cq_duid=d-abc  ;  _cq_pvid=pv-xyz  ;  _cq_s=s-val  ');
+
+      // Assert
+      expect(result.duidCookie).toBe('d-abc');
+      expect(result.pvidCookie).toBe('pv-xyz');
+      expect(result.sCookie).toBe('s-val');
+    });
+
+    // --- Empty cookie value ---
+
+    test('returns undefined when _cq_s has no value', () => {
+      // Act
+      const result = svc.parseCookies('_cq_s=');
+
+      // Assert
+      expect(result.sCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.duidCookie).toBeUndefined();
+
+    });
+
+    test('returns undefined when _cq_duid has no value', () => {
+      // Act
+      const result = svc.parseCookies('_cq_duid=');
+
+      // Assert
+      expect(result.sCookie).toBeUndefined();
+      expect(result.pvidCookie).toBeUndefined();
+      expect(result.duidCookie).toBeUndefined();
+    });
+
+    // --- Empty segments (double semicolons) ---
+
+    test('handles empty segments from double semicolons gracefully', () => {
+      // Act
+      const result = svc.parseCookies('_cq_duid=d-abc;; _cq_s=s-val');
+
+      // Assert
+      expect(result.duidCookie).toBe('d-abc');
+      expect(result.sCookie).toBe('s-val');
+      expect(result.pvidCookie).toBeUndefined();
+    });
+
+    // --- Duplicate cookie names ---
+
+    test('returns first match when _cq_s appears twice', () => {
+      // Act
+      const result = svc.parseCookies('_cq_s=first; _cq_s=second');
+
+      // Assert
+      expect(result.sCookie).toBe('first');
+    });
+  });
+  // #endregion parseCookies Method Tests
+
+  // #region buildRtiResultHeader Method Tests
+  describe('buildRtiResultHeader', () => {
+    const svc = new RTIStatelessUtils();
+
+    function buildResponse(overrides: { verdict?: string; code?: number; version?: string; ids?: any; reasons?: number[]; ruleName?: string | null } = {}) {
+      return {
+        metadata: { version: overrides.version ?? '4.1' },
+        decision: { verdict: overrides.verdict ?? 'benign', ruleName: overrides.ruleName ?? null },
+        classification: { code: overrides.code ?? 0 },
+        ids: overrides.ids ?? { rayId: 'ray-1', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam2: null },
+        cheqDetection: { reasons: overrides.reasons ?? [] },
+      } as any;
+    }
+
+    const defaultIds = { rayId: 'ray-1', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: null, customParam2: null };
+
+    test('produces correct output for default response', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse());
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('produces correct output with version 4.1', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1' }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('produces correct output with malicious verdict', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ verdict: 'malicious' }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=malicious;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('produces correct output with threat-type-code 5', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ code: 5 }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=5;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('preserves null pageViewId in ids JSON', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse());
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('produces correct output matching real benign response shape', () => {
+      // Arrange
+      const ids = { rayId: 'd07fd4d7105b1bf24912745b1fde2c55', pageViewId: null, duid: null, uniqueVisitId: null, customParam1: 'page_load', customParam2: 'a024abc8ff1b2674' };
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1', verdict: 'benign', code: 0, ids }));
+
+      // Assert
+      expect(result).toBe('version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":"d07fd4d7105b1bf24912745b1fde2c55","pageViewId":null,"duid":null,"uniqueVisitId":null,"customParam1":"page_load","customParam2":"a024abc8ff1b2674"}');
+    });
+
+    test('produces correct full output for all fields combined', () => {
+      // Arrange
+      const ids = { rayId: 'f3a1c2e4b5d6789012345678abcdef01', pageViewId: '9e8d7c6b5a4f3e2d', duid: '4.16a154e6ae45bc91bf9a49b365beb989', uniqueVisitId: 'uv-4f3e2d1c0b9a8765', customParam1: 'page_load', customParam2: 'cf-ray-abc123' };
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ version: '4.1', verdict: 'malicious', code: 6, ids }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=malicious;threat-type-code=6;ids=${JSON.stringify(ids)}`);
+    });
+
+    // --- includeDebugData: appends reasons + rule-name (Akamai opt-in) ---
+
+    const CR = String.fromCharCode(13);
+    const LF = String.fromCharCode(10);
+
+    test('omits debug data by default even when reasons and ruleName are present', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2], ruleName: 'Suspicious UA' }));
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)}`);
+    });
+
+    test('appends reasons and rule-name when includeDebugData is true', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [1, 2, 3], ruleName: 'Suspicious UA' }), true);
+
+      // Assert
+      expect(result).toBe(`version=4.1;verdict=benign;threat-type-code=0;ids=${JSON.stringify(defaultIds)};reasons=1,2,3;rule-name=Suspicious UA`);
+    });
+
+    test('emits an empty reasons value when the reasons array is empty', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [], ruleName: 'Rule A' }), true);
+
+      // Assert
+      expect(result).toContain(';reasons=;rule-name=Rule A');
+    });
+
+    test('emits an empty rule-name when ruleName is null', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ reasons: [7], ruleName: null }), true);
+
+      // Assert
+      expect(result).toContain(';reasons=7;rule-name=');
+    });
+
+    test('replaces semicolons in ruleName so they cannot split the header', () => {
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: 'block;allow' }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=block,allow');
+    });
+
+    test('strips CR and LF from ruleName to prevent header injection', () => {
+      // Arrange
+      const ruleName = 'evil' + CR + LF + 'x-injected: 1';
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=evilx-injected: 1');
+      expect(result).not.toContain(CR);
+      expect(result).not.toContain(LF);
+    });
+
+    test('strips non-printable and non-ASCII characters from ruleName', () => {
+      // Arrange - e-acute (233) is non-ASCII, BEL (7) is a control character
+      const ruleName = 'caf' + String.fromCharCode(233) + String.fromCharCode(7) + 'rule';
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName }), true);
+
+      // Assert
+      expect(result).toContain(';rule-name=cafrule');
+    });
+
+    test('truncates ruleName at 128 characters', () => {
+      // Arrange
+      const longName = 'a'.repeat(200);
+
+      // Act
+      const result = svc.buildRtiResultHeader(buildResponse({ ruleName: longName }), true);
+
+      // Assert
+      expect(result).toContain(`;rule-name=${'a'.repeat(128)}`);
+      expect(result).not.toContain('a'.repeat(129));
+    });
+  });
+  // #endregion buildRtiResultHeader Method Tests
+
+  // #region parseNumberList Method Tests
+  describe('parseNumberList', () => {
+    test('returns undefined for undefined input', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList(undefined)).toBeUndefined();
+    });
+
+    test('returns undefined for null input', () => {
+      const input: any = null;
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList(input)).toBeUndefined();
+    });
+
+    test('returns undefined for empty string', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('')).toBeUndefined();
+    });
+
+    test('parses a single number', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('5')).toEqual([5]);
+    });
+
+    test('parses multiple comma-separated numbers', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('4,5,6')).toEqual([4, 5, 6]);
+    });
+
+    test('trims spaces around each value', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList(' 4 , 5 , 6 ')).toEqual([4, 5, 6]);
+    });
+
+    test('filters trailing comma', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('4,5,')).toEqual([4, 5]);
+    });
+
+    test('filters leading comma', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList(',4,5')).toEqual([4, 5]);
+    });
+
+    test('skips non-numeric entries', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('4,abc,6')).toEqual([4, 6]);
+    });
+
+    test('returns undefined when all entries are non-numeric', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('abc,def')).toBeUndefined();
+    });
+
+    test('parses negative numbers', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('-1,3')).toEqual([-1, 3]);
+    });
+
+    test('truncates decimals via parseInt', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseNumberList('4.7,5.2')).toEqual([4, 5]);
+    });
+  });
+  // #endregion parseNumberList Method Tests
+
+  // #region parseStringList Method Tests
+  describe('parseStringList', () => {
+    test('returns undefined for undefined input', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList(undefined)).toBeUndefined();
+    });
+
+    test('returns undefined for null input', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList(null as any)).toBeUndefined();
+    });
+
+    test('returns undefined for empty string', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('')).toBeUndefined();
+    });
+
+    test('returns undefined for whitespace-only entries', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList(' , , ')).toBeUndefined();
+    });
+
+    test('parses a single value', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('/health')).toEqual(['/health']);
+    });
+
+    test('parses multiple comma-separated values', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('/health,/ping')).toEqual(['/health', '/ping']);
+    });
+
+    test('trims spaces around each value', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList(' /health , /ping ')).toEqual(['/health', '/ping']);
+    });
+
+    test('filters trailing comma', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('/health,')).toEqual(['/health']);
+    });
+
+    test('filters leading comma', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList(',/health')).toEqual(['/health']);
+    });
+
+    test('filters consecutive empty entries', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('/a,,/b')).toEqual(['/a', '/b']);
+    });
+
+    test('preserves regex-like patterns intact', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.parseStringList('\\.css$,\\.js$')).toEqual(['\\.css$', '\\.js$']);
+    });
+  });
+  // #endregion parseStringList Method Tests
+
+  // #region safeReturnPath Method Tests
+  describe('safeReturnPath', () => {
+    const safeReturnPath = (raw: string | null | undefined) => RTIStatelessUtils.safeReturnPath(raw);
+    const hex = (code: number) => `0x${code.toString(16).toUpperCase().padStart(2, '0')}`;
+    const ASCII = Array.from({ length: 0x80 }, (_, code) => code);
+    const CONTROLS = ASCII.filter(code => code < 0x20 || code === 0x7F);
+    const PRINTABLE = ASCII.filter(code => code >= 0x20 && code < 0x7F);
+
+    // How a browser resolves the value: as a relative Location (CloudFront without a Host header) and as the
+    // absolute one the integrations build otherwise. Node's URL is the same WHATWG parser browsers implement.
+    // A value the parser rejects (e.g. "/\t/%" becomes an invalid host) does not count as staying on the site.
+    const BASE = 'https://example.com';
+    const staysOnSite = (path: string) => {
+      try {
+        return new URL(path, `${BASE}/current`).origin === BASE && new URL(`${BASE}${path}`).origin === BASE;
+      } catch {
+        return false;
+      }
+    };
+
+    describe('empty input', () => {
+      test.each([
+        ['undefined', undefined],
+        ['null', null],
+        ['an empty string', ''],
+      ])('rejects %s', (_, raw) => {
+        // Act & Assert
+        expect(safeReturnPath(raw)).toBeUndefined();
+      });
+    });
+
+    describe('first character: must be "/"', () => {
+      test.each(ASCII.filter(code => code !== 0x2F).map(code => [hex(code), code]))(
+        'rejects a value starting with %s', (_, code) => {
+          // Act & Assert
+          expect(safeReturnPath(`${String.fromCharCode(code)}evil.com`)).toBeUndefined();
+        });
+
+      test.each([
+        ['an absolute https URL', 'https://evil.com/x'],
+        ['an absolute http URL', 'http://evil.com'],
+        ['a javascript: URL', 'javascript:alert(1)'],
+        ['a data: URL', 'data:text/html,<script>alert(1)</script>'],
+        ['a bare host', 'evil.com'],
+        ['a userinfo-style value', '@evil.com'],
+        ['a dot-prefixed host', '.evil.com'],
+        ['a path after a leading space', ' /page'],
+        ['a path after a leading tab', '\t/page'],
+        ['two backslashes', '\\\\evil.com'],
+        ['a backslash then a slash', '\\/evil.com'],
+        ['a non-ASCII look-alike slash (U+FF0F)', '／／evil.com'],
+      ])('rejects %s', (_, raw) => {
+        // Act & Assert
+        expect(safeReturnPath(raw)).toBeUndefined();
+      });
+    });
+
+    describe('second character: "/" and "\\" make it protocol-relative', () => {
+      test.each([['/', '//evil.com'], ['\\', '/\\evil.com']])('rejects "%s" as the second character', (_, raw) => {
+        // Act & Assert
+        expect(safeReturnPath(raw)).toBeUndefined();
+        expect(staysOnSite(raw)).toBe(false);
+      });
+
+      test.each(PRINTABLE.filter(code => code !== 0x2F && code !== 0x5C).map(code => [hex(code), code]))(
+        'accepts %s as the second character', (_, code) => {
+          // Arrange
+          const path = `/${String.fromCharCode(code)}evil.com`;
+
+          // Act & Assert
+          expect(safeReturnPath(path)).toBe(path);
+          expect(staysOnSite(path)).toBe(true);
+        });
+    });
+
+    describe('ASCII control characters: rejected anywhere', () => {
+      test('covers all 33 of them (0x00-0x1F and 0x7F)', () => {
+        // Act & Assert
+        expect(CONTROLS).toHaveLength(33);
+      });
+
+      test.each(CONTROLS.map(code => [hex(code), code]))(
+        'rejects %s right after the slash, mid-path, in the query, in the fragment and at the end', (_, code) => {
+          // Arrange
+          const ch = String.fromCharCode(code);
+
+          // Act & Assert
+          for (const raw of [`/${ch}/evil.com`, `/${ch}\\evil.com`, `/a${ch}b`, `/a?q=${ch}`, `/a#${ch}`, `/a${ch}`]) {
+            expect(safeReturnPath(raw)).toBeUndefined();
+          }
+        });
+
+      test.each([
+        ['a CRLF header injection', '/page\r\nSet-Cookie: a=1'],
+        ['a bare LF header injection', '/page\nLocation: https://evil.com'],
+        ['several tabs and newlines before the second slash', '/\t\n\r\t/evil.com'],
+        ['a tab between two slashes later on', '/a/\t/b'],
+      ])('rejects %s', (_, raw) => {
+        // Act & Assert
+        expect(safeReturnPath(raw)).toBeUndefined();
+      });
+
+      test('the rule is needed: tab, LF and CR are deleted by the browser, turning /<c>/host into another host', () => {
+        // Arrange: each passes the leading-slash checks on its own
+        const values = ['/\t/evil.com', '/\n/evil.com', '/\r/evil.com', '/\t\\evil.com'];
+
+        // Act & Assert
+        for (const raw of values) {
+          expect(raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/\\')).toBe(true);
+          expect(new URL(raw, BASE).host).toBe('evil.com');
+          expect(safeReturnPath(raw)).toBeUndefined();
+        }
+      });
+    });
+
+    describe('printable ASCII after the second character: accepted', () => {
+      test.each(PRINTABLE.map(code => [hex(code), code]))(
+        'accepts %s mid-path, in the query, in the fragment and at the end', (_, code) => {
+          // Arrange
+          const ch = String.fromCharCode(code);
+
+          // Act & Assert: "/" and "\" here only add a path segment, they cannot change the host
+          for (const path of [`/a${ch}b`, `/a?q=${ch}`, `/a#${ch}`, `/a${ch}`]) {
+            expect(safeReturnPath(path)).toBe(path);
+            expect(staysOnSite(path)).toBe(true);
+          }
+        });
+    });
+
+    describe('non-ASCII: accepted, a browser never reads it as "/" or "\\" in a path', () => {
+      test.each([
+        ['a C1 control (U+0080)', '\u0080'],
+        ['a C1 control (U+009F)', '\u009F'],
+        ['a no-break space (U+00A0)', ' '],
+        ['a line separator (U+2028)', ' '],
+        ['a paragraph separator (U+2029)', ' '],
+        ['a byte-order mark (U+FEFF)', '﻿'],
+        ['a fullwidth solidus (U+FF0F)', '／'],
+        ['a fullwidth reverse solidus (U+FF3C)', '＼'],
+        ['a division slash (U+2215)', '∕'],
+        ['a fraction slash (U+2044)', '⁄'],
+        ['an ideographic full stop (U+3002)', '。'],
+        ['an accented letter', 'é'],
+        ['an emoji', '\u{1F600}'],
+      ])('accepts %s right after the slash', (_, ch) => {
+        // Arrange
+        const path = `/${ch}${ch}evil.com`;
+
+        // Act & Assert
+        expect(safeReturnPath(path)).toBe(path);
+        expect(staysOnSite(path)).toBe(true);
+      });
+
+      test('accepts every character from U+0080 to U+FFFF right after the slash, and each stays on the site', () => {
+        // Arrange: the whole Basic Multilingual Plane above ASCII, lone surrogates (U+D800-U+DFFF) included
+        const codes = Array.from({ length: 0x10000 - 0x80 }, (_, i) => 0x80 + i);
+
+        // Act
+        const wrong = codes.filter(code => {
+          const ch = String.fromCharCode(code);
+          const path = `/${ch}${ch}evil.com`;
+          return safeReturnPath(path) !== path || !staysOnSite(path);
+        }).map(hex);
+
+        // Assert
+        expect(codes).toHaveLength(65_408);
+        expect(wrong).toEqual([]);
+      });
+    });
+
+    describe('realistic paths: accepted unchanged', () => {
+      test.each([
+        ['the root', '/'],
+        ['a path', '/landing'],
+        ['a nested path', '/shop/shoes/42'],
+        ['a path with a query string', '/search?q=shoes&page=2'],
+        ['a path with tracking parameters', '/landing?gclid=abc&utm_source=x'],
+        ['a path with a fragment', '/page#top'],
+        ['an empty query and fragment', '/?#'],
+        ['dot segments (they stay on the site)', '/../../etc/passwd'],
+        ['a double slash later in the path', '/a//b'],
+        ['a backslash later in the path', '/a\\b'],
+        ['a space in the path', '/a b'],
+        ['a still-encoded tab (literal text to the browser)', '/a%09/b'],
+        ['still-encoded slashes after the first', '/%2F%2Fevil.com'],
+        ['a still-encoded backslash after the first', '/%5Cevil.com'],
+        ['a full URL in the query string', '/redirect?to=https://evil.com'],
+        ['a very long path', `/${'a'.repeat(10_000)}`],
+      ])('accepts %s', (_, path) => {
+        // Act & Assert: the same string comes back - nothing is trimmed, decoded or normalised
+        expect(safeReturnPath(path)).toBe(path);
+        expect(staysOnSite(path)).toBe(true);
+      });
+    });
+
+    describe('agrees with the browser on every short string of risky characters', () => {
+      // Every string of 1 to 4 characters over these is tried (88,740 of them): slashes, the characters the browser
+      // deletes, other controls, and the characters that shape a URL (scheme, userinfo, port, query, fragment).
+      const ALPHABET = ['/', '\\', '\t', '\n', '\r', '\x00', '\x7F', ' ', '.', ':', '@', '%', '?', '#', 'a', '。', '／'];
+      const allStrings = (maxLength: number) => {
+        let level = [''];
+        let all: string[] = [];
+        for (let length = 1; length <= maxLength; length++) {
+          level = level.flatMap(prefix => ALPHABET.map(ch => prefix + ch));
+          all = all.concat(level);
+        }
+        return all;
+      };
+      const STRINGS = allStrings(4);
+
+      test('every accepted value stays on the site', () => {
+        // Act
+        const accepted = STRINGS.filter(raw => safeReturnPath(raw) !== undefined);
+        const leaving = accepted.filter(raw => !staysOnSite(raw)).map(raw => JSON.stringify(raw));
+
+        // Assert
+        expect(accepted.length).toBeGreaterThan(1000);
+        expect(leaving).toEqual([]);
+      });
+
+      test('the check above has teeth: without the control-character rule some accepted values leave the site', () => {
+        // Arrange: safeReturnPath before the control-character rule was added
+        const leadingSlashOnly = (raw: string) => raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/\\');
+
+        // Act
+        const leaving = STRINGS.filter(raw => leadingSlashOnly(raw) && !staysOnSite(raw));
+
+        // Assert
+        expect(leaving).toContain('/\t/a');
+        expect(leaving).toContain('/\n\\a');
+      });
+    });
+  });
+  // #endregion safeReturnPath Method Tests
+
+  // #region normalizeHost Method Tests
+  describe('normalizeHost', () => {
+    const normalizeHost = (value: string | null | undefined) => RTIStatelessUtils.normalizeHost(value);
+
+    describe('absent or empty input', () => {
+      test.each([
+        ['undefined', undefined],
+        ['null', null],
+        ['an empty string', ''],
+        ['only spaces', '   '],
+        ['only a tab and newline', '\t\n'],
+      ])('returns "" for %s', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe('');
+      });
+    });
+
+    describe('a bare host: unchanged', () => {
+      test.each([
+        ['a domain', 'shop.com'],
+        ['a subdomain', 'www.shop.co.uk'],
+        ['a single label', 'localhost'],
+        ['a hyphenated domain', 'my-shop.example'],
+        ['a punycode domain', 'xn--bcher-kva.example'],
+        ['an IPv4 address', '203.0.113.7'],
+        ['an IPv6 literal', '[2001:db8::1]'],
+        ['the IPv6 loopback', '[::1]'],
+      ])('keeps %s', (_, host) => {
+        // Act & Assert
+        expect(normalizeHost(host)).toBe(host);
+      });
+    });
+
+    describe('each part that is stripped', () => {
+      test.each([
+        // case and whitespace
+        ['upper case', 'SHOP.COM', 'shop.com'],
+        ['mixed case', 'Shop.Com', 'shop.com'],
+        ['leading and trailing spaces', '  shop.com  ', 'shop.com'],
+        ['a trailing tab and newline', 'shop.com\t\r\n', 'shop.com'],
+        // scheme
+        ['an https scheme', 'https://shop.com', 'shop.com'],
+        ['an http scheme', 'http://shop.com', 'shop.com'],
+        ['an upper-case scheme', 'HTTPS://shop.com', 'shop.com'],
+        ['another scheme', 'wss://shop.com', 'shop.com'],
+        ['a scheme with + . -', 'git+ssh.x-y://shop.com', 'shop.com'],
+        // path, query, fragment
+        ['a trailing slash', 'shop.com/', 'shop.com'],
+        ['a path', 'shop.com/a/b', 'shop.com'],
+        ['a query', 'shop.com?x=1', 'shop.com'],
+        ['a fragment', 'shop.com#top', 'shop.com'],
+        ['a path, query and fragment', 'shop.com/a?b=1#c', 'shop.com'],
+        // userinfo
+        ['a user', 'user@shop.com', 'shop.com'],
+        ['a user and password', 'user:pass@shop.com', 'shop.com'],
+        ['several @ (up to the last one)', 'a@b@shop.com', 'shop.com'],
+        ['an @ in the path (not userinfo)', 'shop.com/a@b', 'shop.com'],
+        // port
+        ['a port', 'shop.com:443', 'shop.com'],
+        ['a high port', 'shop.com:65535', 'shop.com'],
+        ['an empty port', 'shop.com:', 'shop.com'],
+        ['two ports', 'shop.com:443:80', 'shop.com'],
+        ['a non-numeric port', 'shop.com:abc', 'shop.com'],
+        ['a port on an IPv4 address', '203.0.113.7:8080', '203.0.113.7'],
+        ['a port on an IPv6 literal', '[2001:db8::1]:8443', '[2001:db8::1]'],
+        ['an empty port on an IPv6 literal', '[::1]:', '[::1]'],
+        ['anything after an IPv6 literal', '[::1]junk', '[::1]'],
+        // trailing dots
+        ['a trailing dot (the DNS root)', 'shop.com.', 'shop.com'],
+        ['several trailing dots', 'shop.com...', 'shop.com'],
+        ['a trailing dot before the port', 'shop.com.:443', 'shop.com'],
+        ['a trailing dot and spaces mixed', 'shop.com. . ', 'shop.com'],
+        // everything at once
+        ['all of it', '  HTTPS://User:Pass@Shop.COM.:8443/Path?q=1#Frag  ', 'shop.com'],
+        ['all of it on IPv6', 'https://user@[2001:DB8::1]:8443/x', '[2001:db8::1]'],
+      ])('strips %s', (_, value, expected) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe(expected);
+      });
+    });
+
+    describe('values with no host left: "" (fails closed)', () => {
+      test.each([
+        ['only a scheme', 'https://'],
+        ['a scheme and a port', 'http://:443'],
+        ['only a port', ':443'],
+        ['only a colon', ':'],
+        ['only a slash', '/'],
+        ['only a path', '/shop.com'],
+        ['only a query', '?shop.com'],
+        ['only userinfo', 'user@'],
+        ['only a dot', '.'],
+        ['only dots and spaces', ' . . '],
+      ])('returns "" for %s (%j)', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe('');
+      });
+    });
+
+    describe('what it must not merge: different hosts stay different', () => {
+      test.each([
+        ['a longer domain sharing the prefix', 'shop.com.evil.com'],
+        ['a domain sharing the suffix', 'evilshop.com'],
+        ['a subdomain', 'login.shop.com'],
+        ['the host in userinfo', 'shop.com@evil.com'],
+        ['the host in the path', 'evil.com/shop.com'],
+        ['the host in the query', 'evil.com?shop.com'],
+        ['the host in the fragment', 'evil.com#shop.com'],
+        ['the host after the port', 'evil.com:shop.com'],
+        ['the host as a scheme', 'shop.com://evil.com'],
+      ])('does not turn %s (%j) into shop.com', (_, value) => {
+        // Act & Assert
+        expect(normalizeHost(value)).not.toBe('shop.com');
+      });
+
+      test('keeps inner characters as they are (only the edges and the parts above are stripped)', () => {
+        // Act & Assert
+        expect(normalizeHost('shop .com')).toBe('shop .com');
+        expect(normalizeHost('.shop.com')).toBe('.shop.com');
+        expect(normalizeHost('shop..com')).toBe('shop..com');
+        expect(normalizeHost('shop\\com')).toBe('shop\\com');
+      });
+    });
+
+    describe('properties, over every short string of the characters it handles', () => {
+      // Every string of 1 to 4 characters over these (21 + 441 + 9,261 + 194,481 = 204,204 strings): the separators it
+      // cuts at, the characters it trims, IPv6 brackets, and letters/digits that can form a scheme, host or port.
+      const ALPHABET = ['/', '?', '#', '@', ':', '[', ']', '.', ' ', '\t', 'a', 'A', '1', '+', '-', 'h', 's', 'p', 't', 'x', 'é'];
+      const allStrings = (maxLength: number) => {
+        let level = [''];
+        let all: string[] = [];
+        for (let length = 1; length <= maxLength; length++) {
+          level = level.flatMap(prefix => ALPHABET.map(ch => prefix + ch));
+          all = all.concat(level);
+        }
+        return all;
+      };
+      const STRINGS = allStrings(4);
+
+      test('is idempotent: normalizing twice gives the same result as once', () => {
+        // Act
+        const unstable = STRINGS.filter(value => normalizeHost(normalizeHost(value)) !== normalizeHost(value))
+          .map(value => JSON.stringify(value));
+
+        // Assert
+        expect(unstable).toEqual([]);
+      });
+
+      test('never leaves a separator, upper case, edge whitespace or a trailing dot in the result', () => {
+        // Act
+        const bad = STRINGS.map(value => [value, normalizeHost(value)] as const).filter(([, host]) => {
+          const outsideBrackets = host.startsWith('[') ? host.slice(host.indexOf(']') + 1) : host;
+          return /[/?#@]/.test(host)
+            || outsideBrackets.includes(':')
+            || host !== host.toLowerCase()
+            || host !== host.trim()
+            || host.endsWith('.');
+        }).map(([value, host]) => `${JSON.stringify(value)} → ${JSON.stringify(host)}`);
+
+        // Assert
+        expect(bad).toEqual([]);
+      });
+
+      test('the result is always a piece of the lowercased input (it only removes, never adds)', () => {
+        // Act
+        const added = STRINGS.filter(value => !value.toLowerCase().includes(normalizeHost(value)))
+          .map(value => JSON.stringify(value));
+
+        // Assert
+        expect(added).toEqual([]);
+      });
+    });
+  });
+  // #endregion normalizeHost Method Tests
+
+  // #region Debug-log redaction Tests (cookieNames, redactHeaderValue, stringifyRedactedPayload)
+  describe('debug-log redaction', () => {
+    const utils = new RTIStatelessUtils();
+    const SECRET_HEADER_NAMES = ['x-cheq-challenge', 'authorization', 'proxy-authorization'];
+
+    // Every spelling of `name` in upper and lower case, letter by letter (2^letters of them).
+    const caseVariants = (name: string): string[] =>
+      [...name].reduce<string[]>((variants, ch) => {
+        const spellings = ch.toLowerCase() === ch.toUpperCase() ? [ch] : [ch.toLowerCase(), ch.toUpperCase()];
+        return variants.flatMap(prefix => spellings.map(s => prefix + s));
+      }, ['']);
+
+    test('REDACTED is "[REDACTED]"', () => {
+      // Act & Assert
+      expect(RTIStatelessUtils.REDACTED).toBe('[REDACTED]');
+    });
+
+    describe('cookieNames', () => {
+      describe('examples', () => {
+        test.each([
+          ['one cookie', 'a=1', 'a'],
+          ['several cookies', 'a=1; b=2; _cq_se=123.abc|ray', 'a, b, _cq_se'],
+          ['the CHEQ cookies', '_cq_duid=4.abc; _cq_pvid=4.def; _cq_s=eyJ==', '_cq_duid, _cq_pvid, _cq_s'],
+          ['no space after ";"', 'a=1;b=2', 'a, b'],
+          ['tabs around the cookies', '\ta=1\t;\tb=2\t', 'a, b'],
+          ['a value with "=" (base64 padding)', 'a=x==; b=y=', 'a, b'],
+          ['a value that looks like a cookie', 'a=b=c', 'a'],
+          ['an empty value', 'a=; b=2', 'a, b'],
+          ['spaces around the name', '  a =1;  b=2  ', 'a, b'],
+          ['empty segments', ';; a=1 ;; ', 'a'],
+          ['a cookie without "=" (all value)', 'a=1; justavalue', 'a, [REDACTED]'],
+          ['only a cookie without "="', 'secret', '[REDACTED]'],
+          ['an empty name', '=value; a=1', ', a'],
+          ['a quoted value', 'a="quoted"; b=2', 'a, b'],
+          ['a URL-encoded value', 'a=x%3D1%3B; b=2', 'a, b'],
+          ['two headers joined with ", " (the second header\'s first name is hidden in a value)', 'a=1, b=2; c=3', 'a, c'],
+          ['a JSON value', 'prefs={"theme":"dark","x":1}; b=2', 'prefs, b'],
+          ['nothing', '', ''],
+          ['only separators and spaces', ' ; ;  ', ''],
+        ])('lists the names of %s', (_, header, expected) => {
+          // Act & Assert
+          expect(utils.cookieNames(header)).toBe(expected);
+        });
+      });
+
+      describe('several headers (a client can split cookies over several Cookie headers)', () => {
+        test.each([
+          ['two header values', ['a=1; b=2', 'c=3'], 'a, b, c'],
+          ['cookies already split', ['a=1', 'b=2'], 'a, b'],
+          ['an empty list', [], ''],
+          ['empty header values', ['', ' ', ';'], ''],
+          ['a header value ending in ";"', ['a=1;', 'b=2'], 'a, b'],
+          ['a cookie without "=" in one of them', ['a=1', 'secret'], 'a, [REDACTED]'],
+        ])('handles %s', (_, headers, expected) => {
+          // Act & Assert
+          expect(utils.cookieNames(headers)).toBe(expected);
+        });
+
+        test('gives the same names for the headers as for them joined with "; "', () => {
+          // Arrange
+          const headers = ['a=1; b=2', 'c=3;d=4', ' e=5 '];
+
+          // Act & Assert
+          expect(utils.cookieNames(headers)).toBe(utils.cookieNames(headers.join('; ')));
+        });
+      });
+
+      describe('never a value: every cookie header of up to two cookies, names and values from separate alphabets', () => {
+        // Names use only a b _ - ; values only digits and % ! = (an "=" in a value only after the name's "="), so any
+        // value character in the result is a leak. The expected names come from how each header was BUILT, not from
+        // parsing it again.
+        type Cookie = { text: string; name: string | null }; // name null: no "=", so the cookie is all value
+        const NAMES = ['', 'a', 'b_', 'a-b'];
+        const VALUES_AFTER_EQ = ['', '0', '1=', '%!0', '=='];
+        const VALUES_WITHOUT_EQ = ['0', '%!0'];
+        const PADS = ['', ' ', '\t'];
+        const SEPARATORS = [';', '; ', ' ;', ';;'];
+
+        const cookies: Cookie[] = [];
+        for (const before of PADS) {
+          for (const after of PADS) {
+            for (const name of NAMES) {
+              for (const value of VALUES_AFTER_EQ) {
+                cookies.push({ text: `${before}${name}=${value}${after}`, name });
+              }
+            }
+            for (const value of VALUES_WITHOUT_EQ) {
+              cookies.push({ text: `${before}${value}${after}`, name: null });
+            }
+          }
+        }
+        const headers: { header: string; cookies: Cookie[] }[] = [
+          ...cookies.map(c => ({ header: c.text, cookies: [c] })),
+          ...cookies.flatMap(a => cookies.flatMap(b => SEPARATORS.map(sep => ({ header: `${a.text}${sep}${b.text}`, cookies: [a, b] })))),
+        ];
+        const expectedNames = (built: Cookie[]) => built.map(c => c.name === null ? '[REDACTED]' : c.name.trim()).join(', ');
+
+        test('covers more than 25,000 headers', () => {
+          // Act & Assert
+          expect(headers.length).toBeGreaterThan(25_000);
+        });
+
+        test('no value character ever appears in the result', () => {
+          // Act
+          const leaks = headers
+            .map(({ header }) => [header, utils.cookieNames(header)] as const)
+            .filter(([, names]) => /[^ab_\-, ]/.test(names.split('[REDACTED]').join('')))
+            .map(([header, names]) => `${JSON.stringify(header)} → ${JSON.stringify(names)}`);
+
+          // Assert
+          expect(leaks).toEqual([]);
+        });
+
+        test('returns exactly the names the header was built from, in order, with [REDACTED] for a cookie without "="', () => {
+          // Act
+          const wrong = headers
+            .filter(({ header, cookies: built }) => utils.cookieNames(header) !== expectedNames(built))
+            .map(({ header, cookies: built }) => `${JSON.stringify(header)}: expected ${JSON.stringify(expectedNames(built))}, got ${JSON.stringify(utils.cookieNames(header))}`);
+
+          // Assert
+          expect(wrong).toEqual([]);
+        });
+
+        test('gives the same result for the cookies passed as a list', () => {
+          // Act
+          const wrong = headers
+            .filter(({ header, cookies: built }) => built.length === 2 && utils.cookieNames(built.map(c => c.text)) !== utils.cookieNames(header))
+            .filter(({ header }) => !header.includes(';;')); // ";;" adds an empty segment, which the list form does not have
+          // Assert
+          expect(wrong).toEqual([]);
+        });
+      });
+    });
+
+    describe('redactHeaderValue', () => {
+      test.each(['cookie', 'Cookie', 'COOKIE'])('keeps only the cookie names of %s', (name) => {
+        // Act & Assert
+        expect(utils.redactHeaderValue(name, 'a=secret; b=secret')).toBe('a, b');
+      });
+
+      test('treats every upper/lower-case spelling of "cookie" as the Cookie header', () => {
+        // Act
+        const wrong = caseVariants('cookie').filter(name => utils.redactHeaderValue(name, 'a=secret; b=x') !== 'a, b');
+
+        // Assert
+        expect(caseVariants('cookie')).toHaveLength(64);
+        expect(wrong).toEqual([]);
+      });
+
+      test.each(SECRET_HEADER_NAMES)('redacts every upper/lower-case spelling of %s', (secretName) => {
+        // Act
+        const variants = caseVariants(secretName);
+        const kept = variants.filter(name => utils.redactHeaderValue(name, 'secret-value') !== '[REDACTED]');
+
+        // Assert
+        expect(variants.length).toBe(2 ** [...secretName].filter(ch => /[a-z]/.test(ch)).length);
+        expect(kept).toEqual([]);
+      });
+
+      test.each([
+        ['an empty value', ''],
+        ['only spaces', '   '],
+        ['a value that looks harmless', 'none'],
+        ['a very long value', 'x'.repeat(10_000)],
+      ])('redacts a secret header with %s too (the value is never judged)', (_, value) => {
+        // Act & Assert
+        for (const name of SECRET_HEADER_NAMES) {
+          expect(utils.redactHeaderValue(name, value)).toBe('[REDACTED]');
+        }
+      });
+
+      test.each([
+        ['an ordinary header', 'user-agent'],
+        ['host', 'host'],
+        ['the ray id (not a secret)', 'x-cheq-ray-id'],
+        ['the verdict header', 'x-cheq-rti-result'],
+        ['a plural of cookie', 'cookies'],
+        ['a header containing "cookie"', 'x-cookie-consent'],
+        ['set-cookie (a response header)', 'set-cookie'],
+        ['a header containing "authorization"', 'x-authorization-hint'],
+        ['a header starting with "authorization"', 'authorization-x'],
+        ['a header missing a letter', 'authorizatio'],
+        ['a header with a space before (not a valid header name)', ' authorization'],
+        ['a header with a space after (not a valid header name)', 'cookie '],
+        ['an empty name', ''],
+      ])('keeps %s (%j) as it is: only exact names, in any case, are secret', (_, name) => {
+        // Act & Assert
+        expect(utils.redactHeaderValue(name, 'a=1; b=2')).toBe('a=1; b=2');
+      });
+
+      test('returns an ordinary header\'s value unchanged, whatever it holds', () => {
+        // Arrange
+        const values = ['', ' ', 'a=1; b=2', '[REDACTED]', 'Bearer x', '\t\r\n', 'é😀', 'x'.repeat(10_000)];
+
+        // Act & Assert
+        for (const value of values) {
+          expect(utils.redactHeaderValue('user-agent', value)).toBe(value);
+        }
+      });
+
+      test('an empty Cookie header gives no names', () => {
+        // Act & Assert
+        expect(utils.redactHeaderValue('cookie', '')).toBe('');
+      });
+    });
+
+    describe('maskSecret', () => {
+      test.each([
+        ['a long value: first and last 4', 'abcdefghijklmnop', 'abcd****mnop'],
+        ['13 characters: still masked in the middle', 'abcdefghijklm', 'abcd****jklm'],
+        ['12 characters: all hidden', 'abcdefghijkl', '****'],
+        ['a short value', 'abc', '****'],
+        ['an empty value', '', '****'],
+      ])('%s', (_label, value, expected) => {
+        // Act & Assert
+        expect(utils.maskSecret(value)).toBe(expected);
+      });
+    });
+
+    describe('redactQueryString', () => {
+      test.each([
+        ['the token among others', 'a=1&cf-turnstile-response=0.AbCdEfGhIjKlMn&b=2', 'a=1&cf-turnstile-response=0.Ab****KlMn&b=2'],
+        ['the token first', 'cf-turnstile-response=0.AbCdEfGhIjKlMn&a=1', 'cf-turnstile-response=0.Ab****KlMn&a=1'],
+        ['the token twice', 'cf-turnstile-response=AAAABBBBCCCCDDDD&cf-turnstile-response=EEEEFFFFGGGGHHHH', 'cf-turnstile-response=AAAA****DDDD&cf-turnstile-response=EEEE****HHHH'],
+        ['a short or empty token', 'cf-turnstile-response=short&cf-turnstile-response=', 'cf-turnstile-response=****&cf-turnstile-response=****'],
+        ['a name that only ends like the token', 'x-cf-turnstile-response=keep-this-value-1234', 'x-cf-turnstile-response=keep-this-value-1234'],
+        ['no secret parameter, kept byte for byte', 'q=a%20b&utm_source=x&flag', 'q=a%20b&utm_source=x&flag'],
+        ['empty', '', ''],
+      ])('%s', (_label, querystring, expected) => {
+        // Act & Assert
+        expect(utils.redactQueryString(querystring)).toBe(expected);
+      });
+    });
+
+    describe('redactUrl', () => {
+      test.each([
+        ['no query string', 'https://shop.com/cart', 'https://shop.com/cart'],
+        ['a query string with the token', 'https://shop.com/?cf-turnstile-response=0.AbCdEfGhIjKlMn&a=1', 'https://shop.com/?cf-turnstile-response=0.Ab****KlMn&a=1'],
+        ['a fragment after the query string is kept', 'https://shop.com/?cf-turnstile-response=0.AbCdEfGhIjKlMn#top', 'https://shop.com/?cf-turnstile-response=0.Ab****KlMn#top'],
+        ['an empty query string', 'https://shop.com/?', 'https://shop.com/?'],
+      ])('%s', (_label, url, expected) => {
+        // Act & Assert
+        expect(utils.redactUrl(url)).toBe(expected);
+      });
+    });
+
+    describe('stringifyRedactedPayload', () => {
+      const buildPayload = (headers: Record<string, string | undefined>) => ({
+        tagHash: 'tag',
+        apiKey: 'key',
+        channel: 'test-channel',
+        endUserParams: { clientIp: '1.2.3.4', requestUrl: 'https://shop.com/', headerNames: 'x', method: 'GET', headers },
+        duidCookie: 'duid-1',
+        pvidCookie: 'pvid-1',
+        sCookie: 's-1',
+      }) as any;
+
+      test('redacts cookie values, the session token and credentials, matching header names case-insensitively', () => {
+        // Arrange
+        const payload = buildPayload({ Cookie: 'a=secret1; _cq_se=tok|ray', AUTHORIZATION: 'Bearer sk', 'x-cheq-challenge': 'tok', 'Proxy-Authorization': 'Basic pk', host: 'shop.com' });
+
+        // Act
+        const logged = JSON.parse(utils.stringifyRedactedPayload(payload));
+
+        // Assert
+        expect(logged.endUserParams.headers).toEqual({
+          Cookie: 'a, _cq_se', AUTHORIZATION: '[REDACTED]', 'x-cheq-challenge': '[REDACTED]', 'Proxy-Authorization': '[REDACTED]', host: 'shop.com',
+        });
+      });
+
+      test("keeps everything else, CHEQ's own ids included (duidCookie, pvidCookie, sCookie are needed to debug RTI)", () => {
+        // Arrange
+        const payload = buildPayload({ cookie: 'a=1' });
+
+        // Act
+        const logged = JSON.parse(utils.stringifyRedactedPayload(payload));
+
+        // Assert
+        expect(logged).toEqual({ ...payload, tagHash: '****', apiKey: '****', endUserParams: { ...payload.endUserParams, headers: { cookie: 'a' } } });
+        expect(logged.duidCookie).toBe('duid-1');
+        expect(logged.pvidCookie).toBe('pvid-1');
+        expect(logged.sCookie).toBe('s-1');
+      });
+
+      test('equals JSON.stringify apart from the masked keys when there is nothing else to redact (same keys, same order)', () => {
+        // Arrange
+        const payload = buildPayload({ host: 'shop.com', 'user-agent': 'UA', cheq_ja3: undefined });
+
+        // Act & Assert
+        expect(utils.stringifyRedactedPayload(payload)).toBe(JSON.stringify({ ...payload, tagHash: '****', apiKey: '****' }));
+      });
+
+      test('keeps the header order and drops undefined headers, like JSON.stringify', () => {
+        // Arrange
+        const payload = buildPayload({ z: '1', cookie: 'a=1', a: '2', cheq_ja4: undefined, authorization: 'x' });
+
+        // Act
+        const keys = Object.keys(JSON.parse(utils.stringifyRedactedPayload(payload)).endUserParams.headers);
+
+        // Assert
+        expect(keys).toEqual(['z', 'cookie', 'a', 'authorization']);
+      });
+
+      test('changes nothing but the logged string: the payload sent to RTI keeps the real values', () => {
+        // Arrange
+        const headers = { cookie: 'a=secret', authorization: 'Bearer sk' };
+        const payload = buildPayload(headers);
+        const before = JSON.stringify(payload);
+
+        // Act
+        utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(JSON.stringify(payload)).toBe(before);
+        expect(payload.endUserParams.headers).toBe(headers);
+        expect(headers.cookie).toBe('a=secret');
+      });
+
+      test('masks apiKey and tagHash: first and last 4 characters only', () => {
+        // Arrange
+        const payload = { ...buildPayload({}), apiKey: 'bbe1cb9f-75cc-437c-97fe-8dead6575828', tagHash: '89f6be46721c93dcde41c82e1e56ac78' };
+
+        // Act
+        const logged = utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(logged).not.toContain('75cc-437c');
+        expect(logged).not.toContain('721c93dc');
+        expect(JSON.parse(logged)).toMatchObject({ apiKey: 'bbe1****5828', tagHash: '89f6****ac78' });
+        expect(payload.apiKey).toBe('bbe1cb9f-75cc-437c-97fe-8dead6575828');
+      });
+
+      test('masks the Turnstile token in requestUrl, keeping the rest of the URL', () => {
+        // Arrange
+        const token = '0.AbCdEfGhIjKlMnOpQrStUvWxYz-123456789';
+        const payload = buildPayload({});
+        payload.endUserParams.requestUrl = `https://shop.com/?original_url=%2Fcart&cf-turnstile-response=${token}&request_id=r1`;
+
+        // Act
+        const logged = utils.stringifyRedactedPayload(payload);
+
+        // Assert
+        expect(logged).not.toContain(token);
+        expect(JSON.parse(logged).endUserParams.requestUrl).toBe('https://shop.com/?original_url=%2Fcart&cf-turnstile-response=0.Ab****6789&request_id=r1');
+        expect(payload.endUserParams.requestUrl).toContain(token);
+      });
+
+      test('works without endUserParams or headers', () => {
+        // Act & Assert
+        expect(utils.stringifyRedactedPayload({ tagHash: 't' } as any)).toBe('{"tagHash":"****"}');
+        expect(utils.stringifyRedactedPayload({ endUserParams: { clientIp: 'x' } } as any)).toBe('{"endUserParams":{"clientIp":"x"}}');
+      });
+
+      test('works bound to an instance, as the integrations\' spec mocks call it', () => {
+        // Arrange
+        const bound = utils.stringifyRedactedPayload.bind(utils);
+
+        // Act & Assert
+        expect(JSON.parse(bound(buildPayload({ cookie: 'a=secret' }))).endUserParams.headers.cookie).toBe('a');
+      });
+
+      test('never leaks a secret: every combination of secret and ordinary headers, in several spellings', () => {
+        // Arrange: each secret value holds "TOPSECRET"; ordinary headers must come out unchanged
+        const SECRETS: [string, string][] = [
+          ['cookie', 'login=TOPSECRET-1; _cq_se=TOPSECRET-2|ray'],
+          ['Cookie', 'session=TOPSECRET-3'],
+          ['authorization', 'Bearer TOPSECRET-4'],
+          ['AUTHORIZATION', 'Basic TOPSECRET-5'],
+          ['x-cheq-challenge', 'TOPSECRET-6'],
+          ['X-Cheq-Challenge', 'TOPSECRET-7'],
+          ['proxy-authorization', 'Basic TOPSECRET-8'],
+        ];
+        const ORDINARY: [string, string][] = [['host', 'shop.com'], ['user-agent', 'UA/1'], ['x-cheq-ray-id', 'ray-1']];
+        const failures: string[] = [];
+
+        // Act: all 2^10 subsets of the 10 headers
+        const all = [...SECRETS, ...ORDINARY];
+        for (let mask = 0; mask < 2 ** all.length; mask++) {
+          const headers = Object.fromEntries(all.filter((_, i) => mask & (1 << i)));
+          const logged = utils.stringifyRedactedPayload(buildPayload(headers));
+          const loggedHeaders = JSON.parse(logged).endUserParams.headers;
+          if (logged.includes('TOPSECRET')) {
+            failures.push(`leak: ${logged}`);
+          }
+          for (const [name, value] of ORDINARY) {
+            if (name in headers && loggedHeaders[name] !== value) {
+              failures.push(`changed ${name}: ${logged}`);
+            }
+          }
+        }
+
+        // Assert
+        expect(failures).toEqual([]);
+      });
+    });
+  });
+  // #endregion Debug-log redaction Tests
+
+  // #region getCookieValue Method Tests
+  describe('getCookieValue', () => {
+    const svc = new RTIStatelessUtils();
+
+    test('returns value for matching cookie', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['_cq_duid=abc123'], '_cq_duid=')).toBe('abc123');
+    });
+
+    test('returns undefined when cookie not found', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['other=val'], '_cq_duid=')).toBeUndefined();
+    });
+
+    test('returns undefined for empty array', () => {
+      // Act & Assert
+      expect(svc.getCookieValue([], '_cq_s=')).toBeUndefined();
+    });
+
+    test('returns undefined when value is empty', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['_cq_s='], '_cq_s=')).toBeUndefined();
+    });
+
+    test('preserves = characters in value (base64)', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['_cq_s=abc=='], '_cq_s=')).toBe('abc==');
+    });
+
+    test('does not match prefix overlap (_cq_se vs _cq_s)', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['_cq_se=token'], '_cq_s=')).toBeUndefined();
+    });
+
+    test('returns first match when duplicates exist', () => {
+      // Act & Assert
+      expect(svc.getCookieValue(['_cq_s=first', '_cq_s=second'], '_cq_s=')).toBe('first');
+    });
+  });
+  // #endregion getCookieValue Method Tests
+
+  // #region sameSiteReferer Method Tests
+  describe('sameSiteReferer', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['a page on this site', 'https://shop.com/account/login?next=%2Fcart', 'shop.com', { path: '/account/login', query: 'next=%2Fcart' }],
+      ['no query', 'https://shop.com/form', 'shop.com', { path: '/form', query: '' }],
+      ['the host in another case and with a port', 'https://SHOP.com:443/form', 'shop.com', { path: '/form', query: '' }],
+      ['a fragment, which is dropped', 'https://shop.com/form?a=1#top', 'shop.com', { path: '/form', query: 'a=1' }],
+    ])('%s', (_label, referer, host, expected) => {
+      expect(utils.sameSiteReferer(referer, host)).toEqual(expected);
+    });
+
+    test.each([
+      ['no Referer', undefined, 'shop.com'],
+      ['an empty Referer', '', 'shop.com'],
+      ['no Host', 'https://shop.com/form', undefined],
+      ['another site', 'https://evil.example/form', 'shop.com'],
+      ['a subdomain', 'https://login.shop.com/form', 'shop.com'],
+      ['not a URL', 'not a url', 'shop.com'],
+      ['a javascript: URL', 'javascript:alert(1)', 'shop.com'],
+    ])('undefined for %s', (_label, referer, host) => {
+      expect(utils.sameSiteReferer(referer, host)).toBeUndefined();
+    });
+  });
+  // #endregion sameSiteReferer Method Tests
+
+  // #region originalReferer Method Tests
+  describe('originalReferer', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['another site: its origin only, as browsers send it (with /)', 'https://www.google.com/search?q=shoes', 'shop.com', 'https://www.google.com/'],
+      ['another site with a port: origin with the port', 'http://partner.net:8080/deal?id=7', 'shop.com', 'http://partner.net:8080/'],
+      ['a subdomain is another host', 'https://blog.shop.com/post/1', 'shop.com', 'https://blog.shop.com/'],
+      ['this host: full URL without the #fragment', 'https://shop.com/category/shoes?page=2#top', 'shop.com', 'https://shop.com/category/shoes?page=2'],
+      ['this host, any case and a port on Host', 'https://SHOP.com/a?b=1', 'Shop.com:443', 'https://shop.com/a?b=1'],
+      ['this host over http', 'http://shop.com/a', 'shop.com', 'http://shop.com/a'],
+      ['user:password@ is dropped', 'https://user:pass@shop.com/a', 'shop.com', 'https://shop.com/a'],
+      ['no Host: origin only', 'https://shop.com/a?b=1', undefined, 'https://shop.com/'],
+    ])('%s', (_name, referer, host, expected) => {
+      expect(utils.originalReferer(referer, host)).toBe(expected);
+    });
+
+    test.each([
+      ['no Referer', undefined],
+      ['empty', ''],
+      ['not a URL', 'not a url'],
+      ['a path only', '/cart'],
+      ['not http(s)', 'javascript:alert(1)'],
+      ['ftp', 'ftp://files.shop.com/a'],
+    ])('%s: undefined', (_name, referer) => {
+      expect(utils.originalReferer(referer, 'shop.com')).toBeUndefined();
+    });
+
+    test('cut to 420 characters', () => {
+      const value = utils.originalReferer(`https://shop.com/search?q=${'a'.repeat(1000)}`, 'shop.com');
+      expect(value).toHaveLength(RTIStatelessUtils.MAX_ORIGINAL_REFERER_LENGTH);
+      expect(value).toBe(`https://shop.com/search?q=${'a'.repeat(420 - 'https://shop.com/search?q='.length)}`);
+    });
+
+    test('a URL of exactly 420 characters is kept whole', () => {
+      const url = `https://shop.com/?q=${'a'.repeat(420 - 'https://shop.com/?q='.length)}`;
+      expect(utils.originalReferer(url, 'shop.com')).toBe(url);
+    });
+
+    test.each([0, 1, 2, 3, 4, 5, 6, 7, 8])('never cut in the middle of an encoded character (offset %i)', (offset) => {
+      // "é" is %C3%A9: whatever the cut position, the result decodes and ends on a whole character.
+      const prefix = `https://shop.com/?q=${'a'.repeat(420 - 'https://shop.com/?q='.length - offset)}`;
+      const value = utils.originalReferer(`${prefix}${'é'.repeat(10)}`, 'shop.com')!;
+      expect(value.length).toBeLessThanOrEqual(420);
+      expect(value.startsWith(prefix)).toBe(true);
+      expect(() => decodeURIComponent(value)).not.toThrow();
+      expect(decodeURIComponent(value.slice(prefix.length))).toMatch(/^é*$/);
+    });
+
+    test('an invalid %zz earlier in the URL does not stop the cut', () => {
+      const value = utils.originalReferer(`https://shop.com/?x=%zz&q=${'%C3%A9'.repeat(200)}`, 'shop.com')!;
+      expect(value.length).toBeLessThanOrEqual(420);
+      expect(value.endsWith('%C3%A9')).toBe(true);
+    });
+  });
+  // #endregion originalReferer Method Tests
+
+  // #region originalRefererCookieValue Method Tests
+  describe('originalRefererCookieValue', () => {
+    const utils = new RTIStatelessUtils();
+
+    test('{return URL}|{Referer}, both encoded (the 1.0.0 format)', () => {
+      expect(utils.originalRefererCookieValue('/product?gclid=1&a=b#top', 'https://www.google.com/'))
+        .toBe('%2Fproduct%3Fgclid%3D1%26a%3Db%23top|https%3A%2F%2Fwww.google.com%2F');
+    });
+
+    test('a | inside either part is encoded, so the part after the first | is always the Referer', () => {
+      const value = utils.originalRefererCookieValue('/a?x=1|2', 'https://shop.com/b?y=3|4');
+      expect(value.split('|')).toHaveLength(2);
+      expect(decodeURIComponent(value.split('|')[1])).toBe('https://shop.com/b?y=3|4');
+    });
+
+    test('no ; , or space in the value (a cookie value can\'t hold them)', () => {
+      expect(utils.originalRefererCookieValue('/a b;c,d', 'https://shop.com/x y')).not.toMatch(/[;, ]/);
+    });
+  });
+  // #endregion originalRefererCookieValue Method Tests
+
+  // #region cookiePath Method Tests
+  describe('cookiePath', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['/', '/'],
+      ['/shop/item', '/shop/item'],
+      ['/caf%C3%A9', '/caf%C3%A9'],
+      ['/a%20b', '/a%20b'],
+    ])('%s is kept', (path, expected) => {
+      expect(utils.cookiePath(path)).toBe(expected);
+    });
+
+    test.each([
+      ['a ;', '/a;b'],
+      ['a ,', '/a,b'],
+      ['a space', '/a b'],
+      ['a tab', '/a\tb'],
+      ['a newline', '/a\nb'],
+      ['a DEL', '/a\x7Fb'],
+      ['no leading /', 'a/b'],
+      ['empty', ''],
+    ])('%s: /', (_name, path) => {
+      expect(utils.cookiePath(path)).toBe('/');
+    });
+  });
+  // #endregion cookiePath Method Tests
+
+  // #region parseExpiresAt Method Tests
+  describe('parseExpiresAt', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([['1794500000000', 1794500000000], ['0', 0], ['1', 1]])('%s', (value, expected) => {
+      expect(utils.parseExpiresAt(value)).toBe(expected);
+    });
+
+    test.each([
+      [undefined], [''], ['abc'], ['123abc'], ['0123'], [' 123'], ['123 '], ['+123'], ['-1x'],
+      ['1e13'], ['12.0'], ['12.5'], ['0x10'], ['9007199254740993'], ['Infinity'], ['NaN'],
+    ])('%j: undefined', (value) => {
+      expect(utils.parseExpiresAt(value)).toBeUndefined();
+    });
+
+    test('does not check whether it is past', () => {
+      expect(utils.parseExpiresAt('1')).toBe(1);
+    });
+  });
+  // #endregion parseExpiresAt Method Tests
+});

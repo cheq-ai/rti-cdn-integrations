@@ -1,0 +1,540 @@
+// cspell:ignore nums CHEQ duid pvid bodyless
+import { RTIResponse } from "../models/rti-response.model";
+import { RTIParams } from "../models/rti-params.model";
+import { HeadersMap } from "../models/headers-map.model";
+import { ActionStrategy } from "../models/action-strategy.model";
+import { RequestHeaders, RTIRequest } from "../models/rti-request.model";
+import { Action } from "../models/action.model";
+import { CHALLENGEABLE_METHODS } from "../models/action-on-suspicious.model";
+
+/**
+ * The RTI helpers that need no configuration: cookie and header parsing, comma-separated list
+ * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the bodyless-method and
+ * Action checks, safe regex path matching, the challenge return-path check, host normalization,
+ * debug-log redaction and safe error messages.
+ *
+ * Every method works only on its arguments. The class takes no constructor arguments, holds no
+ * instance state and imports nothing but models, so it can be used on its own wherever no config
+ * is available yet (for example while the config itself is being built).
+ *
+ * `RTIHelperService` extends this class and adds the decisions that do depend on config (ignore
+ * paths, event types, actions and strategies, config validation). The integrations call these
+ * helpers through that service, so they reach both halves through one object.
+ *
+ * Keep it stateless: a helper that needs config belongs in `RTIHelperService` instead.
+ * `rti-stateless-utils.spec.ts` enforces this - it fails if a constructor parameter, an
+ * instance field, or an import outside `../models/` (or of the config) is added here.
+ */
+export class RTIStatelessUtils {
+  /**
+   * Whether a reply to a challenge page goes to the challenge callback: when RTI allows it (no strategy) or asks for
+   * a CAPTCHA. Blocks, 404s and redirects are always enforced. Listed positively, so a new strategy is enforced
+   * unless it is added here: a solved token must never bypass it by default.
+   * @param actionStrategy the strategy from `RTIHelperService.getActionStrategy`, or null when the action is ALLOW
+   */
+  isChallengeReplyAllowed(actionStrategy: ActionStrategy | null): boolean {
+    return actionStrategy === null || actionStrategy === ActionStrategy.CAPTCHA;
+  }
+
+  /** True for GET and HEAD: they can get the CAPTCHA page in place, since they have no body to lose. Any case. */
+  isBodylessMethod(method: string): boolean {
+    return CHALLENGEABLE_METHODS.includes(method.toUpperCase());
+  }
+
+  /**
+   * Whether a config value is a real {@link Action}: one of the enum's numbers. Config comes from JSON, env vars or
+   * hand-edited files, so a name like `"BLOCK"`, an out-of-range number or `null` can turn up where an Action belongs.
+   * @param value the value to check
+   */
+  isAction(value: unknown): value is Action {
+    return typeof value === "number" && Action[value] !== undefined;
+  }
+
+  /**
+   * Whether `path` matches the regex `pattern`. A bad regex never matches instead of throwing, so one typo in a rule
+   * doesn't fail every request (`RTIHelperService.validateActionOnSuspicious` reports it).
+   * Known limit: `pattern` must be a string, and that is not checked. Like `String.prototype.match`, it turns any other
+   * value into a regex: `undefined` (a rule without a path) matches every path, `null` the text "null", a number its
+   * digits. See ActionOnSuspiciousRule.path.
+   * @param path the request path
+   * @param pattern a regex source, e.g. `"^/login$"`
+   */
+  pathMatches(path: string, pattern: string): boolean {
+    try {
+      return path.match(pattern) !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The message of anything thrown, for logging in a catch. Never throws itself: code can throw undefined, null or any
+   * object, and reading `.message` on those (or `String()` on a null-prototype object) would throw inside the catch and
+   * break the fail-open. An `Error` gives its message, anything else `String(e)`; if that throws,
+   * `Object.prototype.toString` (e.g. `[object Object]`); if even that throws (a hostile Proxy), `"unknown error"`.
+   * The message goes through `String()` too: code can set it to anything, and a Symbol there would make the
+   * caller's template literal throw.
+   * @param e the value caught
+   */
+  errorMessage(e: unknown): string {
+    try {
+      return String(e instanceof Error ? e.message : e);
+    } catch {
+      try {
+        return Object.prototype.toString.call(e);
+      } catch {
+        return "unknown error";
+      }
+    }
+  }
+
+  /**
+   * Parses a raw Cookie header string and extracts the three CHEQ RTI cookies.
+   * Uses substring (not split) so base64-padded values with `=` are preserved intact.
+   *
+   * Edge cases:
+   * - Empty string or no matching cookies → all three fields are `undefined`
+   * - Cookie present but with an empty value (e.g. `_cq_s=`) → field is `undefined`
+   * - `_cq_se` (challenge session cookie) does NOT match `_cq_s` — prefix is exact
+   * - Duplicate cookie names → first occurrence wins
+   *
+   * @param cookieHeader raw Cookie header value (e.g. `"_cq_duid=abc; _cq_s=xyz=="`)
+   * @returns object with `duidCookie`, `pvidCookie`, `sCookie` — each `undefined` when absent
+   */
+  parseCookies(cookieHeader: string): { duidCookie?: string; pvidCookie?: string; sCookie?: string } {
+    if (!cookieHeader) {
+      return {};
+    }
+
+    // NOTE: does not normalize spaces around '=' (e.g. "name = value") — RFC 6265 forbids it so compliant servers won't send it
+    const cookies = cookieHeader.split(";").map(c => c.trim());
+    
+    // duidCookie and pvidCookie are v4.0 cookies, sCookie is a v4.1 cookie
+    return {
+      duidCookie: this.getCookieValue(cookies, "_cq_duid="),
+      pvidCookie: this.getCookieValue(cookies, "_cq_pvid="),
+      sCookie:    this.getCookieValue(cookies, "_cq_s="),
+    };
+  }
+
+  /**
+   * Extracts a cookie value from a pre-split cookie array by exact prefix match.
+   * The `nameWithEqualSign` parameter must include the trailing `=` (e.g. `"_cq_s="`),
+   * which prevents false-positive matches on similarly-named cookies (e.g. `_cq_se`).
+   *
+   * Edge cases:
+   * - Cookie not found → `undefined`
+   * - Cookie present but with an empty value (e.g. `_cq_s=`) → `undefined` (falsy)
+   * - Values containing `=` (e.g. base64 padding) → preserved intact via `substring`
+   * - Duplicate names → first occurrence wins
+   *
+   * @param cookies pre-split and trimmed cookie tokens (e.g. from `cookieHeader.split(";").map(c => c.trim())`)
+   * @param nameWithEqualSign cookie name including `=` (e.g. `"_cq_duid="`)
+   * @returns the cookie value, or `undefined` when absent or empty
+   */
+  getCookieValue(cookies: string[], nameWithEqualSign: string): string | undefined {
+    // NOTE: does not strip surrounding quotes from values (e.g. name="value") — our cookies never use quoted values
+    return cookies.find(c => c.startsWith(nameWithEqualSign))?.substring(nameWithEqualSign.length) || undefined;
+  }
+
+  /**
+   * Returns CHEQ cookie value
+   * @param cookie
+   */
+  getCheqCookie(cookie: string) {
+    return !cookie
+        ? undefined
+        : (
+            cookie
+            .split(';')
+            .map(c => c.trim())
+            .find(c => c.includes(RTIParams.CHEQ_COOKIE_NAME)) || ''
+        ).substring(RTIParams.CHEQ_COOKIE_NAME.length + 1);
+  }
+
+  /**
+   * Returns capitalized string and substrings
+   * @param str
+   * @param splitter
+   */
+  capitalize(str = '', splitter = ' ') {
+    return str
+        .split(splitter)
+        .map(s => `${s.charAt(0).toUpperCase()}${s.substring(1)}`)
+        .join(splitter);
+  }
+
+  /**
+   * Returns header ignoring case
+   * @param headers
+   * @param name
+   * @param defaultValue
+   */
+  getHeaderByName(headers: HeadersMap, name = '', defaultValue: string | number | undefined = undefined) {
+    return headers[name.toLowerCase()] || headers[this.capitalize(name, '-')] || defaultValue;
+  }
+
+  /**
+   * Parses a comma-separated string of integers into a number array.
+   * Non-numeric entries and empty segments are silently skipped.
+   * Returns undefined when the input is absent or yields no valid numbers.
+   * @param val comma-separated string (e.g. "4,5,6")
+   */
+  static parseNumberList(val: string | undefined): number[] | undefined {
+    if (!val) {
+      return undefined;
+    }
+    const nums = val.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+    return nums.length > 0 ? nums : undefined;
+  }
+
+  /**
+   * Parses a comma-separated string into a string array.
+   * Empty and whitespace-only segments are filtered out.
+   * Returns undefined when the input is absent, blank, or yields no non-empty strings.
+   * @param val comma-separated string (e.g. "/health,/ping")
+   */
+  static parseStringList(val: string | undefined): string[] | undefined {
+    if (!val) {
+      return undefined;
+    }
+    const items = val.split(',').map(s => s.trim()).filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+
+  /**
+   * Accepts a challenge page's `original_url` only when it is a same-site absolute path, so the redirect after a
+   * passed challenge stays on this site.
+   *
+   * It arrives as a query parameter, so any link can carry any value. Reflected into `Location` it would turn a
+   * PASSED challenge into an open redirect: a strong phishing tool, since the victim really did just prove they are
+   * human on the genuine site. Rejected:
+   * - anything not starting with `/` (`https://evil.com`, `evil.com`, `javascript:...`)
+   * - `//host` and `/\host`: browsers read both as protocol-relative and leave the site despite the leading slash
+   * - any ASCII control character, anywhere. Browsers delete tab, LF and CR from a URL before parsing it, so
+   *   `/<TAB>/evil.com` passes the two checks above yet resolves to `//evil.com` - off-site whenever `Location` is
+   *   relative (CloudFront without a Host header). CR/LF would also split the `Location` header. Rejecting, rather
+   *   than stripping, avoids re-checking the result; other control characters are invalid in a header anyway.
+   *
+   * The value must already be decoded: a still-encoded `%09` is literal text to the browser and harmless.
+   *
+   * @param raw the decoded `original_url` value
+   * @returns `raw` when safe, otherwise `undefined` so the caller falls back to the current request path
+   */
+  static safeReturnPath(raw: string | null | undefined): string | undefined {
+    // [\x00-\x1F\x7F]: the 33 ASCII control characters (NUL..US, plus DEL) - tab, LF and CR among them
+    if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\') || /[\x00-\x1F\x7F]/.test(raw)) {
+      return undefined;
+    }
+    return raw;
+  }
+
+  /**
+   * Reduces a host to its bare lowercase name, so two ways of writing one host compare equal - e.g. a request's `Host`
+   * header and the `hostname` a CAPTCHA provider reports for a solved token. Neither should carry more than
+   * `host[:port]`, but a client sends any text it likes, so both sides go through this. It fails closed: a value with
+   * no host left (only a scheme, a port, userinfo...) becomes `''`, which callers must treat as no host. Strips:
+   * - the case, and surrounding whitespace
+   * - a scheme: `https://shop.com` → `shop.com`
+   * - anything from the first `/`, `?` or `#`: `shop.com/page` → `shop.com`
+   * - userinfo, up to the last `@`: `user:pass@shop.com` → `shop.com`
+   * - the port and anything after it: `shop.com:443` → `shop.com`. An IPv6 literal keeps its brackets and loses
+   *   only what follows them: `[2001:db8::1]:8443` → `[2001:db8::1]`
+   * - trailing dots (the DNS root): `shop.com.` → `shop.com`
+   *
+   * Idempotent: `normalizeHost(normalizeHost(x)) === normalizeHost(x)`. The result never contains `/ ? # @`, has no
+   * `:` outside IPv6 brackets, and does not start or end with whitespace or end with a dot.
+   *
+   * @param value the raw host, or `null` / `undefined` when absent
+   * @returns the bare host, `''` when nothing is left
+   */
+  static normalizeHost(value: string | null | undefined): string {
+    let host = (value ?? '')
+      .toLowerCase()
+      .trim()
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+      .replace(/[/?#].*$/, '')
+      .replace(/^.*@/, '')
+      .replace(/^\s+/, '');
+
+    if (host.startsWith('[') && host.includes(']')) {
+      host = host.slice(0, host.indexOf(']') + 1);
+    } else {
+      host = host.replace(/:.*$/, '');
+    }
+
+    return host.replace(/[\s.]+$/, '');
+  }
+
+  /** Logged in place of a secret value (see {@link redactHeaderValue}). */
+  static readonly REDACTED = '[REDACTED]';
+
+  /** Headers whose whole value is a secret: the challenge session token (`x-cheq-challenge`) and credentials. */
+  private static readonly SECRET_HEADERS = new Set(['x-cheq-challenge', 'authorization', 'proxy-authorization']);
+
+  /**
+   * The names of the cookies in one or more Cookie header values, for logging: `"_ga, _cq_duid, _cq_se"`. Debug logs
+   * must never show a value: the site's own login and session cookies, or the challenge session token.
+   *
+   * Split at `;` only. A cookie without `=` is all value (browsers read it as a cookie with an empty name), so it shows
+   * as {@link REDACTED}. Two Cookie headers joined with `", "` (as some header maps do) hide the second header's first
+   * name inside the first value: that name is not shown, and neither is any value.
+   *
+   * @param cookieHeaders one Cookie header value, several (a client can split cookies over several headers), or the
+   *   already split cookies
+   */
+  cookieNames(cookieHeaders: string | string[]): string {
+    return [cookieHeaders].flat().join(';').split(';')
+      .map(cookie => cookie.trim())
+      .filter(Boolean)
+      .map(cookie => cookie.includes('=') ? cookie.substring(0, cookie.indexOf('=')).trim() : RTIStatelessUtils.REDACTED)
+      .join(', ');
+  }
+
+  /**
+   * A header value as it may be logged: cookie names only for `cookie` ({@link cookieNames}), {@link REDACTED} for
+   * `x-cheq-challenge`, `authorization` and `proxy-authorization`, any other header unchanged. The name is matched
+   * case-insensitively: CDNs and header maps spell it differently.
+   */
+  redactHeaderValue(name: string, value: string): string {
+    const lower = name.toLowerCase();
+    if (lower === 'cookie') {
+      return this.cookieNames(value);
+    }
+    return RTIStatelessUtils.SECRET_HEADERS.has(lower) ? RTIStatelessUtils.REDACTED : value;
+  }
+
+  /**
+   * The page the visitor came from, when it is on this site: the Referer's path and query (without `?`). `undefined`
+   * when there is no Referer, it is on another host, or it is not a URL. Used to build a CAPTCHA page for a request
+   * with a body, so the visitor is back on the form after solving it.
+   * @param referer the Referer header value
+   * @param host the request's Host header value
+   */
+  sameSiteReferer(referer: string | null | undefined, host: string | null | undefined): { path: string; query: string } | undefined {
+    const ownHost = RTIStatelessUtils.normalizeHost(host);
+    if (!referer || !ownHost) {
+      return undefined;
+    }
+    try {
+      const url = new URL(referer);
+      if (RTIStatelessUtils.normalizeHost(url.host) !== ownHost) {
+        return undefined;
+      }
+      return { path: url.pathname, query: url.search.replace(/^\?/, '') };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The request header that gives the origin the original Referer after a solved CAPTCHA (see originalReferer). */
+  static readonly ORIGINAL_REFERER_HEADER = 'x-cheq-original-referer';
+
+  /** The longest Referer carried through a CAPTCHA: the most GA4 keeps for page_referrer. A longer one is cut. */
+  static readonly MAX_ORIGINAL_REFERER_LENGTH = 420;
+
+  /**
+   * The Referer to carry through a CAPTCHA, the way a browser sends it by default (strict-origin-when-cross-origin):
+   * from this host, the full URL without the #fragment; from another host, only its origin, written as browsers send
+   * it (`https://www.google.com/`).
+   * Cut to {@link MAX_ORIGINAL_REFERER_LENGTH} characters, never in the middle of an encoded character.
+   * `undefined` when there is none, or it is not an http(s) URL.
+   * @param referer the Referer (or the value the challenge page carried)
+   * @param host the request's Host header value
+   */
+  originalReferer(referer: string | null | undefined, host: string | null | undefined): string | undefined {
+    if (!referer) {
+      return undefined;
+    }
+    let url: URL;
+    try {
+      url = new URL(referer);
+    } catch {
+      return undefined;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return undefined;
+    }
+    const ownHost = RTIStatelessUtils.normalizeHost(host);
+    const sameHost = ownHost !== '' && RTIStatelessUtils.normalizeHost(url.host) === ownHost;
+    // Built from the parsed URL, so no user:password@ and no #fragment.
+    const value = sameHost ? `${url.origin}${url.pathname}${url.search}` : `${url.origin}/`;
+    return this.cutEncoded(value, RTIStatelessUtils.MAX_ORIGINAL_REFERER_LENGTH);
+  }
+
+  /**
+   * The value of the `_cq_ref` cookie: `{return URL}|{Referer}`, both URL-encoded, so neither can contain the `|`.
+   * The format of version 1.0.0, kept so sites that read it (the part after `|`) keep working on every CDN.
+   * @param returnUrl the page the visitor lands on after the CAPTCHA (path, query)
+   * @param referer where they came from ({@link originalReferer})
+   */
+  originalRefererCookieValue(returnUrl: string, referer: string): string {
+    return `${encodeURIComponent(returnUrl)}|${encodeURIComponent(referer)}`;
+  }
+
+  /**
+   * A safe cookie `Path` attribute for `path`: the path itself, or `/` when it has a character a cookie attribute
+   * can't hold (`;`, `,`, whitespace, control characters) or does not start with `/`.
+   * @param path a URL path, without query or fragment
+   */
+  cookiePath(path: string): string {
+    return /^\/[^;,\s\x00-\x1F\x7F]*$/.test(path) ? path : '/';
+  }
+
+  /**
+   * The expiry (ms since 1970) of a signed cookie we issued, or `undefined`. Only the exact spelling we write is
+   * accepted, `${expiresAt}` of a safe integer: "123abc", "0123", " 123", "+123", "1e13" or "12.0" read as numbers but
+   * were not written by us, so the round trip rejects them. Does not check whether it is past.
+   * @param value the expiry part of the cookie
+   */
+  parseExpiresAt(value: string | undefined): number | undefined {
+    if (!value) {
+      return undefined;
+    }
+    const expiresAt = Number(value);
+    return Number.isSafeInteger(expiresAt) && String(expiresAt) === value ? expiresAt : undefined;
+  }
+
+  // Cuts an encoded URL to `max` characters, dropping a %XX left half done, so the result still decodes.
+  private cutEncoded(value: string, max: number): string {
+    let cut = value.slice(0, max).replace(/%[0-9A-Fa-f]?$/, '');
+    // One character can be several %XX (é is %C3%A9): drop the last ones until the trailing run decodes.
+    let run = cut.match(/(?:%[0-9A-Fa-f]{2})+$/)?.[0];
+    while (run && !this.decodes(run)) {
+      cut = cut.slice(0, -3);
+      run = run.slice(0, -3);
+    }
+    return cut;
+  }
+
+  private decodes(value: string): boolean {
+    try {
+      decodeURIComponent(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The query parameter that carries the Turnstile token when the challenge page's form is submitted. */
+  static readonly TURNSTILE_RESPONSE_QUERY_PARAM = 'cf-turnstile-response';
+
+  /** Query parameters whose value is a secret: the Turnstile token (single use, but a credential until it is spent). */
+  private static readonly SECRET_QUERY_PARAMS = new Set([RTIStatelessUtils.TURNSTILE_RESPONSE_QUERY_PARAM]);
+
+  /**
+   * A secret as it may be logged: its first and last 4 characters (`abcd****wxyz`), enough to match two log lines
+   * but not to use it. A value of 12 characters or less is all `****`, so a short secret is never mostly shown.
+   */
+  maskSecret(value: string): string {
+    return value.length > 12 ? `${value.slice(0, 4)}****${value.slice(-4)}` : '****';
+  }
+
+  /**
+   * A raw query string (no leading `?`) as it may be logged: the secret parameters' values masked
+   * ({@link maskSecret}), everything else kept exactly as received.
+   */
+  redactQueryString(querystring: string): string {
+    return querystring.replace(/(^|&)([^=&]*)=([^&]*)/g, (match, separator: string, name: string, value: string) =>
+      RTIStatelessUtils.SECRET_QUERY_PARAMS.has(name) ? `${separator}${name}=${this.maskSecret(value)}` : match);
+  }
+
+  /** A URL as it may be logged: its query string redacted ({@link redactQueryString}). */
+  redactUrl(url: string): string {
+    const queryStart = url.indexOf('?');
+    if (queryStart < 0) {
+      return url;
+    }
+    const hashStart = url.indexOf('#', queryStart);
+    const queryEnd = hashStart < 0 ? url.length : hashStart;
+    return url.slice(0, queryStart + 1) + this.redactQueryString(url.slice(queryStart + 1, queryEnd)) + url.slice(queryEnd);
+  }
+
+  /**
+   * `JSON.stringify(payload)` for a debug log, redacted: `apiKey` and `tagHash` masked ({@link maskSecret}),
+   * `endUserParams.headers` ({@link redactHeaderValue}) and the token in `endUserParams.requestUrl` ({@link redactUrl}).
+   * Only the log changes: `payload` is neither changed nor copied deeply, and the real one is still sent to RTI.
+   * `duidCookie`, `pvidCookie` and `sCookie` are kept: they are CHEQ's own ids, needed to debug RTI.
+   *
+   * @param payload the RTI request about to be sent
+   */
+  stringifyRedactedPayload(payload: RTIRequest): string {
+    return JSON.stringify(payload, (key, value) => {
+      if ((key === 'apiKey' || key === 'tagHash') && typeof value === 'string') {
+        return this.maskSecret(value);
+      }
+      if (key === 'requestUrl' && typeof value === 'string') {
+        return this.redactUrl(value);
+      }
+      if (key === 'headers' && value && typeof value === 'object' && !Array.isArray(value)) {
+        const redacted: RequestHeaders = {};
+        for (const [name, headerValue] of Object.entries(value as RequestHeaders)) {
+          redacted[name] = typeof headerValue === 'string' ? this.redactHeaderValue(name, headerValue) : headerValue;
+        }
+        return redacted;
+      }
+      return value;
+    });
+  }
+
+  /**
+   * Maximum length of the `rule-name` field. Rule names are operator-defined free text
+   * with no length bound, and the whole header shares the CDN's header size budget.
+   */
+  private static readonly RULE_NAME_MAX_LENGTH = 128;
+
+  /**
+   * Makes a rule name safe to carry inside a `;`-delimited header value.
+   *
+   * `decision.ruleName` is operator-defined free text, so it can contain anything:
+   * - CR/LF is a header-injection vector. Cloudflare's `Headers.set` throws on it, but
+   *   Akamai's `setHeader` and CloudFront's header array do not - dropped here along
+   *   with every other control and non-ASCII character.
+   * - a literal `;` would split the field and desync any parser - mapped to `,`.
+   * - unbounded length - truncated to {@link RULE_NAME_MAX_LENGTH}.
+   *
+   * `=` is deliberately left alone: `rule-name` is the last field, and parsers split on
+   * `;` first and then on the FIRST `=`, so an embedded `=` stays inside the value.
+   *
+   * @param ruleName raw {@link Decision.ruleName}, which is `null` when no rule matched
+   * @returns printable-ASCII, delimiter-free, length-capped text (`''` when absent)
+   */
+  private static sanitizeRuleName(ruleName: string | null): string {
+    if (!ruleName) {
+      return '';
+    }
+    return ruleName
+      // [^\x20-\x7E]: anything outside printable ASCII (space to '~') - controls, DEL and all non-ASCII
+      .replace(/[^\x20-\x7E]/g, '')
+      .replace(/;/g, ',')
+      .substring(0, RTIStatelessUtils.RULE_NAME_MAX_LENGTH);
+  }
+
+  /**
+   * Builds the `x-cheq-rti-result` header value from an RTI response.
+   *
+   * Format: `version=X;verdict=Y;threat-type-code=Z;ids={...}`
+   * With `includeDebugData`: `...;ids={...};reasons=N,N,N;rule-name=S`
+   *
+   * @param rtiResponse the RTI response object
+   * @param includeDebugData appends the detection reason codes and the name of the rule
+   *   that produced the verdict. Off by default, so every caller that omits it gets a
+   *   byte-for-byte unchanged header. Only the Akamai integration opts in, per request
+   *   via the `PMUSER_CHEQ_RTI_DEBUG_DATA` property variable.
+   */
+  buildRtiResultHeader(rtiResponse: RTIResponse, includeDebugData = false): string {
+    const parts = [
+      `version=${rtiResponse.metadata.version}`,
+      `verdict=${rtiResponse.decision.verdict}`,
+      `threat-type-code=${rtiResponse.classification.code}`,
+      `ids=${JSON.stringify(rtiResponse.ids)}`,
+    ];
+
+    if (includeDebugData) {
+      parts.push(`reasons=${rtiResponse.cheqDetection.reasons.join(',')}`);
+      parts.push(`rule-name=${RTIStatelessUtils.sanitizeRuleName(rtiResponse.decision.ruleName)}`);
+    }
+
+    return parts.join(';');
+  }
+}

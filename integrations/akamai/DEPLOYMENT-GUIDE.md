@@ -225,7 +225,9 @@ province or region of the request). There is no PMUSER variable for it and nothi
 
 **Verifying.** With `PMUSER_CHEQ_DEBUG=true`, request a staging URL with
 `Pragma: akamai-x-ew-debug` (Step 4 below) — the worker logs the entire outbound payload on a
-`[cheq] payload:` line, so you can read off exactly which of these fields are populated.
+`[cheq] payload:` line, so you can read off exactly which of these fields are populated. (Should a `cookie`,
+`authorization`, `proxy-authorization` or `x-cheq-challenge` header ever be in it, the log shows cookie names only and
+`[REDACTED]` for the others; RTI still receives the real values.)
 
 ### 2f. Save and activate
 
