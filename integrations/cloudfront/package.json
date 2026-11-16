@@ -1,6 +1,6 @@
 {
   "name": "cheq-rti-integration-cloudfront",
-  "version": "0.2.0",
+  "version": "1.0.1",
   "scripts": {
     "compile": "tsc",
     "test": "tsc && vitest --reporter=verbose --watch false",
