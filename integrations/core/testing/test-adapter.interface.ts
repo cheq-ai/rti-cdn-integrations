@@ -97,9 +97,9 @@ export interface TestAdapter {
     name: string;
     /**
      * true: a valid challenge session (validateChallenge → true) skips RTI and passes the request through
-     * untouched (Cloudflare, Akamai). false: RTI always runs, and a valid session only waives the CAPTCHA
-     * (CloudFront). The shared tests for the old behaviour run only when this is true; CloudFront covers
-     * the new behaviour in its own spec. Flip it when a CDN moves to the new behaviour.
+     * untouched (Akamai). false: RTI always runs, and a valid session only waives the CAPTCHA
+     * (CloudFront, Cloudflare). The shared tests for the old behaviour run only when this is true; CloudFront
+     * and Cloudflare cover the new behaviour in their own specs. Flip it when a CDN moves to the new behaviour.
      */
     validChallengeSkipsRti: boolean;
     invoke(options?: InvokeOptions): Promise<NormalizedResult>;

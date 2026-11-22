@@ -74,8 +74,8 @@ Every request follows the same path. Only the adapter layer differs per CDN.
    shouldIgnore(path) ─────────────────── match? ──▶ pass to origin
          │
          ▼
-   validateChallenge(request) ─────────── valid? ──▶ pass to origin   (Cloudflare, Akamai;
-         │                                                            CloudFront: see below)
+   validateChallenge(request) ─────────── valid? ──▶ pass to origin   (Akamai only;
+         │                                                            CloudFront, Cloudflare: see below)
          ▼
    getEventType(path, method)     →  customId1
    parseCookies(cookieHeader)     →  _cq_duid / _cq_pvid / _cq_s
@@ -99,12 +99,12 @@ Every request follows the same path. Only the adapter layer differs per CDN.
                    └── CAPTCHA       ──▶ config.challenge(request, response)
 ```
 
-CloudFront differs: it does not call `validateChallenge` before RTI. It always calls RTI, and checks
+CloudFront and Cloudflare differ: they do not call `validateChallenge` before RTI. They always call RTI, and check
 `validateChallenge` only in the `CAPTCHA` branch: a valid session waives the challenge and the request is
-forwarded with `x-cheq-rti-result` (the real verdict). Otherwise it calls
+forwarded with `x-cheq-rti-result` (the real verdict). Otherwise they call
 `config.challenge(request, response, addRtiResultHeader)`.
 
-CloudFront also routes the reply to its challenge page. The solved form is a new request with a new verdict, so in
+CloudFront and Cloudflare also route the reply to their challenge page. The solved form is a new request with a new verdict, so in
 `BLOCKING` mode, when the strategy is none (ALLOW) or `CAPTCHA` (`isChallengeReplyAllowed`) and the
 `config.isChallengeResponse` callback recognizes the request, it goes to `config.challenge` before the session waiver,
 which verifies it and redirects to the original URL. Any other strategy (blocks, 404s, redirects) is enforced as usual. When the request cannot be
@@ -147,10 +147,19 @@ reference in `turnstile-challenge-example.ts`; Akamai ships `cheq-challenge.ts` 
 
 Every error path passes the request to origin: RTI timeout, network failure, malformed
 response, a throwing `validateChallenge`, a throwing `challenge`, an unrecognized action
-strategy. On CloudFront a throwing `isChallengeResponse` counts as "not a reply", and a reply whose RTI call failed
-is still passed to `challenge` (if that throws too, it is passed to origin). Logging in a catch uses
+strategy. On CloudFront and Cloudflare a throwing `isChallengeResponse` counts as "not a reply", and a reply whose RTI
+call failed is still passed to `challenge` (if that throws too, it is passed to origin). Logging in a catch uses
 `errorMessage()` (from `RTIStatelessUtils`, called through `RTIHelperService`), which never throws, whatever was thrown. A broken integration degrades to a no-op rather than taking the customer's site
 down. Cloudflare reinforces this at the platform level with `passThroughOnException()`.
+
+On Cloudflare the origin call is outside our error handling: `forwardToOrigin` in `index.ts` runs after `handle` has
+decided, so a failing origin is neither logged as our error nor called a second time by this Worker. Cloudflare's
+pass-through has limits of its own: when the Worker fails (an exception it does not catch, or a failed origin call),
+it forwards the visitor's original request with the headers the client sent, including any `x-cheq-*` headers, and
+the Worker cannot change that request. Its body may be missing: the Worker moves the body into the copy it forwards,
+and Cloudflare's documentation says the pass-through "cannot send the body again" once it has been consumed (not seen
+here: `wrangler dev` answers every exception with its own 500). See "What the Worker cannot clean" in
+`integrations/cloudflare/README.md`.
 
 ### Cookies
 
@@ -204,8 +213,8 @@ x-cheq-rti-result: version=4.1;verdict=benign;threat-type-code=0;ids={"rayId":".
 
 This is a *request* header, so it is not visible to the browser — it is there for origin
 application logic and CDN access logs. Block and redirect responses deliberately omit it; those
-responses already carry the reference IDs in the page body. One exception: CloudFront passes
-`config.challenge` an `addRtiResultHeader` function, and its Turnstile example adds the header to the
+responses already carry the reference IDs in the page body. One exception: CloudFront and Cloudflare pass
+`config.challenge` an `addRtiResultHeader` function, and their Turnstile examples add the header to the
 302 sent to the browser after a solved challenge.
 
 Those four fields are what every integration emits. `buildRtiResultHeader` takes an optional
@@ -222,14 +231,20 @@ unchanged.
 
 The cleanest reference implementation, and the best starting point for reading the codebase.
 
-- `passThroughOnException()` guarantees fail-open at the platform level.
-- `context.waitUntil()` fires telemetry without adding latency to the request.
+- `passThroughOnException()` fails open at the platform level for an exception the Worker does not catch. Cloudflare's
+  documentation adds that it "cannot send the body again" once the body has been consumed (see "Fail open, always"
+  above).
+- `context.waitUntil()` fires telemetry and error logs without adding latency to the request.
 - JA3 fingerprint comes free from `request.cf.botManagement.ja3Hash`.
 - Config is a static object in `src/config.ts`, edited before `wrangler deploy`.
 
-`index.ts` carries paired `OPTION 1` (local/demo, proxy to a fixed origin) and `OPTION 2`
-(production, pass through as-is) comment blocks. They must be switched together — mixing them
-sends ignored paths to one origin and allowed traffic to another.
+In `index.ts`, `handle` decides and never calls the origin: it returns our own answer (a block page, a
+redirect, a challenge page) or the request to forward. The Worker entry makes the only origin call, in
+`forwardToOrigin`, which holds the single demo switch: `OPTION 1` (local/demo, proxy to a fixed origin)
+or `OPTION 2` (production, pass through as-is).
+
+`turnstile-challenge-example.ts` is a port of CloudFront's Turnstile example, on Web Crypto and `fetch`.
+It keeps one thing in memory, the pause counter of its CAPTCHA, per isolate.
 
 ### CloudFront — Lambda@Edge
 
@@ -436,10 +451,11 @@ Coverage thresholds are 95% statements / 90% branches / 95% functions / 95% line
 1. Create `integrations/<cdn>/` with its own `package.json`, `tsconfig.json`,
    `vitest.config.ts`.
 2. Extend `Config` with any CDN-specific fields (see `AkamaiConfig`, `CloudfrontConfig`).
-3. Write the adapter: collect headers, build the `RTIRequest`, then drive the core pipeline in
-   order — `shouldIgnore` → `validateChallenge` → `getEventType` / `parseCookies` → `callRTI` →
-   `getAction` → `getActionStrategy` (Cloudflare, Akamai). CloudFront instead calls RTI first and
-   checks `validateChallenge` only for a `CAPTCHA` strategy; new adapters should follow CloudFront.
+3. Write the adapter: collect headers, build the `RTIRequest`, then drive the core pipeline. CloudFront
+   and Cloudflare call RTI first — `shouldIgnore` → `getEventType` / `parseCookies` → `callRTI` →
+   `getAction` → `getStrategyForRequest` — and check `validateChallenge` only for a `CAPTCHA` strategy;
+   new adapters should follow them. Akamai has the old order: `shouldIgnore` → `validateChallenge` →
+   `getEventType` / `parseCookies` → `callRTI` → `getAction` → `getActionStrategy`.
 4. Reuse `core/services/rti.service.ts` if the runtime has `fetch()`. On a low-CPU Node runtime
    (like 128 MB Lambda@Edge), use `rti-https.service.ts` and `rti-https-logger.service.ts` instead:
    loading `fetch` on a cold start is slow enough to hit the RTI timeout. If neither fits, implement
