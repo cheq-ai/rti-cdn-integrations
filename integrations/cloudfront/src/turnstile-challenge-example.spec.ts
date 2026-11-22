@@ -191,6 +191,8 @@ describe('createTurnstileChallenge sessionTtlSeconds', () => {
         });
 
     it.each([1, 60, MAX_TTL])('issues a session with sessionTtlSeconds %j that validateChallenge then accepts', async (ttl) => {
+        // The clock stands still: a 1 s session issued, then checked more than 1 s later (a busy machine), is expired.
+        vi.spyOn(Date, 'now').mockReturnValue(Date.now());
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         const callbacks = build({ ...testSettings, sessionTtlSeconds: ttl });
         expect(warn).not.toHaveBeenCalled();
@@ -524,6 +526,9 @@ describe('validateChallenge', () => {
             it('accepts every issued spelling and rejects every other spelling of the same number, signatures all genuine', async () => {
                 // Arrange: future expiries of every length from 13 to 16 digits, round and not
                 const now = Date.now();
+                // The clock stands still for this test: `now + 1` is one millisecond away. If the real clock passes
+                // it before the expiry is checked (a busy machine), the issued value is rejected and the test fails.
+                vi.spyOn(Date, 'now').mockReturnValue(now);
                 const expiries = [now + 1, now + 300_000, now + 86_400_000, 9_999_999_999_999, 10_000_000_000_000,
                     123_456_789_012_345, 1_000_000_000_000_000, 8_000_000_000_000_001, Number.MAX_SAFE_INTEGER];
                 const respell = (s: string) => [
@@ -1003,12 +1008,38 @@ describe('challenge', () => {
             expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
         });
 
-        it('ends after siteverifyPauseSeconds', async () => {
+        it('ends after siteverifyPauseSeconds, and not 1 ms before', async () => {
             const cb = build(pauseSettings);
             failSiteverify();
             const start = Date.now();
             vi.spyOn(Date, 'now').mockReturnValue(start);
             for (let i = 0; i < 3; i++) await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+            vi.spyOn(Date, 'now').mockReturnValue(start + 59_999);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+            vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+        });
+
+        it('without siteverifyErrorsToPause and siteverifyPauseSeconds: pauses on the 3rd error in a row, for 60 s, and logs the pause once', async () => {
+            // Arrange
+            const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+            stubSiteverifyClient(vi.fn().mockRejectedValue(new Error('down')));
+            const start = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(start);
+            const cb = build(testSettings);
+            const fail = () => cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+
+            // Act & Assert
+            await fail();
+            await fail();
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+            await fail();
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+            expect(error.mock.calls.filter(call => String(call[0]).includes('paused'))).toEqual([
+                ['[turnstile] siteverify (or answering the reply) failed 3 times in a row: CAPTCHA paused for 60s'],
+            ]);
+            vi.spyOn(Date, 'now').mockReturnValue(start + 59_999);
             expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
             vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
             expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
@@ -1048,16 +1079,31 @@ describe('challenge', () => {
             expect(warn).not.toHaveBeenCalled();
         });
 
-        it.each([0, -1, 1.5])('warns and uses the default for an invalid siteverifyPauseSeconds %s', (value) => {
+        it.each([0, -1, 1.5])('warns and pauses for the default 60 s for an invalid siteverifyPauseSeconds %s', async (value) => {
             const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-            build({ ...testSettings, siteverifyPauseSeconds: value });
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: 1, siteverifyPauseSeconds: value });
             expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid siteverifyPauseSeconds'));
+
+            failSiteverify();
+            const start = Date.now();
+            vi.spyOn(Date, 'now').mockReturnValue(start);
+            await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            vi.spyOn(Date, 'now').mockReturnValue(start + 59_999);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
+            vi.spyOn(Date, 'now').mockReturnValue(start + 60_000);
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
         });
 
-        it.each([-1, 1.5, NaN])('warns and uses the defaults for an invalid siteverifyErrorsToPause %s', (value) => {
+        it.each([-1, 1.5, NaN])('warns and pauses after the default 3 errors for an invalid siteverifyErrorsToPause %s', async (value) => {
             const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-            build({ ...testSettings, siteverifyErrorsToPause: value });
+            const cb = build({ ...testSettings, siteverifyErrorsToPause: value });
             expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid siteverifyErrorsToPause'));
+
+            failSiteverify();
+            for (let i = 0; i < 2; i++) await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(false);
+            await cb.challenge(buildTurnstileRequest(errorQuery, 'example.com'), buildRTIResponse());
+            expect(await cb.validateChallenge(buildRequest(), false)).toBe(true);
         });
     });
 
@@ -1335,6 +1381,30 @@ describe('challenge', () => {
         expect(page.body).toContain('data-timeout-callback="onTurnstileReset"');
         expect(page.body).toContain('data-retry-interval="2000"');
         expect(page.body).toContain("addEventListener('pageshow'");
+    });
+
+    it('on pageshow, resets the button, the spinner and the widget only when event.persisted is true', async () => {
+        // Arrange: the page's own script, run against a small fake DOM
+        const page = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        const script: string = page.body.match(/<script>([\s\S]*?)<\/script>/)[1];
+        const button = { disabled: false };
+        const spinner = { classList: { add: vi.fn(), remove: vi.fn() } };
+        const elements: Record<string, unknown> = { 'submit-btn': button, loading: spinner, 'captcha-form': { addEventListener: vi.fn() } };
+        let onPageshow: (event: { persisted: boolean }) => void = () => {};
+        const turnstile = { reset: vi.fn() };
+        const fakeWindow = { addEventListener: (type: string, listener: typeof onPageshow) => { if (type === 'pageshow') onPageshow = listener; }, turnstile };
+        new Function('document', 'window', 'location', script)({ getElementById: (id: string) => elements[id] }, fakeWindow, { hash: '' });
+
+        // Act & Assert: persisted false: nothing changes
+        onPageshow({ persisted: false });
+        expect(turnstile.reset).not.toHaveBeenCalled();
+        expect(button.disabled).toBe(false);
+
+        // Act & Assert: persisted true (the page came back as it was left): button off, no spinner, a new token
+        onPageshow({ persisted: true });
+        expect(turnstile.reset).toHaveBeenCalledOnce();
+        expect(button.disabled).toBe(true);
+        expect(spinner.classList.remove).toHaveBeenCalledWith('show');
     });
 
     it('connects to Cloudflare early and loads no Google Fonts', async () => {
@@ -1728,6 +1798,28 @@ describe('challenge token checks (hostname and action)', () => {
         const logged = [...warn.mock.calls, ...log.mock.calls].flat().join('\n');
         expect(warn).toHaveBeenCalled();
         expect(logged).not.toContain('valid-token');
+    });
+
+    it.each([
+        ['down', () => vi.fn().mockRejectedValue(new Error('siteverify unreachable'))],
+        ['a 503', () => vi.fn().mockResolvedValue({ status: 503, json: async () => ({}) })],
+        ['a 429', () => vi.fn().mockResolvedValue({ status: 429, json: async () => ({}) })],
+        ['a 400', () => vi.fn().mockResolvedValue({ status: 400, json: async () => ({}) })],
+    ])('never logs the token when siteverify is %s', async (_, siteverify) => {
+        // Arrange: a new instance, so these errors don't count toward the shared instance's pause
+        const consoleSpies = [vi.spyOn(console, 'error'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'log')]
+            .map(spy => spy.mockImplementation(() => {}));
+        stubSiteverifyClient(siteverify());
+        const token = 'turnstile-token-0123456789-secret';
+        const reply = buildTurnstileRequest(new URLSearchParams({ 'cf-turnstile-response': token }).toString(), 'shop.com');
+
+        // Act
+        await build(testSettings).challenge(reply, buildRTIResponse('ray-checks'));
+
+        // Assert: the error was logged, without the token
+        const logged = consoleSpies.flatMap(spy => spy.mock.calls).flat().map(String).join('\n');
+        expect(logged).toContain('[turnstile] siteverify');
+        expect(logged).not.toContain(token);
     });
 
     it('sends request.clientIp as remoteip', async () => {
@@ -2543,9 +2635,14 @@ describe('original Referer (_cq_ref)', () => {
         });
 
         it('HTML-escapes it', async () => {
-            const page = await challenge(withReferer('https://example.com/a?q="><script>x</script>'), buildRTIResponse()) as any;
-            expect(page.body).not.toContain('<script>x</script>');
-            expect(fieldOf(page.body, 'original_referer')).toBe('https://example.com/a?q=%22%3E%3Cscript%3Ex%3C/script%3E');
+            // "&" in a same-host query: the URL parser keeps it, so only the escaping turns it into "&amp;".
+            const page = await challenge(withReferer('https://example.com/list?a=1&b=2'), buildRTIResponse()) as any;
+            expect(page.body).toContain('name="original_referer" value="https://example.com/list?a=1&amp;b=2"');
+
+            // '"', '<' and '>': the URL parser percent-encodes them, so they never reach the page.
+            const injected = await challenge(withReferer('https://example.com/a?q="><script>x</script>'), buildRTIResponse()) as any;
+            expect(injected.body).not.toContain('<script>x</script>');
+            expect(fieldOf(injected.body, 'original_referer')).toBe('https://example.com/a?q=%22%3E%3Cscript%3Ex%3C/script%3E');
         });
 
         it.each([
@@ -2736,14 +2833,29 @@ describe('original Referer (originalRefererVia "header", the default)', () => {
         expect(build({ ...testSettings, sessionSigningSecret: 'another-secret' }).originalReferer!(landing(cookie))).toBeUndefined();
     });
 
-    it.each([
-        ['no |', '_cq_rf=123.abc'],
-        ['three parts', '_cq_rf=1.2.3|x'],
-        ['expiry not a number', '_cq_rf=abc.0123456789abcdef0123456789abcdef|x'],
-        ['expiry with a leading zero', `_cq_rf=0${Date.now() + 60000}.0123456789abcdef0123456789abcdef|x`],
-        ['bad encoding', `_cq_rf=${Date.now() + 60000}.0123456789abcdef0123456789abcdef|%E0%A4%A`],
-    ])('a cookie in another format (%s): undefined, no throw', (_name, cookie) => {
-        expect(build(testSettings).originalReferer!(landing(cookie))).toBeUndefined();
+    describe('a cookie in another format', () => {
+        // Signed with the right secret, for this landing page and client, so only the format check can refuse them. An
+        // expiry that is not a number is signed as null (what the code would sign without the check); one with a leading
+        // zero is signed for the number it spells.
+        const referer = 'https://www.google.com/';
+        const sign = (expiresAt: number | null) => createHmac('sha256', testSettings.sessionSigningSecret)
+            .update(JSON.stringify(['rf', expiresAt, referer, '/shop/item', BUILD_REQUEST_BINDING])).digest('hex').slice(0, 32);
+        const value = encodeURIComponent(referer);
+
+        it('signed the same way in the issued format, it is accepted', () => {
+            const expiresAt = Date.now() + 60_000;
+            expect(build(testSettings).originalReferer!(landing(`_cq_rf=${expiresAt}.${sign(expiresAt)}|${value}`))).toBe(referer);
+        });
+
+        it.each([
+            ['no |', (e: number) => `_cq_rf=${e}.${sign(e)}`],
+            ['three parts', (e: number) => `_cq_rf=${e}.${sign(e)}.junk|${value}`],
+            ['expiry not a number', () => `_cq_rf=abc.${sign(null)}|${value}`],
+            ['expiry with a leading zero', (e: number) => `_cq_rf=0${e}.${sign(e)}|${value}`],
+            ['bad encoding', (e: number) => `_cq_rf=${e}.${sign(e)}|%E0%A4%A`],
+        ])('%s: undefined, no throw', (_name, cookie) => {
+            expect(build(testSettings).originalReferer!(landing(cookie(Date.now() + 60_000)))).toBeUndefined();
+        });
     });
 
     it('a _cq_se signature never passes as a _cq_rf one', async () => {

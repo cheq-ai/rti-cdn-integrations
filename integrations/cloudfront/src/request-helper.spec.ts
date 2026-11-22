@@ -1129,7 +1129,8 @@ describe('request-helper handle', () => {
     describe('debug log redaction', () => {
         const COOKIE = 'a=secret1; _cq_se=1730000000000.sigabcdef0123|ray-se; _cq_duid=duid-123';
         const secretHeaders = { 'X-Cheq-Challenge': 'hdr-token-xyz', Authorization: 'Bearer sekret-auth' };
-        const SECRETS = ['secret1', '1730000000000.sigabcdef0123', 'sigabcdef0123', 'ray-se', 'hdr-token-xyz', 'sekret-auth'];
+        // The last two are the apiKey and the tagHash of the mocked config.
+        const SECRETS = ['secret1', '1730000000000.sigabcdef0123', 'sigabcdef0123', 'ray-se', 'hdr-token-xyz', 'sekret-auth', 'api-key', 'tag-hash'];
 
         const debugLogs = async (event: CloudFrontRequestEvent) => {
             (config as any).debug = true;
@@ -1145,7 +1146,7 @@ describe('request-helper handle', () => {
             return { result, lines, eventLog: line('Original CF Event'), payloadLog: line('RTI Request payload') };
         };
 
-        it('logs the event and the RTI payload without cookie values, the session token or authorization', async () => {
+        it('logs the event and the RTI payload without cookie values, the session token, authorization, the apiKey or the tagHash', async () => {
             // Act
             const { lines, eventLog, payloadLog } = await debugLogs(buildEvent('/page', 'example.com', '1.2.3.4', '', COOKIE, { extraHeaders: secretHeaders }));
 
@@ -1160,6 +1161,7 @@ describe('request-helper handle', () => {
             expect(payloadLog).toContain('"cookie":"a, _cq_se, _cq_duid"');
             expect(payloadLog).toContain('"x-cheq-challenge":"[REDACTED]"');
             expect(payloadLog).toContain('"authorization":"[REDACTED]"');
+            expect(payloadLog).toContain('"tagHash":"****","apiKey":"****"');
             // other headers are logged as they are
             expect(eventLog).toContain('"value":"Mozilla/5.0"');
             expect(payloadLog).toContain('"user-agent":"Mozilla/5.0"');

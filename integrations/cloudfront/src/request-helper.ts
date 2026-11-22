@@ -32,9 +32,13 @@ const ORIGINAL_REFERER_HEADER = RTIStatelessUtils.ORIGINAL_REFERER_HEADER;
 // Our block, 404 and redirect answers are never cached.
 const responseHeaders = new ResponseHeaders();
 
-// Once per cold start: a typo in actionOnSuspicious is ALLOW at run time, so say what to fix.
+// Once per cold start: each mistake the check finds in actionOnSuspicious, so it can be fixed. A mistake reported here
+// does not stop the Lambda (a shape TypeScript refuses, forced past it, can make the check itself throw: see
+// ActionOnSuspicious in core). A wrong method key in methods is not used, and a value that is not an Action counts as
+// ALLOW; in a rule, a bad regex never matches and a misspelled method is never matched, so the next rule or the
+// method's default applies, and that can be BLOCK.
 for (const problem of rtiHelperService.validateActionOnSuspicious()) {
-    console.warn(`[config] ${problem} (counts as ALLOW)`);
+    console.warn(`[config] ${problem} (see "actionOnSuspicious" in the README)`);
 }
 
 // Once per cold start: without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING

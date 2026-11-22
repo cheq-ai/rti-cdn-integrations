@@ -895,7 +895,11 @@ vendor outage. A fallback would have to trust the browser ("the widget failed"),
 
 **Only `GET` and `HEAD` are challenged in place.** A challenge page can't carry a request body through its redirect
 (login, checkout, a bank's 3D Secure return). For a `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict,
-`actionOnSuspicious` says what to do instead. Blocks, 404s and redirects from RTI still apply to every method.
+`actionOnSuspicious` says what to do instead. Blocks, 404s and redirects from RTI still apply to every method, except a
+block when `blockingStrategy` is `CAPTCHA`: that block has the CAPTCHA strategy, so a request with a body follows
+`actionOnSuspicious` too, and with the shipped `ALLOW` it is forwarded with `x-cheq-rti-result`. A site that wants those
+requests stopped sets `Action.BLOCK` or `Action.CHALLENGE` for their methods or paths (with this `blockingStrategy`,
+`Action.BLOCK` gives the CAPTCHA page too).
 
 #### actionOnSuspicious
 
@@ -920,8 +924,11 @@ actionOnSuspicious: {
 - `rules` match the path with a regex (like `ignorePaths`) and, optionally, a list of methods. They are checked in
   order; the first match wins over `methods`.
 - `OPTIONS` is the browser's CORS preflight, sent before a cross-site call. Blocking or challenging it breaks that call.
-- A typo (a method that isn't one of these five, a value that isn't an `Action`, a bad regex) is logged as a warning once
-  per cold start and counts as `ALLOW`, so it never blocks by mistake.
+- A typo is logged as a warning once per cold start (`[config] <problem> (see "actionOnSuspicious" in the README)`).
+  What it does depends on where it is. A key in `methods` that isn't one of these five is not used (a method left out
+  is `ALLOW`), and a value that isn't an `Action`, in `methods` or as a rule's `action`, counts as `ALLOW`. A rule with
+  a bad regex never matches, and a method misspelled in a rule's `methods` (`'post'`, `'PST'`) is never matched by it:
+  the next rule or the method's default applies, and that can be `BLOCK`.
 - **Known limit: keep exactly the shape shown above.** `config.ts` is TypeScript, which enforces it. A value forced past
   it (`as any`, or a config built in plain JS) is not checked when the Lambda runs:
   - **Every rule needs a `path`, written as a string** (`'^/login$'`, not `/^\/login$/`). JavaScript turns any other

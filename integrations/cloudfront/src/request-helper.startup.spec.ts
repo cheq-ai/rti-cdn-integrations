@@ -1,5 +1,5 @@
 // What request-helper logs when it loads (once per cold start). Each test loads a fresh copy against its own config.
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { Mode } from '../../core/models/mode.model';
 import { Action } from '../../core/models/action.model';
 
@@ -9,6 +9,16 @@ const loadRequestHelper = async (config: Record<string, unknown>) => {
     vi.doMock('./config', () => ({ config: { apiKey: 'k', tagHash: 't', keepHeadersNames: [], ...config } }));
     await vi.importActual<typeof import('./request-helper')>('./request-helper');
 };
+
+// The first load of the module graph is slow. Done here, outside the tests' 5 s timeout: on a busy machine it timed
+// out inside the first test, and its warning then landed in the next test's spy.
+beforeAll(async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await loadRequestHelper({});
+    vi.restoreAllMocks();
+    vi.doUnmock('./config');
+    vi.resetModules();
+}, 60_000);
 
 afterEach(() => {
     vi.restoreAllMocks();
@@ -44,17 +54,21 @@ describe('request-helper at load', () => {
         expect(warn).not.toHaveBeenCalled();
     });
 
-    it('warns once per actionOnSuspicious problem, saying it counts as ALLOW', async () => {
-        // Arrange: a method that is not a body method, and a value that is not an Action
+    it('warns once per actionOnSuspicious problem, pointing to "actionOnSuspicious" in the README', async () => {
+        // Arrange: a method that is not a body method, a value that is not an Action, and a rule whose path is not a regex
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
         // Act
-        await loadRequestHelper({ mode: Mode.BLOCKING, actionOnSuspicious: { methods: { GET: Action.BLOCK, POST: 9 } } });
+        await loadRequestHelper({
+            mode: Mode.BLOCKING,
+            actionOnSuspicious: { methods: { GET: Action.BLOCK, POST: 9 }, rules: [{ path: '[', action: Action.ALLOW }] },
+        });
 
         // Assert
         expect(warn.mock.calls).toEqual([
-            ["[config] actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS (counts as ALLOW)"],
-            ['[config] actionOnSuspicious.methods.POST: 9 is not an Action (counts as ALLOW)'],
+            [`[config] actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS (see "actionOnSuspicious" in the README)`],
+            ['[config] actionOnSuspicious.methods.POST: 9 is not an Action (see "actionOnSuspicious" in the README)'],
+            [`[config] actionOnSuspicious.rules[0].path: '[' is not a valid regex (see "actionOnSuspicious" in the README)`],
         ]);
     });
 

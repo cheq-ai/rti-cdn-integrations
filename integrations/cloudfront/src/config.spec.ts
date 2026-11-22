@@ -1,6 +1,6 @@
 // Tests the REAL shipped config.ts (the request-helper specs mock it). Each test loads a fresh copy with
 // vi.resetModules(), because config.ts calls createTurnstileChallenge (and may warn) while it loads.
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import { Mode } from '../../core/models/mode.model';
 import { Action } from '../../core/models/action.model';
 
@@ -15,7 +15,33 @@ afterEach(() => {
 });
 
 describe('shipped config.ts', () => {
-    it('leaves challenge, validateChallenge and isChallengeResponse undefined while the Turnstile secrets are REPLACE_ME, and warns once', async () => {
+    // These tests check config.ts as this repository ships it. A filled-in config.ts is not wrong, and "Verify config"
+    // (npm test) must pass for it: once apiKey, tagHash or a Turnstile secret is set, they are skipped.
+    let filledIn = false;
+    const FILLED_IN = 'config.ts is filled in';
+
+    // One load of the real config.ts, to read its five secrets. It also takes the slow first load of the module graph out
+    // of the tests' 5 s timeout: on a busy machine that load timed out, and its warning then landed in the next test.
+    beforeAll(async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            // The real createTurnstileChallenge, watched: the Turnstile settings are not exported.
+            const turnstileExample = await vi.importActual<typeof import('./turnstile-challenge-example')>('./turnstile-challenge-example');
+            const createTurnstileChallenge = vi.fn(turnstileExample.createTurnstileChallenge);
+            vi.doMock('./turnstile-challenge-example', () => ({ ...turnstileExample, createTurnstileChallenge }));
+            const config = await loadConfig();
+            const turnstile = createTurnstileChallenge.mock.calls[0]?.[0];
+            filledIn = [config.apiKey, config.tagHash, turnstile?.siteKey, turnstile?.secretKey, turnstile?.sessionSigningSecret]
+                .some(secret => secret !== 'REPLACE_ME');
+        } finally {
+            vi.restoreAllMocks();
+            vi.doUnmock('./turnstile-challenge-example');
+            vi.resetModules();
+        }
+    }, 60_000);
+
+    it('leaves challenge, validateChallenge and isChallengeResponse undefined while the Turnstile secrets are REPLACE_ME, and warns once', async ({ skip }) => {
+        skip(filledIn, FILLED_IN);
         vi.resetModules();
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -29,7 +55,8 @@ describe('shipped config.ts', () => {
         expect(warn).toHaveBeenCalledWith(expect.stringContaining('siteKey, secretKey, sessionSigningSecret'));
     });
 
-    it('passes the turnstile settings to createTurnstileChallenge and wires the four callbacks it returns', async () => {
+    it('passes the turnstile settings to createTurnstileChallenge and wires the four callbacks it returns', async ({ skip }) => {
+        skip(filledIn, FILLED_IN);
         vi.resetModules();
         const challenge = vi.fn();
         const validateChallenge = vi.fn();
@@ -58,7 +85,8 @@ describe('shipped config.ts', () => {
         expect('handleChallengeReply' in config).toBe(false);
     });
 
-    it('ships actionOnSuspicious with ALLOW for every body method and no rules: nothing changes until set', async () => {
+    it('ships actionOnSuspicious with ALLOW for every body method and no rules: nothing changes until set', async ({ skip }) => {
+        skip(filledIn, FILLED_IN);
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const config = await loadConfig();
         expect(config.actionOnSuspicious).toEqual({
@@ -67,7 +95,8 @@ describe('shipped config.ts', () => {
         });
     });
 
-    it('ships safe defaults', async () => {
+    it('ships safe defaults', async ({ skip }) => {
+        skip(filledIn, FILLED_IN);
         vi.resetModules();
         vi.spyOn(console, 'warn').mockImplementation(() => {});
 
