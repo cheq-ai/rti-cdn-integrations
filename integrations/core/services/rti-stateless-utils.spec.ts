@@ -1103,8 +1103,8 @@ describe('RTIStatelessUtils', () => {
         ['a C1 control (U+0080)', '\u0080'],
         ['a C1 control (U+009F)', '\u009F'],
         ['a no-break space (U+00A0)', ' '],
-        ['a line separator (U+2028)', ' '],
-        ['a paragraph separator (U+2029)', ' '],
+        ['a line separator (U+2028)', ''],
+        ['a paragraph separator (U+2029)', ''],
         ['a byte-order mark (U+FEFF)', '﻿'],
         ['a fullwidth solidus (U+FF0F)', '／'],
         ['a fullwidth reverse solidus (U+FF3C)', '＼'],
@@ -1325,6 +1325,79 @@ describe('RTIStatelessUtils', () => {
         expect(normalizeHost('.shop.com')).toBe('.shop.com');
         expect(normalizeHost('shop..com')).toBe('shop..com');
         expect(normalizeHost('shop\\com')).toBe('shop\\com');
+      });
+    });
+
+    describe('the tail it trims: dots and whatever \\s matches, nothing else', () => {
+      // Built from code points, so the source shows which character each row holds.
+      const NO_BREAK_SPACE = String.fromCharCode(0x00a0);
+      const BYTE_ORDER_MARK = String.fromCharCode(0xfeff);
+      const LINE_SEPARATOR = String.fromCharCode(0x2028);
+      const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+      const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000);
+      const ZERO_WIDTH_SPACE = String.fromCharCode(0x200b);
+
+      test.each([
+        ['a dot', '.'],
+        ['a space', ' '],
+        ['a tab', '\t'],
+        ['a line feed', '\n'],
+        ['a carriage return', '\r'],
+        ['a vertical tab', '\v'],
+        ['a form feed', '\f'],
+        ['a no-break space (U+00A0)', NO_BREAK_SPACE],
+        ['a byte-order mark (U+FEFF)', BYTE_ORDER_MARK],
+        ['a line separator (U+2028)', LINE_SEPARATOR],
+        ['a paragraph separator (U+2029)', PARAGRAPH_SEPARATOR],
+        ['an ideographic space (U+3000)', IDEOGRAPHIC_SPACE],
+      ])('trims %s at the end, also before a trailing dot', (_, ch) => {
+        // Act & Assert
+        expect(normalizeHost(`shop.com${ch}`)).toBe('shop.com');
+        expect(normalizeHost(`shop.com${ch}.`)).toBe('shop.com');
+      });
+
+      test.each([
+        ['dots, a space and a tab', 'shop.com. .\t.', 'shop.com'],
+        ['dots and Unicode spaces', `shop.com.${NO_BREAK_SPACE}.${IDEOGRAPHIC_SPACE}.${LINE_SEPARATOR}.`, 'shop.com'],
+        ['only dots and spaces', '. . .', ''],
+        ['only dots and Unicode spaces', `.${NO_BREAK_SPACE}.${PARAGRAPH_SEPARATOR}.${BYTE_ORDER_MARK}.`, ''],
+      ])('trims a mixed tail: %s (%j)', (_, value, expected) => {
+        // Act & Assert
+        expect(normalizeHost(value)).toBe(expected);
+      });
+
+      test.each([
+        ['a hyphen', 'shop.com-'],
+        ['an underscore', 'shop.com_'],
+        ['a zero-width space (U+200B, not matched by \\s)', `shop.com${ZERO_WIDTH_SPACE}`],
+      ])('keeps %s at the end', (_, host) => {
+        // Act & Assert
+        expect(normalizeHost(host)).toBe(host);
+      });
+    });
+
+    describe('long input', () => {
+      // The old tail trim, the regex /[\s.]+$/, ran for many seconds on these inner runs (its time grew with the
+      // square of the run's length). The default 5 s test timeout is the check.
+      test('keeps 100,000 dots between two letters (an inner run is not a tail)', () => {
+        // Arrange
+        const host = 'a' + '.'.repeat(100_000) + 'b';
+
+        // Act & Assert
+        expect(normalizeHost(host)).toBe(host);
+      });
+
+      test('keeps 100,000 spaces between two letters', () => {
+        // Arrange
+        const host = 'a' + ' '.repeat(100_000) + 'b';
+
+        // Act & Assert
+        expect(normalizeHost(host)).toBe(host);
+      });
+
+      test('trims a tail of 100,000 dots', () => {
+        // Act & Assert
+        expect(normalizeHost('shop.com' + '.'.repeat(100_000))).toBe('shop.com');
       });
     });
 

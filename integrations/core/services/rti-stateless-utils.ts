@@ -263,7 +263,12 @@ export class RTIStatelessUtils {
       host = host.replace(/:.*$/, '');
     }
 
-    return host.replace(/[\s.]+$/, '');
+    // A loop, not the regex /[\s.]+$/: that regex was quadratic on a long run of dots before another character.
+    let end = host.length;
+    while (end > 0 && /[\s.]/.test(host.charAt(end - 1))) {
+      end--;
+    }
+    return host.slice(0, end);
   }
 
   /** Logged in place of a secret value (see {@link redactHeaderValue}). */
