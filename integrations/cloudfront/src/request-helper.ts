@@ -29,7 +29,7 @@ const rtiService = new RTIHttpsService(config);
 // Set only by a solved CAPTCHA (see restoreOriginalReferer), never by the client.
 const ORIGINAL_REFERER_HEADER = RTIStatelessUtils.ORIGINAL_REFERER_HEADER;
 
-// Our block, 404 and redirect answers are never cached.
+// Our block, 404 and redirect answers, and the empty 403 for a prefetch, are never cached.
 const responseHeaders = new ResponseHeaders();
 
 // Once per cold start: each mistake the check finds in actionOnSuspicious, so it can be fixed. A mistake reported here
@@ -46,6 +46,11 @@ for (const problem of rtiHelperService.validateActionOnSuspicious()) {
 if (config.challenge && !config.isChallengeResponse) {
     console.warn("[challenge] config.isChallengeResponse is not set: replies to the challenge page are not recognized (see Implementing a Custom Challenge in the README)");
 }
+
+// The warning about missing page-load headers was logged in this cold start (see handle). Set by the first
+// origin-request GET that RTI wants challenged, that gets the CAPTCHA strategy, has neither Sec-Fetch-Dest nor Accept
+// and is not a prefetch, while the CAPTCHA is on. It holds nothing of that request.
+let pageLoadHeadersWarned = false;
 
 export const handle = async (event: CloudFrontRequestEvent, requestType: RequestType): Promise<CloudFrontRequestResult> => {
     //debugger; // Pause for breakpoints when using SAM - remove for production
@@ -140,14 +145,37 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
-        // RTI's action as a strategy. A request with a body is never challenged in place: config.actionOnSuspicious
-        // decides (see getStrategyForRequest).
-        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, cfRequest.method, requestURL.pathname);
+        // RTI's action as a strategy. When RTI says CHALLENGE and the strategy is CAPTCHA, the CAPTCHA page is not the
+        // answer for every request (see "Which request gets a page" in the README): a rule of config.actionOnSuspicious
+        // that covers the request decides first, then a page load gets the page, and any other request follows the
+        // default of its method there (ALLOW when not set: forwarded with x-cheq-rti-result). A request RTI wants
+        // blocked is handled as before, also with blockingStrategy: CAPTCHA.
+        // A page load is a GET for a document: Sec-Fetch-Dest decides, else Accept. The prefetch of a page is a page
+        // load too: it gets an empty 403 in place of the challenge page (in the CAPTCHA branch below). When a GET has
+        // neither Sec-Fetch-Dest nor Accept, it counts as a page load, as before this version. At viewer-request the
+        // function gets the headers the client sent, at origin-request those of the request that CloudFront sends to
+        // the origin: the example events in AWS docs, "Lambda@Edge event structure", show this. Which viewer headers
+        // the origin request carries is set by the origin request policy and the cache key of the cache policy (AWS
+        // docs, "Control origin requests with a policy"; legacy cache settings: see the README), so there they must
+        // include Sec-Fetch-Dest and Accept (the warning below says so once per cold start).
+        // Header names are in lower case, and a header sent more than once comes as several values (AWS docs,
+        // "Lambda@Edge event structure"): they are joined with ", ", as for the JA3 header above.
+        const headerValue = (name: string) => cfRequest.headers[name]?.map((kv) => kv.value).join(', ');
+        const pageLoadHeaders = {
+            secFetchDest: headerValue("sec-fetch-dest"),
+            accept: headerValue("accept"),
+            secPurpose: headerValue("sec-purpose"),
+            purpose: headerValue("purpose"),
+        };
+        const pageLoad = rtiHelperService.isPageLoad(cfRequest.method, pageLoadHeaders);
+        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, cfRequest.method, requestURL.pathname, pageLoad);
 
         // Every value as its name and its raw value. Cannot throw: a value with no name (null, undefined, an unknown number)
-        // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (body method, CAPTCHA verdict).
+        // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (a rule or a method's
+        // default, on the CAPTCHA strategy), for a GET or HEAD too. pageLoad is the isPageLoad answer passed to
+        // getStrategyForRequest.
         if (isDebugEnabled && action !== Action.ALLOW) {
-            console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${cfRequest.method}`);
+            console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${cfRequest.method}, pageLoad: ${pageLoad}`);
         }
 
         // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA) and
@@ -160,6 +188,19 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                 console.log("challenge reply, passing it to challenge");
             }
             return await answerChallengeReply(event, cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+        }
+
+        // Once per cold start: an origin-request GET that RTI wants challenged, with neither Sec-Fetch-Dest nor Accept,
+        // counted as a page load above. The origin request policy is the place to fix it. Only while the CAPTCHA is on
+        // (config.challenge is set), and not for a prefetch: without a challenge the GET is forwarded, and a prefetch
+        // gets an empty 403 below, so "gets the challenge page" would not be true.
+        // A reply to the challenge page does not count: it returned above, whatever isPageLoad said.
+        if (!pageLoadHeadersWarned && config.challenge && requestType === RequestType.ORIGIN_REQUEST
+            && cfRequest.method.toUpperCase() === 'GET' && action === Action.CHALLENGE
+            && actionStrategy === ActionStrategy.CAPTCHA && !rtiHelperService.hasPageLoadHeaders(pageLoadHeaders)
+            && !rtiHelperService.isPrefetch(pageLoadHeaders)) {
+            pageLoadHeadersWarned = true;
+            console.warn('[config] a GET that RTI wants challenged has no Sec-Fetch-Dest and no Accept header, so it is handled as a page load and gets the challenge page. At origin-request the origin request policy must forward both headers (see "Which request gets a page" in the README)');
         }
 
         // If action is not allow, return the corresponding response to client based on action strategy
@@ -192,6 +233,24 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                                     console.log("valid challenge session, waiving CAPTCHA");
                                 }
                                 break;
+                            }
+                            // This branch gets a GET page load, a request that a rule or a method's default of
+                            // actionOnSuspicious sends to the CAPTCHA, and a GET or HEAD that RTI wants blocked with
+                            // blockingStrategy: CAPTCHA (see "Which request gets a page" in the README).
+                            // A prefetch (Sec-Purpose or Purpose contains prefetch) gets an empty 403 in place of the
+                            // challenge page: MDN's "Speculation Rules API" says a page answered with a status outside
+                            // 200 to 299 is not prefetched or prerendered, so the browser does not keep this page.
+                            // Nobody ran this in a browser here. The owner's decision of 2026-11-23.
+                            // Known limit, not fixed on purpose (the owner's decision of 2026-11-23): a page that a
+                            // site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty. Where that
+                            // header reaches this function, it is not a page load and, as shipped, does not get here:
+                            // it is forwarded with the verdict (the JSDoc of RTIStatelessUtils.isPrefetch; README,
+                            // "Known limits", which also says what happens at origin-request without that header).
+                            if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
+                                if (isDebugEnabled) {
+                                    console.log("prefetch: an empty 403 in place of the challenge page");
+                                }
+                                return prefetchForbidden(event, rtiResponse);
                             }
                             // On a request with no body (GET, HEAD), the request is challenged in place (forward to the original requested page).
                             // On a request with a body (POST, PUT, PATCH, DELETE, OPTIONS), the visitor is redirected to the page they came from (the Referer, same site only) or to the site's home page if there is no usable Referer.
@@ -374,6 +433,20 @@ function restoreOriginalReferer(request: CloudFrontRequest): void {
     } catch (e) {
         console.error(`[challenge] originalReferer failed, forwarding without ${ORIGINAL_REFERER_HEADER}: ${rtiHelperService.errorMessage(e)}`);
     }
+}
+
+// The answer to a prefetch in place of the challenge page: a 403 with no body, and the headers of our redirect without
+// Location (the request ids, and no caching).
+function prefetchForbidden(event: CloudFrontRequestEvent, rtiResponse: RTIResponse): CloudFrontResultResponse {
+    return {
+        status: '403',
+        headers: {
+            'x-cheq-cdn-request-id': [{ key: 'x-cheq-cdn-request-id', value: getCfRequestId(event) }],
+            'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
+            'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
+            ...responseHeaders.noStore(),
+        },
+    };
 }
 
 // Our own 403 or 404 page for a blocked request.

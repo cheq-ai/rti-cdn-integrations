@@ -131,6 +131,8 @@ Lambda@Edge (Viewer-Request) ← RTI CHECK HAPPENS HERE
 ║ Bot Detected? → Return 403\404\Captcha\redirect        ║ ← User sees block page
 ║   ❌ Never checks cache                                ║
 ║   ❌ Never reaches origin                              ║
+║ Except CHALLENGE, not a page load: actionOnSuspicious  ║ ← see "Which request gets a page" in the README
+║   decides (as shipped ALLOW: on to cache and origin)   ║
 ║                                                        ║
 ║ Legitimate? → Continue to cache                        ║ ← Normal flow
 ╚════════════════════════════════════════════════════════╝
@@ -197,7 +199,9 @@ Lambda@Edge (Origin-Request) ← RTI CHECK HAPPENS HERE
 ║ RTI Response → Lambda decides action   ║
 ╠════════════════════════════════════════╣
 ║ BLOCK  → Return 403/404 at edge        ║ ← Origin never sees this
-║ CHALLENGE → Return CAPTCHA page        ║ ← Origin never sees this
+║ CHALLENGE → CAPTCHA page (page load)   ║ ← Origin never sees this
+║   other requests: actionOnSuspicious   ║ ← see "Which request gets a page" in the README
+║   decides (by default as ALLOW)        ║
 ║ REDIRECT → Return 302 at edge          ║ ← Origin never sees this
 ║                                        ║
 ║ ALLOW  → Inject x-cheq-rti-result hdr  ║
@@ -205,7 +209,7 @@ Lambda@Edge (Origin-Request) ← RTI CHECK HAPPENS HERE
 ║   Forward request to origin            ║
 ╚════════════════════════════════════════╝
     ↓
-Origin Server (only receives allowed traffic)
+Origin Server (receives allowed traffic and challenged requests that get no page)
     ↓
 Response → CloudFront → Cache → User
 ```
@@ -255,7 +259,7 @@ Request 5 (Bot):     Cache MISS → RTI Check → BLOCK at edge (403) → origin
 |--------|----------------|----------------|
 | **Edge Protection** | ✅ Blocks at edge (every request) | ✅ Blocks at edge (cache misses only) |
 | **Cache Protection** | ✅ Bots never reach cache | ⚠️ Bots with cache hits bypass RTI entirely |
-| **Origin Protection** | ✅ Origin never sees blocked traffic | ✅ Origin never sees blocked traffic — only allowed cache-miss requests reach it |
+| **Origin Protection** | ✅ Origin never sees blocked traffic | ✅ Origin never sees blocked traffic — only cache-miss requests that are allowed, or challenged without a page, reach it |
 | **Coverage** | 100% of requests | Cache misses only — cache hits are unchecked |
 | **DDoS Mitigation** | Excellent | Poor for cached paths (cache hits bypass); Good for uncached paths |
 

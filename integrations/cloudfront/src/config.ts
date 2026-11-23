@@ -169,14 +169,25 @@ export const config: CloudfrontConfig = {
         '^/assets/',       // Generic assets directory
     ],
 
-    // What to do when RTI says CHALLENGE for a request with a body. A CAPTCHA page can't carry the body through,
-    // so these requests are never challenged in place. GET and HEAD always get the CAPTCHA page.
+    // Which request gets the CAPTCHA page when RTI says CHALLENGE (see "Which request gets a page" in the README):
+    //   1. A rule below that matches the path and covers the method decides (a rule without methods covers only the
+    //      methods with a body).
+    //   2. Else a page load (a GET for a document) gets the CAPTCHA page.
+    //   3. Else the method's default below decides (a method not listed is ALLOW).
+    // So a page load gets the CAPTCHA page unless a rule covers it. Set GET and HEAD below to Action.CHALLENGE to give
+    // every GET and HEAD that no rule covers the CAPTCHA page, as before this version.
+    // A request RTI wants blocked is handled as before: with blockingStrategy: CAPTCHA a GET or HEAD gets the CAPTCHA
+    // page, and a request with a body follows these settings.
+    // Wherever this comment says the CAPTCHA page, a prefetch gets an empty 403 (README, "Which request gets a page").
     //   Action.ALLOW:     forwarded with x-cheq-rti-result, so the origin decides (the default for every method)
-    //   Action.CHALLENGE: the CAPTCHA, for the page the visitor came from (Referer); after solving they send the form again
-    //   Action.BLOCK:     the blockingStrategy answer (403 by default)
+    //   Action.CHALLENGE: the CAPTCHA. A GET or HEAD gets it in place. A request with a body gets it for the page the
+    //                     visitor came from (Referer); after solving they send the form again
+    //   Action.BLOCK:     the blockingStrategy answer (403 by default; the CAPTCHA with blockingStrategy: CAPTCHA)
     //   Action.REDIRECT:  a 302 to redirectLocation
     actionOnSuspicious: {
         methods: {
+            GET: Action.ALLOW,     // a GET that is not a page load: a script's fetch, an API client
+            HEAD: Action.ALLOW,    // HEAD is never a page load
             POST: Action.ALLOW,    // forms, logins, checkout, API calls
             PUT: Action.ALLOW,     // API calls
             PATCH: Action.ALLOW,   // API calls

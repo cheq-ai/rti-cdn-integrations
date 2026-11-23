@@ -2,7 +2,7 @@ import { CloudFrontHeaders } from 'aws-lambda';
 
 /**
  * Headers for the answers our Lambda sends itself, instead of passing the request on to the origin:
- * the block pages (403, 404), the CAPTCHA page and our redirects (302).
+ * the block pages (403, 404), the CAPTCHA page, our redirects (302) and the empty 403 for a prefetch.
  * Written once here, so every one of those answers gets the same headers.
  */
 export class ResponseHeaders {
@@ -11,7 +11,7 @@ export class ResponseHeaders {
      * Without it, CloudFront can cache what the Lambda returns (on origin-request), so a block page or CAPTCHA
      * meant for one bot could be served to real visitors of the same URL. The browser could also show a saved
      * CAPTCHA page on Back instead of asking again.
-     * Use it alone for answers with no page (redirects).
+     * Use it alone for answers with no page (redirects, the empty 403 for a prefetch).
      */
     noStore(): CloudFrontHeaders {
         return { 'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }] };

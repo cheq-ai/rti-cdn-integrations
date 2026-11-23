@@ -85,12 +85,17 @@ describe('shipped config.ts', () => {
         expect('handleChallengeReply' in config).toBe(false);
     });
 
-    it('ships actionOnSuspicious with ALLOW for every body method and no rules: nothing changes until set', async ({ skip }) => {
+    it('ships actionOnSuspicious with ALLOW for GET, HEAD and every body method, and no rules (the same as leaving them out)', async ({ skip }) => {
         skip(filledIn, FILLED_IN);
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const config = await loadConfig();
+        expect(config.actionOnSuspicious?.methods?.GET).toBe(Action.ALLOW);
+        expect(config.actionOnSuspicious?.methods?.HEAD).toBe(Action.ALLOW);
         expect(config.actionOnSuspicious).toEqual({
-            methods: { POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW },
+            methods: {
+                GET: Action.ALLOW, HEAD: Action.ALLOW,
+                POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW,
+            },
             rules: [],
         });
     });
