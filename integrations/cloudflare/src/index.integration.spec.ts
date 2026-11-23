@@ -6,8 +6,10 @@ import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Action } from '../../core/models/action.model';
 import type { CloudflareConfig } from './config';
 
-const { mockCallRTI, integrationConfig } = vi.hoisted(() => {
+const { mockCallRTI, mockLoggerError, integrationConfig } = vi.hoisted(() => {
     const mockCallRTI = vi.fn();
+    // The RTI logger's error, so a test can check that nothing was logged as an error.
+    const mockLoggerError = vi.fn().mockResolvedValue(undefined);
     // Mutable config object — integration tests call setConfig() to change properties between tests.
     // The real RTIHelperService reads from this object via reference, so mutations take effect immediately.
     // Mode.BLOCKING = 1 (numeric enum) — using the raw value here since imports are not available in vi.hoisted.
@@ -26,7 +28,7 @@ const { mockCallRTI, integrationConfig } = vi.hoisted(() => {
         blockingStrategy: undefined,
         challengingStrategy: undefined,
     };
-    return { mockCallRTI, integrationConfig };
+    return { mockCallRTI, mockLoggerError, integrationConfig };
 });
 
 vi.mock('../package.json', () => ({ name: 'test', version: '1.0.0' }));
@@ -41,7 +43,7 @@ vi.mock('../../core/services/rti.service', () => ({
 
 vi.mock('../../core/services/rti-logger.service', () => ({
     RTILoggerService: vi.fn().mockImplementation(function () {
-        return { info: vi.fn().mockResolvedValue(undefined), error: vi.fn().mockResolvedValue(undefined) };
+        return { info: vi.fn().mockResolvedValue(undefined), error: mockLoggerError };
     }),
 }));
 
@@ -341,6 +343,107 @@ describe('[integration] cloudflare challenge reply', () => {
         expect(originFetch).toHaveBeenCalledOnce();
         expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=benign');
         expect(challenge).not.toHaveBeenCalled();
+    });
+});
+
+// --- Which request gets a page, with the real decision logic (README, "Which request gets a page") ---
+
+describe('[integration] cloudflare: which request gets a page on a CAPTCHA verdict', () => {
+    let challenge: Mock<NonNullable<CloudflareConfig['challenge']>>;
+    let consoleError: ReturnType<typeof vi.spyOn>;
+
+    // Sends a request through the Worker. `forwarded` is the request the origin received, if any.
+    async function run(request: Request) {
+        const originFetch = vi.fn<(request: Request) => Promise<Response>>(async () => new Response('origin'));
+        vi.stubGlobal('fetch', originFetch);
+        const response = await worker.fetch(request, {}, buildContext());
+        return { response, originFetch, forwarded: originFetch.mock.calls[0]?.[0] };
+    }
+
+    beforeEach(() => {
+        challenge = vi.fn<NonNullable<CloudflareConfig['challenge']>>().mockResolvedValue(new Response('<html>captcha</html>', { status: 403 }));
+        setConfig({ challenge, validateChallenge: vi.fn().mockResolvedValue(false) });
+        mockCallRTI.mockResolvedValue(buildRTIResponse({ verdict: 'suspicious' }));
+        consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+    });
+
+    it('row 1: a GET with Sec-Fetch-Dest: document is a page load: config.challenge gets this request, and its page is the answer', async () => {
+        // Arrange
+        const request = buildWorkerRequest('/sofas', { extraHeaders: { 'sec-fetch-dest': 'document' } });
+
+        // Act
+        const { response, originFetch } = await run(request);
+
+        // Assert
+        expect(challenge).toHaveBeenCalledOnce();
+        const challenged = challenge.mock.calls[0][0];
+        expect(challenged.url).toBe(request.url);
+        expect(challenged.method).toBe('GET');
+        expect(challenged.headers.get('sec-fetch-dest')).toBe('document');
+        expect(response.status).toBe(403);
+        expect(await response.text()).toBe('<html>captcha</html>');
+        expect(originFetch).not.toHaveBeenCalled();
+    });
+
+    it('row 2: a GET with Sec-Fetch-Dest: empty and Accept: text/html is not a page load: forwarded with the verdict, no page', async () => {
+        // Arrange
+        const request = buildWorkerRequest('/sofas', { extraHeaders: { 'sec-fetch-dest': 'empty', accept: 'text/html' } });
+
+        // Act
+        const { originFetch, forwarded } = await run(request);
+
+        // Assert: the handler fails open, so the verdict header and the empty error logs show the request was decided,
+        // not forwarded after an error
+        expect(challenge).not.toHaveBeenCalled();
+        expect(originFetch).toHaveBeenCalledOnce();
+        expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=suspicious');
+        expect(consoleError).not.toHaveBeenCalled();
+        expect(mockLoggerError).not.toHaveBeenCalled();
+    });
+
+    it('row 14: a malicious verdict with blockingStrategy: CAPTCHA still gets the challenge page for a GET that is not a page load: methods { GET: Action.ALLOW } is not used', async () => {
+        // Arrange: the real getAction makes "malicious" a BLOCK, and the real getActionStrategy makes that a CAPTCHA
+        setConfig({
+            challenge, validateChallenge: vi.fn().mockResolvedValue(false),
+            blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { methods: { GET: Action.ALLOW } },
+        });
+        mockCallRTI.mockResolvedValue(buildRTIResponse({ verdict: 'malicious' }));
+        const request = buildWorkerRequest('/sofas', { extraHeaders: { 'sec-fetch-dest': 'empty' } });
+
+        // Act
+        const { response, originFetch } = await run(request);
+
+        // Assert
+        expect(challenge).toHaveBeenCalledOnce();
+        const [challenged, rtiResponse] = challenge.mock.calls[0];
+        expect(challenged.url).toBe(request.url);
+        expect(challenged.method).toBe('GET');
+        expect(rtiResponse.decision.verdict).toBe('malicious');
+        expect(response.status).toBe(403);
+        expect(await response.text()).toBe('<html>captcha</html>');
+        expect(originFetch).not.toHaveBeenCalled();
+    });
+
+    it('P1: a GET with Sec-Fetch-Dest: document and Sec-Purpose: prefetch is a prefetch of a page: an empty 403 in place of the challenge page', async () => {
+        // Arrange
+        const request = buildWorkerRequest('/sofas', { extraHeaders: { 'sec-fetch-dest': 'document', 'sec-purpose': 'prefetch' } });
+
+        // Act
+        const { response, originFetch } = await run(request);
+
+        // Assert
+        expect(response.status).toBe(403);
+        expect(await response.text()).toBe('');
+        expect(response.headers.get('cache-control')).toBe('no-store, no-cache, must-revalidate');
+        expect(challenge).not.toHaveBeenCalled();
+        expect(originFetch).not.toHaveBeenCalled();
+        expect(consoleError).not.toHaveBeenCalled();
+        expect(mockLoggerError).not.toHaveBeenCalled();
     });
 });
 

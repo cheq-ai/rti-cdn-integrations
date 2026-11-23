@@ -86,8 +86,9 @@ https://developers.cloudflare.com/workers/platform/triggers/routes/
 
 The Worker's `fetch` in [`src/index.ts`](src/index.ts) first calls `context.passThroughOnException()`. Then `handle`
 decides what happens to the request. It never calls the origin: it returns either our own answer (a block page, a
-redirect, a CAPTCHA page), which the Worker sends as it is, or the request to send on, which `forwardToOrigin` passes to
-the origin. `forwardToOrigin` is the only place that calls the origin (see [Local or demo origin](#local-or-demo-origin)).
+redirect, a CAPTCHA page, the empty 403 for a prefetch), which the Worker sends as it is, or the request to send on,
+which `forwardToOrigin` passes to the origin. `forwardToOrigin` is the only place that calls the origin (see
+[Local or demo origin](#local-or-demo-origin)).
 
 A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
 
@@ -103,8 +104,9 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
    CHEQ cookies, and the JA3 hash from the incoming request's `cf`. With `telemetry: true` the duration of the call goes
    to the RTI logger through `waitUntil`.
 4. **Decision.** RTI's answer becomes an action (`getAction`), and the action a strategy for this method and path
-   (`getStrategyForRequest`). For a `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict,
-   [`actionOnSuspicious`](#actiononsuspicious) decides.
+   (`getStrategyForRequest`). When RTI wants the request challenged and the strategy is `CAPTCHA`, three questions
+   decide whether it gets the CAPTCHA page: a rule of [`actionOnSuspicious`](#actiononsuspicious), then whether it is
+   a page load (`isPageLoad`), then the method's default (see [Which request gets a page](#which-request-gets-a-page)).
 5. **Challenge reply.** In `BLOCKING` mode, with `challenge` and `isChallengeResponse` set, a request that
    `isChallengeResponse` recognizes goes to `config.challenge` when the strategy is none (ALLOW) or `CAPTCHA`, whatever
    session the visitor has. A throwing `isChallengeResponse` counts as no reply. A throwing `challenge` is logged and the
@@ -116,12 +118,18 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
    - `CAPTCHA` without `config.challenge`: forwarded with the verdict.
    - `CAPTCHA`, and `validateChallenge` returns `true` (a valid session): forwarded with the verdict. The session waives
      only the CAPTCHA, never a block, a 404 or a redirect.
-   - `CAPTCHA` otherwise: `config.challenge`. A `GET` or `HEAD` is challenged in place. A request with a body is
+   - `CAPTCHA` for a prefetch (`Sec-Purpose` or `Purpose` contains `prefetch`): an empty 403 with
+     `x-cheq-cdn-request-id`, `x-cheq-id`, `x-cheq-page-view-id` and no-store, in place of the CAPTCHA page (see
+     [Which request gets a page](#which-request-gets-a-page)).
+   - `CAPTCHA` otherwise: `config.challenge`. A `GET` gets here when it is a page load that no rule covers; a `GET` or
+     `HEAD` also when `actionOnSuspicious` or `blockingStrategy: CAPTCHA` sends it to the CAPTCHA (see
+     [Which request gets a page](#which-request-gets-a-page)). It is challenged in place. A request with a body is
      challenged for the page it came from: a `GET`, without the body, for the same-site `Referer`, or for `/` without
      one. Only the path and the query of the request's own URL are changed, so the host cannot change.
    - A throw from `validateChallenge` or `challenge`: logged, and the request is forwarded without the verdict.
-7. **Allow.** Every other request (ALLOW, a request with a body that `actionOnSuspicious` lets through, and the `CAPTCHA`
-   cases above that are forwarded with the verdict) gets `x-cheq-rti-result` on the copy, and the copy is forwarded.
+7. **Allow.** Every other request (ALLOW, a request that `actionOnSuspicious` lets through, such as a `GET` that is not
+   a page load, and the `CAPTCHA` cases above that are forwarded with the verdict) gets `x-cheq-rti-result` on the copy,
+   and the copy is forwarded.
 8. **Any error before the decision** (an RTI error or timeout, a malformed RTI response): logged. A recognized challenge
    reply (the same conditions as step 5) still goes to `config.challenge`, with a stand-in response and no
    `addRtiResultHeader` (see [Challenge callbacks](#challenge-callbacks)). Everything else is forwarded, without the
@@ -131,7 +139,8 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
 `Error handling request '<id>'`, `Challenge error handling request '<id>'` and
 `Challenge reply check error handling request '<id>'`, where `<id>` is the `cf-ray` value or `unknown_request_id`.
 With `debug: true` the Worker also logs the RTI payload (redacted), the RTI response, the action, the strategy, and the
-lines `challenge reply, passing it to challenge` and `valid challenge session, waiving CAPTCHA`.
+lines `challenge reply, passing it to challenge`, `valid challenge session, waiving CAPTCHA` and
+`prefetch: an empty 403 in place of the challenge page`.
 
 **Cold start.** When the module loads, the Worker logs one warning when `challenge` is set without
 `isChallengeResponse`, then one per problem in `actionOnSuspicious`
@@ -146,7 +155,10 @@ Both are in the `config` object in [`src/config.ts`](src/config.ts). For example
 
 ```ts
 actionOnSuspicious: {
-    methods: { POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW },
+    methods: {
+        GET: Action.ALLOW, HEAD: Action.ALLOW, // a GET that is not a page load, and a HEAD
+        POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW,
+    },
     rules: [
         { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }, // login form: CAPTCHA, then log in again
         { path: '^/api/', action: Action.BLOCK },                          // every body method under /api/
@@ -157,29 +169,138 @@ logErrors: true, // false: caught errors go to the console only, not to the RTI 
 
 The shipped config has every method on `Action.ALLOW`, `rules: []` and `logErrors: true`.
 
+#### Which request gets a page
+
+When RTI wants a request challenged (its action is `CHALLENGE`, and the strategy is `CAPTCHA`, the default
+`challengingStrategy`), the Worker asks three questions, in this order:
+
+1. **Does a rule of `actionOnSuspicious.rules` match the path and cover the method?** The first such rule decides.
+2. **Is the request a page load (below)?** It gets the CAPTCHA page (a prefetch of a page gets an empty 403, below).
+3. **Otherwise** the method's default in `actionOnSuspicious.methods` decides. Without a default the action is
+   `Action.ALLOW`: the request is forwarded to the origin with `x-cheq-rti-result`.
+
+An example with two rules and no defaults: `{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }` and
+`{ path: '^/api/', methods: ['GET'], action: Action.ALLOW }`.
+
+| # | A request that RTI wants challenged | Before this version | Now | Question |
+|---|---|---|---|---|
+| 1 | `GET /sofas`, a page load | the CAPTCHA page | the CAPTCHA page | 2 |
+| 2 | `GET /api/cart`, from the page's script | the CAPTCHA page, the script breaks | forwarded | 1 |
+| 3 | `GET /search/suggest`, from the page's script, no rule | the CAPTCHA page, the script breaks | forwarded | 3 |
+| 4 | `GET /sofas`, from a client that sends `Sec-Fetch-Dest: empty`, or from `curl` | the CAPTCHA page | forwarded | 3 |
+| 5 | `HEAD /sofas` | the CAPTCHA page | forwarded | 3 |
+| 6 | `POST /login` | the CAPTCHA page | the CAPTCHA page, for the page it came from | 1 |
+| 7 | `POST /api/order` | the CAPTCHA page | forwarded | 3 |
+
+Before this version, every request that RTI wanted challenged got the CAPTCHA page, whatever its method. "Forwarded"
+means sent to the origin with `x-cheq-rti-result`, so the origin decides.
+
+**A page load** is a `GET` that a browser sends to show a page. The Worker tells it by two headers of the request,
+`Sec-Fetch-Dest` and `Accept`, and a prefetch (below) by two more, `Sec-Purpose` and `Purpose`. Cloudflare's docs say
+that a Worker gets "the incoming HTTP request"
+([Fetch Handler](https://developers.cloudflare.com/workers/runtime-apis/handlers/fetch/); documented, not tested at
+Cloudflare's edge). A Request Header Transform Rule runs before the Worker, and one that removes such a header takes it
+from the Worker too (see [What the Worker cannot clean](#what-the-worker-cannot-clean)). When a header does not arrive,
+the list below applies: without `Sec-Fetch-Dest`, `Accept` decides; with neither, a `GET` counts as a page load.
+
+- **`Sec-Fetch-Dest: document`** is a page load. In MDN's words, "the request is the result of a user-initiated
+  top-level navigation" ([Sec-Fetch-Dest](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Dest)).
+  Any other value is not: `empty` (MDN names `fetch()` and `XMLHttpRequest` for it), `iframe`, `image`, `script`.
+- **Without `Sec-Fetch-Dest`**, `Accept` decides: a page load asks for `text/html`, as browsers do for a page
+  ([MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Content_negotiation/List_of_default_Accept_values)).
+  `Sec-Fetch-Dest` is missing from Safari before 16.4
+  ([MDN's compatibility data](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Sec-Fetch-Dest#browser_compatibility))
+  and for a site on plain `http://` (MDN: "The header is only included in requests to potentially trustworthy URLs").
+- **With neither header** the Worker cannot tell, and the `GET` counts as a page load, as before this version.
+- **`Sec-Purpose` and `Purpose`** do not change it: a prefetch of a page is a page load. What it gets is below.
+- A `HEAD` is never a page load, and neither is a request with a body.
+
+Header values are compared in any case, and spaces around `Sec-Fetch-Dest` do not count. A header sent more than once
+is judged as one value, its values joined with `, ` as `Headers.get` returns them
+([MDN](https://developer.mozilla.org/en-US/docs/Web/API/Headers/get)): `Sec-Fetch-Dest` sent twice as `document` reads
+`document, document`, which is not a page load. With `debug: true` the strategy line ends with the result:
+`..., method: GET, pageLoad: true`.
+
+**A prefetch** is a request that a browser sends to load a page before the visitor opens it. MDN's
+[Speculation Rules API](https://developer.mozilla.org/en-US/docs/Web/API/Speculation_Rules_API) page says that such a
+request is sent with `Sec-Purpose: prefetch` (`prefetch;prerender` for a prerender), that the browser keeps a
+prefetched page "in a per-document in-memory cache" and uses it when the visitor goes to that page, and that "If a
+non-success response code is returned (any HTTP status other than in the 200-299 range after redirects), then the page
+will not be prefetched/prerendered". So where a visit would get the CAPTCHA page, a request whose `Sec-Purpose` or
+`Purpose` contains `prefetch` gets an empty 403: no body, the request ids (`x-cheq-cdn-request-id`, `x-cheq-id`,
+`x-cheq-page-view-id`) and `Cache-Control: no-store, no-cache, must-revalidate`. `config.challenge` is not called. The
+browser then does not keep the page, and the visitor's own visit goes through RTI as usual. Nobody ran this in a
+browser here.
+
+- This holds wherever this README says that a request gets the CAPTCHA page: a page load, a request that a rule or a
+  default sends to the CAPTCHA, a block shown as a CAPTCHA (`blockingStrategy: CAPTCHA`).
+- As for a visit, a valid CAPTCHA session waives it (the prefetch is forwarded with the verdict), and without
+  `config.challenge` the prefetch is forwarded with the verdict.
+- A reply to the challenge page that `isChallengeResponse` recognizes is answered before this check (step 5 of
+  [How a request is handled](#how-a-request-is-handled)).
+- With `debug: true` the Worker logs `prefetch: an empty 403 in place of the challenge page`.
+
+**What `Action.CHALLENGE` means** when a rule or a default gives it: the CAPTCHA. A `GET` or `HEAD` gets the CAPTCHA
+page in place, for its own URL. A request with a body gets it for the page it came from (see the table of
+[actionOnSuspicious](#actiononsuspicious)). `Action.ALLOW` forwards the request with the verdict, and `Action.BLOCK` and
+`Action.REDIRECT` are carried out as usual.
+
+**A request RTI wants blocked:** whether it is a page load changes nothing for it. The three questions are asked only
+for a request that RTI wants challenged, so a client cannot get past a block by sending the headers of a background
+call. A block page, a 404 or a redirect from RTI applies to every method. With
+`blockingStrategy: ActionStrategy.CAPTCHA` a block is a CAPTCHA too: a `GET` or `HEAD` gets the CAPTCHA page, page load
+or not, and the `GET` and `HEAD` settings of `actionOnSuspicious` are not used. A request with a body follows
+`actionOnSuspicious`, which cannot see whether RTI said block or challenge, so its setting applies to both: with the
+shipped `Action.ALLOW` the request is forwarded with `x-cheq-rti-result`. A site with that setting that wants these
+requests stopped sets `Action.BLOCK` or `Action.CHALLENGE` for their methods or paths.
+
+**To give a `GET` or `HEAD` the CAPTCHA page again, as before this version**, set one line in `methods`:
+`GET: Action.CHALLENGE, HEAD: Action.CHALLENGE`. Then a `GET` or `HEAD` that RTI wants challenged gets the CAPTCHA
+page, page load or not, unless a rule covers it. List the paths that a page's scripts call in `Action.ALLOW` rules, as
+in row 2.
+
+**Known limits:**
+
+- A client can send the headers of a background call, such as `Sec-Fetch-Dest: empty`, and then gets no page: it is
+  forwarded with `x-cheq-rti-result`, like a script's call. So is a client that sends `Accept: */*` without
+  `Sec-Fetch-Dest`, as `curl` 8.14.1 does. The origin can act on the verdict, or a rule or a default can say
+  `Action.CHALLENGE` or `Action.BLOCK` for such requests. If your origin answers differently depending on
+  `x-cheq-rti-result`, make that answer uncacheable (`Cache-Control: private, no-store`). A suspicious `GET` that is
+  not a page load now reaches the origin with the verdict, and a cache that stores the origin's answer to it would
+  serve that answer to other visitors.
+- A suspicious `HEAD` is forwarded by default: it is never a page load, and the shipped default is `Action.ALLOW`. Set
+  `HEAD: Action.CHALLENGE` or `HEAD: Action.BLOCK` to stop it.
+- A prefetch that is not a page load (`Sec-Purpose: prefetch` with `Sec-Fetch-Dest: empty`, for example) is forwarded
+  with `x-cheq-rti-result` like any background `GET`, as shipped. The usual case is a page that a site names in
+  `<link rel="prefetch">`: MDN's
+  [`rel=prefetch`](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/rel/prefetch) page says that
+  the browser asks for it with `Sec-Purpose: prefetch` and `Sec-Fetch-Dest: empty`, and that "The result is kept in the
+  HTTP cache on disk". So the browser may show such a page from its cache on the click, without the CAPTCHA. Nobody ran
+  this in a browser here. `methods: { GET: Action.CHALLENGE }` gives such a prefetch the empty 403, unless a rule
+  covers it. With that setting, give the paths of background calls `Action.ALLOW` rules.
+
 #### actionOnSuspicious
 
-**Only `GET` and `HEAD` are challenged in place.** A CAPTCHA page can't carry a request body through its redirect (a
-login, a checkout, a bank's 3-D Secure return). For a `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA
-verdict, `actionOnSuspicious` says what to do instead. Blocks, 404s and redirects from RTI still apply to every method,
-except with `blockingStrategy: CAPTCHA`: then a block is a CAPTCHA verdict too, so a request with a body that RTI wants
-blocked follows `actionOnSuspicious` as well (forwarded with `x-cheq-rti-result`, as shipped). A site with that setting
-that wants these requests stopped sets `Action.BLOCK` or `Action.CHALLENGE` for their methods or paths.
-`actionOnSuspicious` cannot see whether RTI said block or challenge, so the setting applies to both.
-
-| Action | What a request with a body gets |
+| Action | What the request gets |
 |---|---|
 | `Action.ALLOW` (default for every method) | Forwarded with `x-cheq-rti-result`, so the origin decides. |
-| `Action.CHALLENGE` | The CAPTCHA page, built for the page the visitor came from (the `Referer`, same site only; without one, or from another site, the site's home page `/`). After solving they are back on that page and send the form again. The body itself is not kept. A visitor with a valid session is not challenged: the request is forwarded with the verdict. While the CAPTCHA is off (no `config.challenge`), the request is forwarded with the verdict too. |
+| `Action.CHALLENGE` | The CAPTCHA page. A `GET` or `HEAD` gets it in place, for its own URL. A request with a body gets it built for the page the visitor came from (the `Referer`, same site only; without one, or from another site, the site's home page `/`), because a CAPTCHA page can't carry a request body through its redirect (a login, a checkout, a bank's 3-D Secure return). After solving they are back on that page and send the form again. The body itself is not kept. A visitor with a valid session is not challenged: the request is forwarded with the verdict. While the CAPTCHA is off (no `config.challenge`), the request is forwarded with the verdict too. |
 | `Action.BLOCK` | The `blockingStrategy` answer (403 by default, or 404). With `blockingStrategy: CAPTCHA` it is the CAPTCHA page, as for `Action.CHALLENGE`. |
 | `Action.REDIRECT` | A 302 to `redirectLocation`. |
 
-- `methods` is the default per method. A method left out is `ALLOW`.
-- `rules` match the path with a regex (like `ignorePaths`) and, optionally, a list of methods. They are checked in
-  order; the first match wins over `methods`.
+- `methods` is the default per method. A method left out is `ALLOW`. `GET` and `HEAD` are valid keys: the `GET` default
+  is used only for a `GET` that is not a page load (see [Which request gets a page](#which-request-gets-a-page)).
+- `rules` match the path with a regex (like `ignorePaths`) and, optionally, a list of methods, where `GET` and `HEAD`
+  are valid too. A rule without `methods` covers the five methods with a body (`POST`, `PUT`, `PATCH`, `DELETE`,
+  `OPTIONS`), not `GET` or `HEAD`. They are checked in order; the first match wins over `methods`, and for a page load
+  over the CAPTCHA page (the rules are asked before the page load). In the Turnstile example the reply to the CAPTCHA
+  page is a `GET` to the URL that showed it. When RTI wants that reply challenged too, a `GET` rule for that path
+  decides: `Action.BLOCK` or `Action.REDIRECT` stops the reply, also after the visitor solved the CAPTCHA (with
+  `blockingStrategy: CAPTCHA` a block is the CAPTCHA, and the reply is answered). On a path where a request can get the
+  CAPTCHA, give `GET` the action `Action.ALLOW` or `Action.CHALLENGE`.
 - `OPTIONS` is the browser's CORS preflight, sent before a cross-site call. Blocking or challenging it breaks that call.
 - A typo is logged as a warning once per cold start (`[config] <problem> (see "actionOnSuspicious" in the README)`).
-  What it does depends on where it is. A key in `methods` that isn't one of these five is not used (a method left out
+  What it does depends on where it is. A key in `methods` that isn't one of these seven is not used (a method left out
   is `ALLOW`), and a value that isn't an `Action`, in `methods` or as a rule's `action`, counts as `ALLOW`. A rule with
   a bad regex never matches, and a method misspelled in a rule's `methods` (`'post'`, `'PST'`) is never matched by it:
   the next rule or the method's default applies, and that can be `BLOCK`.
@@ -224,10 +345,13 @@ originalReferer?: (request: Request) => string | undefined | Promise<string | un
 
 **`challenge(request, response, addRtiResultHeader?)`**
 
-- **When:** the strategy is `CAPTCHA` (a CHALLENGE by default, see `challengingStrategy`; a BLOCK with
-  `blockingStrategy: CAPTCHA`; a request with a body with `actionOnSuspicious` CHALLENGE) and `validateChallenge` does
-  not report a valid session. In `BLOCKING` mode also for every reply that `isChallengeResponse` recognizes, when the
-  strategy is none (ALLOW) or `CAPTCHA`, with or without a session, and when RTI is down (below).
+- **When:** the strategy is `CAPTCHA` (a CHALLENGE by default, see `challengingStrategy`, for a page load that no rule
+  covers, or for a request that `actionOnSuspicious` sends to the CAPTCHA, see
+  [Which request gets a page](#which-request-gets-a-page); a BLOCK with `blockingStrategy: CAPTCHA`) and
+  `validateChallenge` does not report a valid session, unless the request is a prefetch (it gets an empty 403, see
+  [Which request gets a page](#which-request-gets-a-page)). In `BLOCKING` mode also for every reply that
+  `isChallengeResponse` recognizes, when the strategy is none (ALLOW) or `CAPTCHA`, with or without a session, and when
+  RTI is down (below).
 - **Gets:** the copy that is forwarded. For a challenged request with a body, a `GET` without the body for the page it
   came from.
 - **Returns:** a `Response`, sent to the visitor as it is, or a `Request`, forwarded as it is. A returned request carries
@@ -304,8 +428,8 @@ between a production and a local or demo origin, in one place:
   only.
 
 Every request that is forwarded goes through this function (allowed traffic, ignored paths, every error path of
-`handle`), so the one switch covers them all. Our own answers (block pages, redirects, the CAPTCHA page) never reach
-it.
+`handle`), so the one switch covers them all. Our own answers (block pages, redirects, the CAPTCHA page, the empty 403
+for a prefetch) never reach it.
 `forwardToOrigin` is outside `handle`'s error handling: a failing origin is not logged as our error and not called a
 second time by this Worker. Cloudflare's pass-through still applies, and may send the request to the origin again, with
 the headers the client sent and possibly without its body (see the next section).
@@ -360,12 +484,19 @@ underscore spellings itself.
 >   `src/config.ts` does.
 > - **Old sessions stop working once.** Sessions issued by the old version fail validation: those visitors are
 >   challenged once more. Nothing to do.
-> - **Only `GET` and `HEAD` are challenged in place.** The old version showed the CAPTCHA page to every method. Now a
->   `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` with a CAPTCHA verdict follows `actionOnSuspicious`, which ships with
->   `Action.ALLOW` for all five: the request is forwarded to the origin with `x-cheq-rti-result`. Any other method is
->   forwarded too. If a login or checkout form should keep its CAPTCHA (or be blocked), add a rule for its path (see
->   [actionOnSuspicious](#actiononsuspicious)). With `blockingStrategy: CAPTCHA` that includes a request RTI wants
->   blocked (the old version showed it the CAPTCHA page): set `Action.BLOCK` or `Action.CHALLENGE` to stop it.
+> - **Only a page load gets the CAPTCHA page by default.** The old version showed the CAPTCHA page to every request
+>   that RTI wanted challenged, whatever its method. Now a page load gets it (a browser's `GET` for a page), unless a
+>   rule of `actionOnSuspicious` covers it. Every other request follows `actionOnSuspicious`, which ships with
+>   `Action.ALLOW` for all seven methods: it is forwarded to the origin with `x-cheq-rti-result` (see
+>   [Which request gets a page](#which-request-gets-a-page)). What a site notices: a `GET` that is not a page load (a
+>   script's `fetch`, an API client) is forwarded with `x-cheq-rti-result` where it got the CAPTCHA page before, and so
+>   is a suspicious `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`. Any other method is forwarded too. A
+>   suspicious prefetch of a page gets an empty 403 where it got the CAPTCHA page before. One line in `methods` brings
+>   the old behavior back for `GET` and `HEAD` (a prefetch keeps the empty 403):
+>   `GET: Action.CHALLENGE, HEAD: Action.CHALLENGE`. If a login or checkout form should keep its CAPTCHA (or be
+>   blocked), add a rule for its path (see [actionOnSuspicious](#actiononsuspicious)). With `blockingStrategy: CAPTCHA`
+>   that includes a request with a body that RTI wants blocked (the old version showed it the CAPTCHA page): set
+>   `Action.BLOCK` or `Action.CHALLENGE` to stop it.
 > - **A valid session no longer skips RTI.** The old version checked `_cq_se` before calling RTI and forwarded a visitor
 >   with a valid session without an RTI call and without `x-cheq-rti-result`. Now every request that `ignorePaths` does
 >   not exclude is checked by RTI, and the session only waives the `CAPTCHA` strategy: `ACCESS_DENIED`, `NOT_FOUND` and
@@ -518,8 +649,10 @@ CAPTCHA vendor outage. A fallback would have to trust the browser ("the widget f
 #### How the challenge flow works
 
 ```
-Request arrives → strategy is CAPTCHA (CHALLENGE by default, or BLOCK with blockingStrategy: CAPTCHA)
-                and there is no valid session → config.challenge() called
+Request arrives → strategy is CAPTCHA (CHALLENGE by default, for a page load that no rule covers, or for a request
+                that actionOnSuspicious sends to the CAPTCHA, see Which request gets a page; or BLOCK with
+                blockingStrategy: CAPTCHA)
+                and there is no valid session and it is not a prefetch → config.challenge() called
                     (in BLOCKING mode also for every reply, see The reply to the challenge page)
         │
         ▼

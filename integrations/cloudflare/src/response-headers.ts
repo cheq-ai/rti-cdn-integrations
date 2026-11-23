@@ -1,6 +1,6 @@
 /**
  * Headers for the answers our Worker sends itself, instead of passing the request on to the origin:
- * the block pages (403, 404), the CAPTCHA page and our redirects (302).
+ * the block pages (403, 404), the CAPTCHA page, our redirects (302) and the empty 403 for a prefetch.
  * Written once here, so every one of those answers gets the same headers.
  */
 export class ResponseHeaders {
@@ -10,7 +10,7 @@ export class ResponseHeaders {
      * a shared proxy may keep one (a 404 may be cached even with no header at all), so a block page or CAPTCHA meant
      * for one bot could be shown again later, or to another visitor behind the same proxy. The browser could also
      * show a saved CAPTCHA page on Back instead of asking again.
-     * Use it alone for answers with no page (redirects).
+     * Use it alone for answers with no page (redirects, the empty 403 for a prefetch).
      */
     noStore(): Record<string, string> {
         return { 'Cache-Control': 'no-store, no-cache, must-revalidate' };

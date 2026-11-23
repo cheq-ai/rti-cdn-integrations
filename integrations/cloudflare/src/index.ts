@@ -21,7 +21,7 @@ const rtiService = new RTIService(config);
 // sends what the client sent (README, "What the Worker cannot clean").
 const ORIGINAL_REFERER_HEADER = RTIStatelessUtils.ORIGINAL_REFERER_HEADER;
 
-// Our block, 404 and redirect answers are never cached.
+// Our block, 404 and redirect answers, and the empty 403 for a prefetch, are never cached.
 const responseHeaders = new ResponseHeaders();
 
 // Once per cold start, and never fatal: an exception while the module loads breaks every request of the Worker. Only
@@ -59,7 +59,8 @@ export default {
         // The request the origin gets, unless the Worker answers itself or config.challenge returns another request.
         const originRequest = new Request(request);
 
-        // handle only decides: our own answer (block page, redirect, challenge page), or the request to send on.
+        // handle only decides: our own answer (block page, redirect, challenge page, the empty 403 for a prefetch), or the
+        // request to send on.
         const result = await handle(request, originRequest, context);
         // The copy holds the body. When the copy is not sent on, nobody reads that body, and wrangler dev then stalls the
         // next request (seen with wrangler 4.56.0; whether production does is not known). So the body is read to the end
@@ -107,8 +108,9 @@ function forwardToOrigin(request: Request): Promise<Response> {
 
 /**
  * Decides what happens to a request and never calls the origin itself: it returns either our own answer
- * (block page, redirect, challenge page) or the request to send on. Errors fail open: the request is sent on,
- * except a reply to the challenge page, which still goes to config.challenge (see the outer catch).
+ * (block page, redirect, challenge page, the empty 403 for a prefetch) or the request to send on. Errors fail open:
+ * the request is sent on, except a reply to the challenge page, which still goes to config.challenge (see the outer
+ * catch).
  * `originRequest` is the copy of `request` made in fetch (it holds the body). handle cleans it and returns it to send
  * on, unless it answers itself or config.challenge returns another Request.
  */
@@ -180,15 +182,28 @@ async function handle(request: Request, originRequest: Request, context: Executi
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
-        // RTI's action as a strategy. A request with a body is never challenged in place: config.actionOnSuspicious
-        // decides (see getStrategyForRequest).
+        // RTI's action as a strategy for this request. When RTI says CHALLENGE and the strategy is CAPTCHA, three questions
+        // decide which request gets the page (README, "Which request gets a page"): a rule of config.actionOnSuspicious
+        // that matches the path and covers the method, then a page load gets the page, then the method's default (ALLOW
+        // without one: forwarded with the verdict). A block verdict shown as a CAPTCHA (blockingStrategy: CAPTCHA) asks no
+        // question: a GET or HEAD gets the page, and a request with a body still follows actionOnSuspicious. Where the
+        // page would be the answer, a prefetch gets an empty 403 instead (see the CAPTCHA case below).
         const method = originRequest.method;
-        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, method, requestURL.pathname);
+        // The four headers of the request sent on, for isPageLoad and isPrefetch. A missing header is null.
+        const pageLoadHeaders = {
+            secFetchDest: originRequest.headers.get("sec-fetch-dest"),
+            accept: originRequest.headers.get("accept"),
+            secPurpose: originRequest.headers.get("sec-purpose"),
+            purpose: originRequest.headers.get("purpose"),
+        };
+        const pageLoad = rtiHelperService.isPageLoad(method, pageLoadHeaders);
+        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, method, requestURL.pathname, pageLoad);
 
         // Every value as its name and its raw value. Cannot throw: a value with no name (null, undefined, an unknown number)
-        // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (body method, CAPTCHA verdict).
+        // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (a rule or a method's
+        // default, when the strategy is CAPTCHA).
         if (config.debug && action !== Action.ALLOW) {
-            console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${method}`);
+            console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${method}, pageLoad: ${pageLoad}`);
         }
 
         // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA) and
@@ -232,11 +247,35 @@ async function handle(request: Request, originRequest: Request, context: Executi
                                 }
                                 break;
                             }
-                            // A request with no body (GET, HEAD) is challenged in place: after the challenge, the visitor
-                            // is back on the page they asked for. A request with a body (POST, PUT, PATCH, DELETE,
-                            // OPTIONS) gets the page for where the visitor came from (the Referer, same site only), or
-                            // the site's home page without a usable Referer. The body is not kept (a challenge page
-                            // cannot carry it through): the visitor can send it again after solving the challenge.
+                            // A prefetch (Sec-Purpose or Purpose contains "prefetch") gets an empty 403 in place of the
+                            // challenge page: the owner's decision of 2026-11-23 (README, "Which request gets a page";
+                            // RTIStatelessUtils.isPrefetch says what MDN writes about it). Checked after the session
+                            // waiver, so a valid session forwards a prefetch with the verdict, as it would a visit.
+                            // Known limit, not fixed on purpose (the owner's decision of 2026-11-23): a page that a
+                            // site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty, so it is not
+                            // a page load and, as shipped, does not get here: it is forwarded with the verdict (the
+                            // JSDoc of RTIStatelessUtils.isPrefetch; README, "Known limits").
+                            if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
+                                if (config.debug) {
+                                    console.log("prefetch: an empty 403 in place of the challenge page");
+                                }
+                                return new Response(null, {
+                                    status: 403,
+                                    headers: {
+                                        "x-cheq-cdn-request-id": request.headers.get("cf-ray") || '',
+                                        "x-cheq-id": rtiResponse.ids.rayId,
+                                        "x-cheq-page-view-id": rtiResponse.ids.pageViewId ?? '',
+                                        ...responseHeaders.noStore(),
+                                    },
+                                });
+                            }
+                            // A GET gets here when it is a page load that no rule covers; a GET or HEAD also when
+                            // actionOnSuspicious or blockingStrategy: CAPTCHA sends it to the CAPTCHA (README, "Which
+                            // request gets a page"). It is challenged in place: after the challenge, the visitor is back
+                            // on the page they asked for. A request with a body (POST, PUT, PATCH, DELETE, OPTIONS) gets
+                            // the page for where the visitor came from (the Referer, same site only), or the site's home
+                            // page without a usable Referer. The body is not kept (a challenge page cannot carry it
+                            // through): the visitor can send it again after solving the challenge.
                             const afterChallengeRequest = rtiHelperService.isBodylessMethod(method) ? originRequest : refererAfterChallengeRequest(originRequest);
                             // Passed on as it is: a Response is our answer, a Request is forwarded. Awaited here, so
                             // a rejection is caught below.
@@ -252,8 +291,8 @@ async function handle(request: Request, originRequest: Request, context: Executi
             }
         }
 
-        // action is Action.ALLOW, or no strategy applies (e.g. a request with a body that actionOnSuspicious lets through),
-        // or a CAPTCHA that was waived or has no challenge: pass headers to origin request
+        // action is Action.ALLOW, or no strategy applies (e.g. a request that actionOnSuspicious lets through, such as a GET
+        // that is not a page load), or a CAPTCHA that was waived or has no challenge: pass headers to origin request
 
         // Set the RTI result header for the origin to consume. It is not visible to the client; the origin can log it
         // or act on it.

@@ -56,18 +56,18 @@ describe('index at load', () => {
     });
 
     it('warns once per actionOnSuspicious problem, pointing to the README for each', async () => {
-        // Arrange: a method that is not a body method, a value that is not an Action, and a rule with a bad regex
+        // Arrange: a method that is not one of the seven, a value that is not an Action, and a rule with a bad regex
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
         // Act
         await loadWorker({
             mode: Mode.BLOCKING,
-            actionOnSuspicious: { methods: { GET: Action.BLOCK, POST: 9 }, rules: [{ path: '[', action: Action.ALLOW }] },
+            actionOnSuspicious: { methods: { FETCH: Action.BLOCK, POST: 9 }, rules: [{ path: '[', action: Action.ALLOW }] },
         });
 
         // Assert
         expect(warn.mock.calls).toEqual([
-            ["[config] actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS (see \"actionOnSuspicious\" in the README)"],
+            ["[config] actionOnSuspicious.methods: 'FETCH' is not one of GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS (see \"actionOnSuspicious\" in the README)"],
             ['[config] actionOnSuspicious.methods.POST: 9 is not an Action (see "actionOnSuspicious" in the README)'],
             ["[config] actionOnSuspicious.rules[0].path: '[' is not a valid regex (see \"actionOnSuspicious\" in the README)"],
         ]);
@@ -81,6 +81,23 @@ describe('index at load', () => {
         await loadWorker({
             mode: Mode.BLOCKING,
             actionOnSuspicious: { methods: { POST: Action.CHALLENGE }, rules: [{ path: '^/api/', action: Action.BLOCK }] },
+        });
+
+        // Assert
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('does not warn about GET and HEAD in methods or GET in a rule', async () => {
+        // Arrange
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        // Act
+        await loadWorker({
+            mode: Mode.BLOCKING,
+            actionOnSuspicious: {
+                methods: { GET: Action.ALLOW, HEAD: Action.ALLOW },
+                rules: [{ path: '^/api/', methods: ['GET'], action: Action.ALLOW }],
+            },
         });
 
         // Assert

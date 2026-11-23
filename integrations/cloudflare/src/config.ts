@@ -9,8 +9,11 @@ import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challen
  */
 export interface CloudflareConfig extends Config {
     /**
-     * Called when the action strategy is `CAPTCHA` (by default for CHALLENGE actions, see `challengingStrategy`)
-     * and the visitor has no valid session (see `validateChallenge`).
+     * Called when the action strategy is `CAPTCHA` (by default for a CHALLENGE action on a page load that no rule
+     * covers, or on a request that `actionOnSuspicious` sends to the CAPTCHA, see `challengingStrategy` and "Which
+     * request gets a page" in the README; or a BLOCK action with `blockingStrategy: CAPTCHA`) and the visitor has no
+     * valid session (see `validateChallenge`). In that case a prefetch (`Sec-Purpose` or `Purpose` contains
+     * `prefetch`) gets an empty 403, and `challenge` is not called.
      * In BLOCKING mode it is also called for every reply to the challenge page (see `isChallengeResponse`) when RTI
      * allows it (no strategy) or the strategy is CAPTCHA (`isChallengeReplyAllowed`), with or without a valid session.
      * Any other strategy (ACCESS_DENIED, NOT_FOUND, REDIRECT) is enforced as usual.
@@ -170,17 +173,27 @@ export const config: CloudflareConfig = {
         '^/assets/',       // Generic assets directory
     ],
 
-    // What to do with a request with a body when the strategy is CAPTCHA: RTI says CHALLENGE (challengingStrategy is
-    // CAPTCHA by default), or BLOCK with blockingStrategy: CAPTCHA. A CAPTCHA page can't carry the body through, so
-    // these requests are never challenged in place. GET and HEAD get the CAPTCHA page in place.
-    //   Action.ALLOW:     forwarded with x-cheq-rti-result, so the origin decides (the default for every method).
-    //                     With blockingStrategy: CAPTCHA that includes requests RTI wants blocked (set BLOCK or
-    //                     CHALLENGE to stop them)
-    //   Action.CHALLENGE: the CAPTCHA, for the page the visitor came from (Referer); after solving they send the form again
+    // Which request gets the CAPTCHA page when RTI says CHALLENGE and the strategy is CAPTCHA (challengingStrategy, the
+    // default). README, "Which request gets a page":
+    //   1. Does a rule below match the path and cover the method? The first such rule decides.
+    //   2. Else, is it a page load (a browser asking for a page)? It gets the CAPTCHA page.
+    //   3. Else, the method's default below decides (ALLOW without one).
+    // Wherever this comment says the CAPTCHA page, a prefetch gets an empty 403 (README, "Which request gets a page").
+    // A page load gets the CAPTCHA page unless a rule covers it: GET below is only for a GET that is not a page load.
+    // To give every GET and HEAD that no rule covers the CAPTCHA page again, as before this version:
+    //   GET: Action.CHALLENGE, HEAD: Action.CHALLENGE
+    // Whether a request is a page load changes nothing for a request RTI wants blocked. With
+    // blockingStrategy: CAPTCHA a GET or HEAD gets the CAPTCHA page, and a request with a body follows its rule or
+    // default below (with ALLOW it is forwarded).
+    //   Action.ALLOW:     forwarded with x-cheq-rti-result, so the origin decides (the default for every method)
+    //   Action.CHALLENGE: the CAPTCHA, for a GET or HEAD in place; for a request with a body, for the page the visitor
+    //                     came from (Referer): after solving they send the form again
     //   Action.BLOCK:     the blockingStrategy answer (403 by default; the CAPTCHA with blockingStrategy: CAPTCHA)
     //   Action.REDIRECT:  a 302 to redirectLocation
     actionOnSuspicious: {
         methods: {
+            GET: Action.ALLOW,     // a GET that is not a page load: a script's fetch, an API client
+            HEAD: Action.ALLOW,    // HEAD is never a page load
             POST: Action.ALLOW,    // forms, logins, checkout, API calls
             PUT: Action.ALLOW,     // API calls
             PATCH: Action.ALLOW,   // API calls
@@ -192,6 +205,7 @@ export const config: CloudflareConfig = {
         // path. Keep this exact shape (see "actionOnSuspicious" in the README).
         rules: [
             // { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+            // { path: '^/api/', methods: ['GET'], action: Action.ALLOW },
         ],
     },
 

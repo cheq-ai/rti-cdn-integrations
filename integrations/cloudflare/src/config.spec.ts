@@ -111,12 +111,17 @@ describe('shipped config.ts', () => {
         expect(config.isChallengeResponse).toBe(isChallengeResponse);
     });
 
-    it('ships actionOnSuspicious with ALLOW for every body method and no rules: nothing changes until set', async (context) => {
+    it('ships actionOnSuspicious with ALLOW for all seven methods, GET and HEAD included, and no rules', async (context) => {
         skipIfFilledIn(context);
         vi.spyOn(console, 'warn').mockImplementation(() => {});
         const config = await loadConfig();
+        expect(config.actionOnSuspicious?.methods?.GET).toBe(Action.ALLOW);
+        expect(config.actionOnSuspicious?.methods?.HEAD).toBe(Action.ALLOW);
         expect(config.actionOnSuspicious).toEqual({
-            methods: { POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW },
+            methods: {
+                GET: Action.ALLOW, HEAD: Action.ALLOW,
+                POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW,
+            },
             rules: [],
         });
     });

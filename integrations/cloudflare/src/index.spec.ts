@@ -36,10 +36,10 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
     const real = await importOriginal<typeof import('../../core/services/rti-helper.service')>();
     return {
         RTIHelperService: vi.fn().mockImplementation(function (config: any) {
-            // validateActionOnSuspicious, getActionOnSuspicious, isBodylessMethod, sameSiteReferer, parseCookies,
-            // stringifyRedactedPayload, buildRtiResultHeader, isChallengeReplyAllowed and errorMessage are pure
-            // functions with no side effects — use the real implementation so tests verify actual output rather than
-            // a duplicated mock formula.
+            // validateActionOnSuspicious, getActionOnSuspicious, findActionOnSuspiciousRule, isBodylessMethod,
+            // isPageLoad, isPrefetch, sameSiteReferer, parseCookies, stringifyRedactedPayload, buildRtiResultHeader,
+            // isChallengeReplyAllowed and errorMessage are pure functions with no side effects — use the real
+            // implementation so tests verify actual output rather than a duplicated mock formula.
             const realInstance = new real.RTIHelperService(config);
             const service: any = {
                 shouldIgnore: mocks.shouldIgnore,
@@ -49,7 +49,11 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 validateConfig: mocks.validateConfig,
                 validateActionOnSuspicious: realInstance.validateActionOnSuspicious.bind(realInstance),
                 getActionOnSuspicious: realInstance.getActionOnSuspicious.bind(realInstance),
+                // Private in core: bracket access compiles, dot access does not.
+                findActionOnSuspiciousRule: realInstance['findActionOnSuspiciousRule'].bind(realInstance),
                 isBodylessMethod: realInstance.isBodylessMethod.bind(realInstance),
+                isPageLoad: realInstance.isPageLoad.bind(realInstance),
+                isPrefetch: realInstance.isPrefetch.bind(realInstance),
                 sameSiteReferer: realInstance.sameSiteReferer.bind(realInstance),
                 parseCookies: realInstance.parseCookies.bind(realInstance),
                 stringifyRedactedPayload: realInstance.stringifyRedactedPayload.bind(realInstance),
@@ -57,7 +61,8 @@ vi.mock('../../core/services/rti-helper.service', async (importOriginal) => {
                 isChallengeReplyAllowed: realInstance.isChallengeReplyAllowed.bind(realInstance),
                 errorMessage: realInstance.errorMessage.bind(realInstance),
             };
-            // The real getStrategyForRequest, run on this mock: it uses the mocked getActionStrategy for RTI's action.
+            // The real getStrategyForRequest, run on this mock: it uses the mocked getActionStrategy for RTI's action,
+            // and the real isBodylessMethod, findActionOnSuspiciousRule and getActionOnSuspicious above.
             service.getStrategyForRequest = real.RTIHelperService.prototype.getStrategyForRequest.bind(service);
             return service;
         }),
@@ -541,9 +546,9 @@ describe('cloudflare worker', () => {
         consoleSpy.mockRestore();
     });
 
-    // --- Methods: a challenge can't carry a request body, so only GET and HEAD are challenged ---
+    // --- Methods: with a CAPTCHA verdict and no actionOnSuspicious setting, only a page load gets the CAPTCHA page ---
 
-    it.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])('forwards a %s with a CAPTCHA verdict and its x-cheq-rti-result, without challenging it', async (method) => {
+    it.each(['HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])('forwards a %s with a CAPTCHA verdict and its x-cheq-rti-result, without challenging it', async (method) => {
         // Arrange
         const challenge = captchaVerdict();
         const request = buildWorkerRequest('/login', { method, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
@@ -558,10 +563,10 @@ describe('cloudflare worker', () => {
         expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=suspicious');
     });
 
-    it.each(['GET', 'HEAD'])('still challenges a %s with a CAPTCHA verdict', async (method) => {
+    it('still challenges a GET with a CAPTCHA verdict (without Sec-Fetch-Dest and Accept it counts as a page load)', async () => {
         // Arrange
         const challenge = captchaVerdict();
-        const request = buildWorkerRequest('/page', { method, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
+        const request = buildWorkerRequest('/page', { cfRay: CF_RAY, xRealIp: '1.2.3.4' });
 
         // Act
         const { response, originFetch } = await run(request);
@@ -737,25 +742,25 @@ describe('cloudflare worker', () => {
             ['BLOCK (2)', Action.BLOCK, 'ACCESS_DENIED (0)'],
             ['REDIRECT (3)', Action.REDIRECT, 'REDIRECT (2)'],
             ['ALLOW (0)', Action.ALLOW, 'none (null)'],
-        ])('debug logs the strategy, what actionOnSuspicious says and the method in one line: %s', async (logged, action, strategy) => {
+        ])('debug logs the strategy, what actionOnSuspicious says, the method and whether it is a page load in one line: %s', async (logged, action, strategy) => {
             captchaVerdict();
             realStrategies();
             (config as any).debug = true;
             const log = vi.spyOn(console, 'log').mockImplementation(() => {});
             (config as any).actionOnSuspicious = { methods: { POST: action } };
             await run(post());
-            expect(log).toHaveBeenCalledWith(`action strategy: ${strategy}, actionOnSuspicious: ${logged}, method: POST`);
+            expect(log).toHaveBeenCalledWith(`action strategy: ${strategy}, actionOnSuspicious: ${logged}, method: POST, pageLoad: false`);
             expect(log.mock.calls.filter(([line]) => String(line).includes('action strategy:'))).toHaveLength(1);
             (config as any).debug = false;
         });
 
-        it('debug logs the same line for a GET', async () => {
+        it('debug logs the same line for a GET (without Sec-Fetch-Dest and Accept: a page load)', async () => {
             captchaVerdict();
             realStrategies();
             (config as any).debug = true;
             const log = vi.spyOn(console, 'log').mockImplementation(() => {});
             await run(buildWorkerRequest('/page', { cfRay: CF_RAY, xRealIp: '1.2.3.4' }));
-            expect(log).toHaveBeenCalledWith('action strategy: CAPTCHA (3), actionOnSuspicious: none (undefined), method: GET');
+            expect(log).toHaveBeenCalledWith('action strategy: CAPTCHA (3), actionOnSuspicious: none (undefined), method: GET, pageLoad: true');
             (config as any).debug = false;
         });
 
@@ -777,6 +782,383 @@ describe('cloudflare worker', () => {
             const request = buildWorkerRequest('/page', { querystring: 'a=1', extraHeaders: { Referer: 'https://example.com/other' }, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
             await run(request);
             expect(challenge.mock.calls[0][0].url).toBe('https://example.com/page?a=1');
+        });
+    });
+
+    // --- Which request gets a page (README, "Which request gets a page"). On a CAPTCHA verdict: a rule of
+    // actionOnSuspicious that covers the method decides first, then a page load gets the page, then the method's default ---
+
+    describe('which request gets a page on a CAPTCHA verdict', () => {
+        // getActionStrategy as core maps an Action with this blockingStrategy (challengingStrategy left at CAPTCHA).
+        const strategies = (blockingStrategy = ActionStrategy.ACCESS_DENIED) => mocks.getActionStrategy.mockImplementation((a: Action) =>
+            a === Action.CHALLENGE ? ActionStrategy.CAPTCHA : a === Action.BLOCK ? blockingStrategy : a === Action.REDIRECT ? ActionStrategy.REDIRECT : null);
+        // Each request names another page of the site as its Referer: a page built for the Referer would show in the URL
+        // that config.challenge gets.
+        const request = (method: string, headers: Record<string, string>, path = '/page', cookies?: string) =>
+            buildWorkerRequest(path, { method, cookies, extraHeaders: { referer: 'https://example.com/other', ...headers }, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
+
+        // Forwarded: no page, and the origin gets the request with the verdict. The handler fails open: an exception (a
+        // member missing from the mock, say) forwards the request too, but without the verdict and with an error logged.
+        // So the verdict header and the empty error logs are checked as well.
+        const expectForwarded = (result: Awaited<ReturnType<typeof run>>, challenge: ReturnType<typeof captchaVerdict>) => {
+            expect(challenge).not.toHaveBeenCalled();
+            expect(result.originFetch).toHaveBeenCalledOnce();
+            expect(result.forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=suspicious');
+            expect(consoleErrorSpy).not.toHaveBeenCalled();
+            expect(mocks.loggerError).not.toHaveBeenCalled();
+        };
+
+        // The challenge page for this request itself: config.challenge gets the request sent on (its URL, method and
+        // headers, not a GET for its Referer), and its answer goes to the visitor.
+        const expectPageFor = async (result: Awaited<ReturnType<typeof run>>, challenge: ReturnType<typeof captchaVerdict>, sent: Request) => {
+            expect(challenge).toHaveBeenCalledOnce();
+            const challenged = challenge.mock.calls[0][0];
+            expect(challenged.url).toBe(sent.url);
+            expect(challenged.method).toBe(sent.method);
+            expect(challenged.headers.get('sec-fetch-dest')).toBe(sent.headers.get('sec-fetch-dest'));
+            expect(challenged.headers.get('accept')).toBe(sent.headers.get('accept'));
+            expect(result.response.status).toBe(403);
+            expect(await result.response.text()).toBe('<html>captcha</html>');
+            expect(result.originFetch).not.toHaveBeenCalled();
+        };
+
+        it.each([
+            ['1', 'Sec-Fetch-Dest: document', { 'sec-fetch-dest': 'document' }],
+            ['4', 'no Sec-Fetch-Dest and Accept: text/html,*/*;q=0.8', { accept: 'text/html,*/*;q=0.8' }],
+            ['5', 'neither Sec-Fetch-Dest nor Accept', {}],
+        ])('row %s: a GET with %s is a page load: config.challenge gets this request, and its page is the answer', async (_row, _label, headers) => {
+            // Arrange
+            const challenge = captchaVerdict();
+            const sent = request('GET', headers);
+
+            // Act
+            const result = await run(sent);
+
+            // Assert
+            await expectPageFor(result, challenge, sent);
+        });
+
+        it.each([
+            ['2', 'GET', 'Sec-Fetch-Dest: empty and Accept: text/html', { 'sec-fetch-dest': 'empty', accept: 'text/html' }],
+            ['3', 'GET', 'no Sec-Fetch-Dest and Accept: */*', { accept: '*/*' }],
+            ['8', 'HEAD', 'Sec-Fetch-Dest: document', { 'sec-fetch-dest': 'document' }],
+        ])('row %s: a %s with %s is not a page load: forwarded with the verdict, no page', async (_row, method, _label, headers) => {
+            // Arrange
+            const challenge = captchaVerdict();
+
+            // Act
+            const result = await run(request(method, headers));
+
+            // Assert
+            expectForwarded(result, challenge);
+        });
+
+        it('a GET with Sec-Fetch-Dest: document sent twice is not a page load: Headers.get joins the values, so it reads "document, document" and is forwarded with the verdict', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            const headers = new Headers({ host: 'example.com', 'user-agent': 'Mozilla/5.0', 'cf-ray': CF_RAY, 'x-real-ip': '1.2.3.4' });
+            headers.append('sec-fetch-dest', 'document');
+            headers.append('sec-fetch-dest', 'document');
+
+            // Act
+            const result = await run(new Request(`${BASE_URL}/page`, { headers }));
+
+            // Assert
+            expectForwarded(result, challenge);
+            expect(result.forwarded!.headers.get('sec-fetch-dest')).toBe('document, document');
+        });
+
+        it.each([
+            ['9', 'empty'],
+            ['10', 'document'],
+        ])('row %s: a rule that names GET is asked first: GET /api/x with Sec-Fetch-Dest: %s gets the 403 block page of the rule', async (_row, dest) => {
+            // Arrange
+            const challenge = captchaVerdict();
+            strategies();
+            (config as any).actionOnSuspicious = { rules: [{ path: '^/api/', methods: ['GET'], action: Action.BLOCK }] };
+
+            // Act
+            const { response, originFetch } = await run(request('GET', { 'sec-fetch-dest': dest }, '/api/x'));
+
+            // Assert
+            expect(response.status).toBe(403);
+            expect(await response.text()).toBe('<html>blocked</html>'); // the block page, not the challenge's 403
+            expect(challenge).not.toHaveBeenCalled();
+            expect(originFetch).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ['11', 'GET', { 'sec-fetch-dest': 'empty' }],
+            ['12', 'HEAD', {}],
+        ])('row %s: with methods { %s: Action.CHALLENGE } a request that is not a page load gets the challenge page for itself', async (_row, method, headers) => {
+            // Arrange
+            const challenge = captchaVerdict();
+            strategies();
+            (config as any).actionOnSuspicious = { methods: { [method]: Action.CHALLENGE } };
+            const sent = request(method, headers);
+
+            // Act
+            const result = await run(sent);
+
+            // Assert
+            await expectPageFor(result, challenge, sent);
+        });
+
+        it('row 13: with methods { GET: Action.REDIRECT } a GET that is not a page load gets the 302 to redirectLocation', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            strategies();
+            (config as any).redirectLocation = 'https://example.com/suspicious';
+            (config as any).actionOnSuspicious = { methods: { GET: Action.REDIRECT } };
+
+            // Act
+            const { response, originFetch } = await run(request('GET', { 'sec-fetch-dest': 'empty' }));
+
+            // Assert
+            expect(response.status).toBe(302);
+            expect(response.headers.get('location')).toBe('https://example.com/suspicious');
+            expect(challenge).not.toHaveBeenCalled();
+            expect(originFetch).not.toHaveBeenCalled();
+        });
+
+        it('row 14: a block verdict shown as a CAPTCHA (blockingStrategy: CAPTCHA) still gets the challenge page for a GET that is not a page load: methods { GET: Action.ALLOW } is not used', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            mocks.getAction.mockReturnValue(Action.BLOCK);
+            strategies(ActionStrategy.CAPTCHA);
+            (config as any).actionOnSuspicious = { methods: { GET: Action.ALLOW } };
+            const sent = request('GET', { 'sec-fetch-dest': 'empty' });
+
+            // Act
+            const result = await run(sent);
+
+            // Assert
+            await expectPageFor(result, challenge, sent);
+        });
+
+        it('row 15: a GET that is not a page load is forwarded with the verdict, and a valid session is not checked', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            mocks.validateChallenge.mockResolvedValue(true);
+
+            // Act
+            const result = await run(request('GET', { 'sec-fetch-dest': 'empty' }, '/page', '_cq_se=tok|ray'));
+
+            // Assert
+            expectForwarded(result, challenge);
+            expect(mocks.validateChallenge).not.toHaveBeenCalled();
+        });
+
+        it('row 16: a page load with a valid session is forwarded with the verdict: the session waives the CAPTCHA, as before', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            mocks.validateChallenge.mockResolvedValue(true);
+
+            // Act
+            const result = await run(request('GET', { 'sec-fetch-dest': 'document' }, '/page', '_cq_se=tok|ray'));
+
+            // Assert
+            expectForwarded(result, challenge);
+            expect(mocks.validateChallenge).toHaveBeenCalledOnce();
+            expect(mocks.validateChallenge.mock.calls[0][0]).toBe(result.forwarded); // the request sent on
+        });
+
+        it('row 17: a reply to the challenge page that is not a page load still goes to config.challenge, as before', async () => {
+            // Arrange
+            (config as any).mode = Mode.BLOCKING;
+            const challenge = captchaVerdict();
+            const reply = buildWorkerRequest('/landing', {
+                querystring: 'cf-turnstile-response=tok', extraHeaders: { 'sec-fetch-dest': 'empty' }, cfRay: CF_RAY, xRealIp: '1.2.3.4',
+            });
+
+            // Act
+            const { response, originFetch } = await run(reply);
+
+            // Assert
+            expect(challenge).toHaveBeenCalledOnce();
+            expect(challenge.mock.calls[0][0].url).toBe(reply.url);
+            expect(response.status).toBe(403);
+            expect(await response.text()).toBe('<html>captcha</html>');
+            expect(originFetch).not.toHaveBeenCalled();
+            expect(mocks.validateChallenge).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ['1', { 'sec-fetch-dest': 'document' }, 'action strategy: CAPTCHA (3), actionOnSuspicious: none (undefined), method: GET, pageLoad: true'],
+            ['2', { 'sec-fetch-dest': 'empty', accept: 'text/html' }, 'action strategy: none (null), actionOnSuspicious: ALLOW (0), method: GET, pageLoad: false'],
+        ])('row 18: with debug on, the strategy line of row %s ends with whether it is a page load', async (_row, headers, line) => {
+            // Arrange
+            captchaVerdict();
+            (config as any).debug = true;
+            const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+            // Act
+            await run(request('GET', headers));
+
+            // Assert
+            const strategyLines = log.mock.calls.map(([text]) => String(text)).filter((text) => text.startsWith('action strategy:'));
+            expect(strategyLines).toEqual([line]);
+        });
+
+        // --- A prefetch (README, "Which request gets a page"; the owner's decision of 2026-11-23). Where a visit would get
+        // the challenge page, a request whose Sec-Purpose or Purpose contains "prefetch" gets an empty 403 ---
+
+        describe('a prefetch on a CAPTCHA verdict', () => {
+            // An empty 403: status 403, no body, and the headers of our redirect without Location (the request ids and
+            // no-store). config.challenge is not called, the origin is not called, and nothing is logged as an error.
+            const expectEmpty403 = async (result: Awaited<ReturnType<typeof run>>, challenge: ReturnType<typeof captchaVerdict>) => {
+                expect(result.response.status).toBe(403);
+                expect(await result.response.text()).toBe('');
+                expect(result.response.headers.get('cache-control')).toBe('no-store, no-cache, must-revalidate');
+                expect(result.response.headers.get('x-cheq-cdn-request-id')).toBe(CF_RAY);
+                expect(result.response.headers.get('x-cheq-id')).toBe('ray-123');
+                expect(result.response.headers.get('x-cheq-page-view-id')).toBe('');
+                expect(result.response.headers.get('location')).toBeNull();
+                expect(challenge).not.toHaveBeenCalled();
+                expect(result.originFetch).not.toHaveBeenCalled();
+                expect(consoleErrorSpy).not.toHaveBeenCalled();
+                expect(mocks.loggerError).not.toHaveBeenCalled();
+            };
+            const prefetchOfAPage = { 'sec-fetch-dest': 'document', 'sec-purpose': 'prefetch' };
+
+            it.each([
+                ['P1', 'Sec-Fetch-Dest: document and Sec-Purpose: prefetch', prefetchOfAPage],
+                ['P2', 'Sec-Fetch-Dest: document and Sec-Purpose: prefetch;prerender', { 'sec-fetch-dest': 'document', 'sec-purpose': 'prefetch;prerender' }],
+                ['P3', 'no Sec-Fetch-Dest, Accept: text/html and Purpose: prefetch', { accept: 'text/html', purpose: 'prefetch' }],
+            ])('%s: a GET with %s is a prefetch of a page: an empty 403 in place of the challenge page', async (_row, _label, headers) => {
+                // Arrange: debug is off
+                const challenge = captchaVerdict();
+                const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+                // Act
+                const result = await run(request('GET', headers));
+
+                // Assert
+                await expectEmpty403(result, challenge);
+                expect(log).not.toHaveBeenCalledWith('prefetch: an empty 403 in place of the challenge page');
+            });
+
+            it('P4: a GET with Sec-Fetch-Dest: empty and Sec-Purpose: prefetch is not a page load: forwarded with the verdict (the GET default is ALLOW)', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+
+                // Act
+                const result = await run(request('GET', { 'sec-fetch-dest': 'empty', 'sec-purpose': 'prefetch' }));
+
+                // Assert
+                expectForwarded(result, challenge);
+            });
+
+            it('P5: with methods { GET: Action.CHALLENGE } the prefetch of P4 gets an empty 403', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                strategies();
+                (config as any).actionOnSuspicious = { methods: { GET: Action.CHALLENGE } };
+
+                // Act
+                const result = await run(request('GET', { 'sec-fetch-dest': 'empty', 'sec-purpose': 'prefetch' }));
+
+                // Assert
+                await expectEmpty403(result, challenge);
+            });
+
+            it('P6: the prefetch of P1 from a visitor with a valid session is forwarded with the verdict: the session is checked first', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                mocks.validateChallenge.mockResolvedValue(true);
+
+                // Act
+                const result = await run(request('GET', prefetchOfAPage, '/page', '_cq_se=tok|ray'));
+
+                // Assert
+                expectForwarded(result, challenge);
+                expect(mocks.validateChallenge).toHaveBeenCalledOnce();
+            });
+
+            it('P7: the prefetch of P1 without a config.challenge is forwarded with the verdict', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                (config as any).challenge = undefined;
+
+                // Act
+                const result = await run(request('GET', prefetchOfAPage));
+
+                // Assert
+                expectForwarded(result, challenge);
+            });
+
+            it('P8: the prefetch of P1 with a block verdict shown as a CAPTCHA (blockingStrategy: CAPTCHA) gets an empty 403', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                mocks.getAction.mockReturnValue(Action.BLOCK);
+                strategies(ActionStrategy.CAPTCHA);
+
+                // Act
+                const result = await run(request('GET', prefetchOfAPage));
+
+                // Assert
+                await expectEmpty403(result, challenge);
+            });
+
+            it('P9: the prefetch of P1 on a path that a GET rule with Action.ALLOW covers is forwarded with the verdict (the rule is asked first)', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                strategies();
+                (config as any).actionOnSuspicious = { rules: [{ path: '^/page$', methods: ['GET'], action: Action.ALLOW }] };
+
+                // Act
+                const result = await run(request('GET', prefetchOfAPage));
+
+                // Assert
+                expectForwarded(result, challenge);
+            });
+
+            it('P10: a GET with Sec-Fetch-Dest: document and no prefetch header still gets the challenge page', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                const sent = request('GET', { 'sec-fetch-dest': 'document' });
+
+                // Act
+                const result = await run(sent);
+
+                // Assert
+                await expectPageFor(result, challenge, sent);
+            });
+
+            it('P11: with debug on, the prefetch of P1 logs the empty 403, and its strategy line ends with pageLoad: true', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                (config as any).debug = true;
+                const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+                // Act
+                const result = await run(request('GET', prefetchOfAPage));
+
+                // Assert
+                await expectEmpty403(result, challenge);
+                const lines = log.mock.calls.map(([text]) => String(text));
+                expect(lines).toContain('prefetch: an empty 403 in place of the challenge page');
+                expect(lines.filter((text) => text.startsWith('action strategy:'))).toEqual([
+                    'action strategy: CAPTCHA (3), actionOnSuspicious: none (undefined), method: GET, pageLoad: true',
+                ]);
+            });
+
+            it('a POST that a rule challenges and that carries Sec-Purpose: prefetch (a browser does not send such a request) gets the empty 403 too, by the same check, and its body is read in the background', async () => {
+                // Arrange
+                const challenge = captchaVerdict();
+                strategies();
+                (config as any).actionOnSuspicious = { rules: [{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }] };
+                const sent = new Request(request('POST', { 'sec-purpose': 'prefetch' }, '/login'), { body: 'user=a&pass=b' });
+
+                // Act
+                const result = await run(sent);
+
+                // Assert: our own answer, so fetch reads the body that nobody sent on to the end, as for the other answers
+                await expectEmpty403(result, challenge);
+                expect(result.ctx.waitUntil).toHaveBeenCalledOnce();
+                const [bodyRead] = vi.mocked(result.ctx.waitUntil).mock.calls[0];
+                await expect(bodyRead).resolves.toBeUndefined();
+            });
         });
     });
 
@@ -1202,6 +1584,24 @@ describe('cloudflare worker', () => {
         expect(response.status).toBe(status);
         expect(originFetch).not.toHaveBeenCalled();
         expect(challenge).not.toHaveBeenCalled();
+    });
+
+    it('blocks a reply that RTI wants challenged on a path whose GET rule says BLOCK: the rule decides before the reply is answered', async () => {
+        // Arrange: the reply is a GET to the page that showed the CAPTCHA (README, the rules of "actionOnSuspicious")
+        const challenge = replyChallenge();
+        mocks.getAction.mockReturnValue(Action.CHALLENGE);
+        mocks.getActionStrategy.mockImplementation((a: Action) =>
+            a === Action.CHALLENGE ? ActionStrategy.CAPTCHA : a === Action.BLOCK ? ActionStrategy.ACCESS_DENIED : null);
+        (config as any).actionOnSuspicious = { rules: [{ path: '^/landing$', methods: ['GET'], action: Action.BLOCK }] };
+
+        // Act
+        const { response, originFetch } = await run(replyRequest());
+
+        // Assert
+        expect(response.status).toBe(403);
+        expect(await response.text()).toBe('<html>blocked</html>'); // the block page, not the challenge's answer
+        expect(challenge).not.toHaveBeenCalled();
+        expect(originFetch).not.toHaveBeenCalled();
     });
 
     it('forwards a reply unchanged in MONITORING mode', async () => {
