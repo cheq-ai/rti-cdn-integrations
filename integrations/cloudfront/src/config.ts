@@ -12,7 +12,8 @@ import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challen
 export interface CloudfrontConfig extends Config {
     /**
      * Called when the action strategy is `CAPTCHA` (by default for CHALLENGE actions, see `challengingStrategy`)
-     * and the visitor has no valid session (see `validateChallenge`).
+     * and the visitor has no valid session (see `validateChallenge`). In that case a prefetch (`Sec-Purpose` or
+     * `Purpose` contains `prefetch`) gets an empty 403, and `challenge` is not called.
      * In BLOCKING mode it is also called for every reply to the challenge page (see `isChallengeResponse`) when RTI
      * allows it (no strategy) or the strategy is CAPTCHA (`isChallengeReplyAllowed`), with or without a valid session.
      * Any other strategy (ACCESS_DENIED, NOT_FOUND, REDIRECT) is enforced as usual.
