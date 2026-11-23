@@ -5,7 +5,13 @@ import { RTIResponse } from "../models/rti-response.model";
 import { Action } from "../models/action.model";
 import { Mode } from "../models/mode.model";
 import { ActionStrategy } from "../models/action-strategy.model";
-import { BODY_METHODS, BodyMethod, RequestStrategy } from "../models/action-on-suspicious.model";
+import {
+  ACTION_ON_SUSPICIOUS_METHODS,
+  ActionOnSuspiciousMethod,
+  ActionOnSuspiciousRule,
+  BODY_METHODS,
+  RequestStrategy,
+} from "../models/action-on-suspicious.model";
 import { RTIStatelessUtils } from "./rti-stateless-utils";
 
 /**
@@ -14,8 +20,8 @@ import { RTIStatelessUtils } from "./rti-stateless-utils";
  * response leads to, and whether the config itself is valid.
  *
  * The config-free helpers (cookies, headers, list parsing, the `x-cheq-rti-result` header, the
- * challenge-reply check, the bodyless-method and Action checks, safe path matching and error
- * messages) live in {@link RTIStatelessUtils}, which this class
+ * challenge-reply check, the bodyless-method, page-load and Action checks, safe path matching and
+ * error messages) live in {@link RTIStatelessUtils}, which this class
  * extends. The integrations only ever create this service and call everything through it, so the
  * split is invisible to them: `rtiHelperService.parseCookies(...)` and
  * `RTIHelperService.parseNumberList(...)` keep working through inheritance.
@@ -93,45 +99,85 @@ export class RTIHelperService extends RTIStatelessUtils {
   }
 
   /**
-   * What to do with this request: RTI's {@link Action} mapped to a strategy ({@link getActionStrategy}).
-   * A CAPTCHA page can't carry a request body through (login, payment, the bank's 3DS return), so a POST, PUT, PATCH,
-   * DELETE or OPTIONS is never challenged in place: when the strategy is CAPTCHA, {@link getActionOnSuspicious} decides
-   * instead, mapped the same way. `strategy: null` means forward to the origin with the verdict.
+   * What to do with this request: RTI's {@link Action} mapped to a strategy ({@link getActionStrategy}). When that
+   * strategy is CAPTCHA, the CAPTCHA page is not always the answer:
+   * - RTI says CHALLENGE and the caller passes `isPageLoad`: three questions, in this order. 1. A rule of
+   *   actionOnSuspicious matches the path and covers the method: the first such rule decides. 2. A page load gets the
+   *   page. Only a GET can be a page load: a `true` passed for another method is not used. 3. Otherwise the method's
+   *   default decides, else ALLOW.
+   * - `isPageLoad` not passed (`undefined` or `null`), or a block verdict shown as a CAPTCHA (`blockingStrategy:
+   *   CAPTCHA`): as before. A GET or HEAD gets the page, and the GET and HEAD settings are not used. Any other method
+   *   follows {@link getActionOnSuspicious}: a CAPTCHA page can't carry a request body through (login, payment, the
+   *   bank's 3DS return).
+   * - A method outside the seven ({@link ActionOnSuspiciousMethod}) is forwarded, whatever `isPageLoad` says.
+   * When actionOnSuspicious decides, its Action is mapped the same way and returned in `actionOnSuspicious`.
+   * `strategy: null` means forward to the origin with the verdict.
    * @param action RTI's action for this request ({@link getAction})
    * @param method the request method
    * @param path the request path, for actionOnSuspicious rules
+   * @param isPageLoad whether the request is a page load ({@link isPageLoad}). Not passed (`undefined` or `null`): the
+   *   behavior from before this argument existed.
    */
-  getStrategyForRequest(action: Action, method: string, path: string): RequestStrategy {
+  getStrategyForRequest(action: Action, method: string, path: string, isPageLoad?: boolean): RequestStrategy {
     const strategy = action !== Action.ALLOW ? this.getActionStrategy(action) : null;
-    if (strategy !== ActionStrategy.CAPTCHA || this.isBodylessMethod(method)) {
+    if (strategy !== ActionStrategy.CAPTCHA) {
       return { strategy };
     }
-    const bodyAction = this.getActionOnSuspicious(method, path);
+    if (action !== Action.CHALLENGE || isPageLoad === undefined || isPageLoad === null) {
+      // As before isPageLoad was passed: a GET or HEAD gets the page.
+      if (this.isBodylessMethod(method)) {
+        return { strategy };
+      }
+    } else if (isPageLoad && method.toUpperCase() === 'GET' && !this.findActionOnSuspiciousRule(method, path)) {
+      // Question 2, asked only for a GET: a page load that no rule covers gets the page. A GET is one of the seven, so
+      // here the helper's answer only says whether a rule covers it (its made-up ALLOW is for a method outside them).
+      return { strategy };
+    }
+    // Question 1 or 3, or a request with a body as before: actionOnSuspicious decides.
+    const suspiciousAction = this.getActionOnSuspicious(method, path);
     return {
-      strategy: bodyAction === Action.ALLOW ? null : this.getActionStrategy(bodyAction),
-      actionOnSuspicious: bodyAction,
+      strategy: suspiciousAction === Action.ALLOW ? null : this.getActionStrategy(suspiciousAction),
+      actionOnSuspicious: suspiciousAction,
     };
   }
 
   /**
-   * What to do with a request with a body when RTI says CHALLENGE ({@link Config.actionOnSuspicious}): the first
-   * matching rule, else the method's default, else {@link Action.ALLOW}. A method that is not a {@link BodyMethod}
-   * (GET, HEAD, anything else) is ALLOW: GET and HEAD get the CAPTCHA page through the usual flow.
-   * A value that is not an {@link Action} counts as ALLOW, so a typo never blocks.
+   * The Action of {@link Config.actionOnSuspicious} for this request when RTI says CHALLENGE: the first rule that
+   * matches the path and covers the method, else the method's default, else {@link Action.ALLOW}. It covers the seven
+   * methods of {@link ActionOnSuspiciousMethod}. Any other method is ALLOW, and no rule or default is used for it.
+   * Wrong settings: a method key in `methods` that is not one of the seven is not used, and a value that is not an
+   * {@link Action} counts as ALLOW. In a rule, a bad regex never matches and a misspelled method is never matched, so
+   * the next rule or the method's default applies, and that can be BLOCK.
    * Expects the documented shape, which is not checked here: a rule without a string `path` matches every path, and
    * some other shapes throw (see the known limit on {@link ActionOnSuspicious}).
    * @param method the request method, any case
    * @param path the request path, matched against each rule's regex
    */
   getActionOnSuspicious(method: string, path: string): Action {
-    const upperMethod = method.toUpperCase() as BodyMethod;
-    if (!BODY_METHODS.includes(upperMethod)) {
-      return Action.ALLOW;
-    }
-    const settings = this.config.actionOnSuspicious;
-    const rule = settings?.rules?.find(r => (!r.methods || r.methods.includes(upperMethod)) && this.pathMatches(path, r.path));
-    const action = rule ? rule.action : settings?.methods?.[upperMethod];
+    const rule = this.findActionOnSuspiciousRule(method, path);
+    const action = rule
+      ? rule.action
+      : this.config.actionOnSuspicious?.methods?.[method.toUpperCase() as ActionOnSuspiciousMethod];
     return this.isAction(action) ? action : Action.ALLOW;
+  }
+
+  /**
+   * The rule of {@link Config.actionOnSuspicious} that decides this request, if one does: the first that matches the
+   * path and covers the method. A rule covers the methods its `methods` names. A rule without `methods` covers the
+   * five methods with a body ({@link BODY_METHODS}), not GET or HEAD. A method outside the seven gets
+   * `{ action: Action.ALLOW }`, so no rule or default is used for it.
+   * @param method the request method, any case
+   * @param path the request path, matched against each rule's regex
+   */
+  private findActionOnSuspiciousRule(method: string, path: string): Pick<ActionOnSuspiciousRule, "action"> | undefined {
+    const upperMethod = method.toUpperCase() as ActionOnSuspiciousMethod;
+    if (!ACTION_ON_SUSPICIOUS_METHODS.includes(upperMethod)) {
+      return { action: Action.ALLOW };
+    }
+    return this.config.actionOnSuspicious?.rules?.find(rule => {
+      const covered: readonly ActionOnSuspiciousMethod[] = rule.methods || BODY_METHODS;
+      return covered.includes(upperMethod) && this.pathMatches(path, rule.path);
+    });
   }
 
   /**
@@ -149,8 +195,11 @@ export class RTIHelperService extends RTIStatelessUtils {
   }
 
   /**
-   * Problems in {@link Config.actionOnSuspicious}, one message each. Wrong values are ALLOW at run time
-   * (see {@link getActionOnSuspicious}); this says what to fix. Integrations log it once per cold start.
+   * Problems in {@link Config.actionOnSuspicious}, one message each: this says what to fix. Integrations log it once
+   * per cold start. At run time the wrong values work as {@link getActionOnSuspicious} says: a method key in `methods`
+   * that is not one of the seven is not used, and a value that is not an Action counts as ALLOW. In a rule, a bad regex
+   * never matches and a misspelled method is never matched, so the next rule or the method's default applies, and that
+   * can be BLOCK.
    * Known limit: it expects the documented shape. A missing or non-string `path` is not reported (it matches every
    * path), and `rules`, a rule or `methods` of another shape, or a value JSON can't write, can make it throw. CloudFront
    * calls it at module load, so that throw stops the Lambda from starting (see {@link ActionOnSuspicious}).
@@ -159,8 +208,8 @@ export class RTIHelperService extends RTIStatelessUtils {
     const errors: string[] = [];
     const settings = this.config.actionOnSuspicious;
     for (const [method, action] of Object.entries(settings?.methods ?? {})) {
-      if (!BODY_METHODS.includes(method as BodyMethod)) {
-        errors.push(`actionOnSuspicious.methods: '${method}' is not one of ${BODY_METHODS.join(", ")}`);
+      if (!ACTION_ON_SUSPICIOUS_METHODS.includes(method as ActionOnSuspiciousMethod)) {
+        errors.push(`actionOnSuspicious.methods: '${method}' is not one of ${ACTION_ON_SUSPICIOUS_METHODS.join(", ")}`);
       }
       if (!this.isAction(action)) {
         errors.push(`actionOnSuspicious.methods.${method}: ${JSON.stringify(action)} is not an Action`);
@@ -173,8 +222,8 @@ export class RTIHelperService extends RTIStatelessUtils {
         errors.push(`actionOnSuspicious.rules[${i}].path: '${rule.path}' is not a valid regex`);
       }
       for (const method of rule.methods ?? []) {
-        if (!BODY_METHODS.includes(method)) {
-          errors.push(`actionOnSuspicious.rules[${i}].methods: '${method}' is not one of ${BODY_METHODS.join(", ")}`);
+        if (!ACTION_ON_SUSPICIOUS_METHODS.includes(method)) {
+          errors.push(`actionOnSuspicious.rules[${i}].methods: '${method}' is not one of ${ACTION_ON_SUSPICIOUS_METHODS.join(", ")}`);
         }
       }
       if (!this.isAction(rule.action)) {

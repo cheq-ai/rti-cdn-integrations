@@ -1,4 +1,4 @@
-// cspell:ignore cheq rayid
+// cspell:ignore cheq rayid propfind
 import { describe, test, expect } from 'vitest';
 import { RTIHelperService } from './rti-helper.service';
 import { RTIStatelessUtils } from './rti-stateless-utils';
@@ -359,6 +359,180 @@ describe('RTIHelperService', () => {
       expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/login').strategy).toBe(ActionStrategy.ACCESS_DENIED);
       expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/search').strategy).toBeNull();
     });
+
+    // With the page-load fact (the fourth argument), RTI's CHALLENGE with the CAPTCHA strategy asks three questions:
+    // 1. a rule covers the request: it decides; 2. a page load: the page; 3. else the method's default, else ALLOW.
+    const PAGE = { strategy: ActionStrategy.CAPTCHA };
+    const FORWARD = { strategy: null, actionOnSuspicious: Action.ALLOW };
+    const CHALLENGED = { strategy: ActionStrategy.CAPTCHA, actionOnSuspicious: Action.CHALLENGE };
+    const TWO_RULES = {
+      rules: [
+        { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+        { path: '^/api/', methods: ['GET'], action: Action.ALLOW },
+      ],
+    };
+
+    test.each([
+      ['GET /sofas, a page load: the page (question 2)', 'GET', '/sofas', true, PAGE],
+      ['GET /api/cart, not a page load: forwarded, the GET rule says ALLOW (question 1)', 'GET', '/api/cart', false, FORWARD],
+      ['GET /search/suggest, not a page load: forwarded, no rule and no default (question 3)', 'GET', '/search/suggest', false, FORWARD],
+      ['GET /api/cart, a page load: forwarded, the rule decides before the page-load fact (question 1)', 'GET', '/api/cart', true, FORWARD],
+      ['HEAD /sofas, not a page load: forwarded, no default (question 3)', 'HEAD', '/sofas', false, FORWARD],
+      ['POST /login: the CAPTCHA, the POST rule says CHALLENGE (question 1)', 'POST', '/login', false, CHALLENGED],
+      ['POST /api/order: forwarded, the GET rule does not cover POST (question 3)', 'POST', '/api/order', false, FORWARD],
+      ['GET /login, not a page load: forwarded, the POST rule does not cover GET (question 3)', 'GET', '/login', false, FORWARD],
+    ])('two rules, no defaults: %s', (_, method, path, isPageLoad, expected) => {
+      // Arrange
+      const s = svc({ actionOnSuspicious: TWO_RULES });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, method, path, isPageLoad)).toEqual(expected);
+    });
+
+    test.each([
+      ['get /api/cart, not a page load: forwarded, the GET rule says ALLOW (question 1)', 'get', '/api/cart', false, FORWARD],
+      ['get /api/cart, a page load: forwarded, the rule decides before the page-load fact (question 1)', 'get', '/api/cart', true, FORWARD],
+      ['post /login without the page-load fact: the CAPTCHA, the POST rule says CHALLENGE', 'post', '/login', undefined, CHALLENGED],
+    ])('two rules, a method in lower case: %s', (_, method, path, isPageLoad, expected) => {
+      // Arrange
+      const s = svc({ actionOnSuspicious: TWO_RULES });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, method, path, isPageLoad)).toEqual(expected);
+    });
+
+    test.each([
+      ['GET /search/suggest', 'GET', '/search/suggest'],
+      ['HEAD /sofas', 'HEAD', '/sofas'],
+      ['GET /login', 'GET', '/login'],
+    ])('two rules and methods { GET: CHALLENGE, HEAD: CHALLENGE }: %s, not a page load, gets the CAPTCHA, as before', (_, method, path) => {
+      // Arrange
+      const s = svc({ actionOnSuspicious: { ...TWO_RULES, methods: { GET: Action.CHALLENGE, HEAD: Action.CHALLENGE } } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, method, path, false)).toEqual(CHALLENGED);
+    });
+
+    test('the page-load fact comes before the default: with methods { GET: BLOCK } a page load gets the page, another GET is blocked', () => {
+      // Arrange
+      const s = svc({ actionOnSuspicious: { methods: { GET: Action.BLOCK } } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', true)).toEqual(PAGE);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', false)).toEqual({ strategy: ActionStrategy.ACCESS_DENIED, actionOnSuspicious: Action.BLOCK });
+    });
+
+    test('a rule without methods does not cover GET or HEAD: a page load gets the page, another GET or HEAD follows its default', () => {
+      // Arrange: the rule covers the five methods with a body
+      const s = svc({ actionOnSuspicious: { methods: { GET: Action.REDIRECT }, rules: [{ path: '^/api/', action: Action.BLOCK }] } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart', true)).toEqual(PAGE);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart', false)).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/api/cart', false)).toEqual(FORWARD);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'POST', '/api/cart', false)).toEqual({ strategy: ActionStrategy.ACCESS_DENIED, actionOnSuspicious: Action.BLOCK });
+    });
+
+    test.each([
+      ['BLOCK', Action.BLOCK, ActionStrategy.NOT_FOUND],
+      ['REDIRECT', Action.REDIRECT, ActionStrategy.REDIRECT],
+    ])('%s from a GET rule or a GET default gets the strategy of getActionStrategy, with actionOnSuspicious set', (_, action, strategy) => {
+      // Arrange
+      const byRule = svc({ blockingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { rules: [{ path: '^/api/', methods: ['GET'], action }] } });
+      const byDefault = svc({ blockingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { methods: { GET: action } } });
+      expect(byRule.getActionStrategy(action)).toBe(strategy);
+
+      // Act & Assert
+      expect(byRule.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart', true)).toEqual({ strategy, actionOnSuspicious: action });
+      expect(byRule.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart', false)).toEqual({ strategy, actionOnSuspicious: action });
+      expect(byDefault.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart', false)).toEqual({ strategy, actionOnSuspicious: action });
+    });
+
+    test('a GET rule whose action is not an Action still decides for a page load: it counts as ALLOW, so the GET is forwarded', () => {
+      // Arrange: the string 'BLOCK', not the enum
+      const s = svc({ actionOnSuspicious: { rules: [{ path: '.*', methods: ['GET'], action: 'BLOCK' }] } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', true)).toEqual(FORWARD);
+    });
+
+    test('a block verdict shown as a CAPTCHA asks no question: a GET gets the page whatever GET settings say, a POST follows actionOnSuspicious', () => {
+      // Arrange: blockingStrategy CAPTCHA, and GET settings that would forward a GET that is not a page load
+      const withDefault = svc({ blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { methods: { GET: Action.ALLOW, POST: Action.REDIRECT } } });
+      const withRule = svc({ blockingStrategy: ActionStrategy.CAPTCHA, actionOnSuspicious: { rules: [{ path: '^/api/', methods: ['GET'], action: Action.ALLOW }] } });
+
+      // Act & Assert
+      expect(withDefault.getStrategyForRequest(Action.BLOCK, 'GET', '/api/cart', false)).toEqual(PAGE);
+      expect(withRule.getStrategyForRequest(Action.BLOCK, 'GET', '/api/cart', false)).toEqual(PAGE);
+      expect(withDefault.getStrategyForRequest(Action.BLOCK, 'POST', '/api/cart', false)).toEqual({ strategy: ActionStrategy.REDIRECT, actionOnSuspicious: Action.REDIRECT });
+    });
+
+    test('without the page-load fact a GET and a HEAD get the page, as before, whatever the GET and HEAD settings say', () => {
+      // Arrange: GET and HEAD settings that would forward them
+      const s = svc({ actionOnSuspicious: {
+        methods: { GET: Action.ALLOW, HEAD: Action.ALLOW },
+        rules: [{ path: '^/api/', methods: ['GET', 'HEAD'], action: Action.ALLOW }],
+      } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/api/cart')).toEqual(PAGE);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/api/cart')).toEqual(PAGE);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', undefined)).toEqual(PAGE);
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'HEAD', '/sofas', undefined)).toEqual(PAGE);
+    });
+
+    test('a strategy other than CAPTCHA is kept whatever the page-load fact', () => {
+      // Arrange
+      const s = svc({ challengingStrategy: ActionStrategy.ACCESS_DENIED, actionOnSuspicious: { methods: { GET: Action.ALLOW } } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/x', false)).toEqual({ strategy: ActionStrategy.ACCESS_DENIED });
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/x', true)).toEqual({ strategy: ActionStrategy.ACCESS_DENIED });
+      expect(s.getStrategyForRequest(Action.ALLOW, 'GET', '/x', true)).toEqual({ strategy: null });
+    });
+
+    test.each(['PROPFIND', 'CONNECT', 'TRACE'])('%s, not one of the seven methods and not a page load, is forwarded: ALLOW, also when a rule or a default names it', (method) => {
+      // Arrange: a rule and a default that name the method, forced past the type
+      const s = svc({ actionOnSuspicious: { methods: { [method]: Action.BLOCK }, rules: [{ path: '.*', methods: [method], action: Action.BLOCK }] } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, method, '/x', false)).toEqual(FORWARD);
+    });
+
+    test('a method outside the seven, in any case, is forwarded also with isPageLoad true: the method decides first', () => {
+      // Arrange: isPageLoad is true only for a GET, so this caller passes a wrong fact
+      const s = svc();
+
+      // Act & Assert
+      for (const method of ['PROPFIND', 'propfind', 'Trace']) {
+        expect(s.getStrategyForRequest(Action.CHALLENGE, method, '/x', true)).toEqual(FORWARD);
+      }
+    });
+
+    test.each([
+      ['a POST with methods { POST: ALLOW } is forwarded', 'POST', { methods: { POST: Action.ALLOW } }, FORWARD],
+      ['a HEAD with no default is forwarded', 'HEAD', {}, FORWARD],
+      ['a HEAD with methods { HEAD: CHALLENGE } gets the CAPTCHA', 'HEAD', { methods: { HEAD: Action.CHALLENGE } }, CHALLENGED],
+    ])('question 2 is asked only for a GET: with isPageLoad true, %s', (_, method, settings, expected) => {
+      // Arrange: isPageLoad is true only for a GET, so this caller passes a wrong fact
+      const s = svc({ actionOnSuspicious: settings });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, method, '/x', true)).toEqual(expected);
+    });
+
+    test.each(['GET', 'get', 'Get'])('%s with isPageLoad true gets the page: a GET in any case is a GET', (method) => {
+      // Act & Assert
+      expect(svc().getStrategyForRequest(Action.CHALLENGE, method, '/sofas', true)).toEqual(PAGE);
+    });
+
+    test('null as the page-load fact counts as not passed: a GET gets the page as before, whatever its default says', () => {
+      // Arrange: a caller in plain JS can pass null; forced past the type
+      const s = svc({ actionOnSuspicious: { methods: { GET: Action.BLOCK } } });
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', null as any)).toEqual(PAGE);
+    });
   });
 
   describe('getActionOnSuspicious', () => {
@@ -379,6 +553,14 @@ describe('RTIHelperService', () => {
 
     test('matches the method in any case', () => {
       expect(svc({ methods: { POST: Action.BLOCK } }).getActionOnSuspicious('post', '/x')).toBe(Action.BLOCK);
+    });
+
+    test.each([
+      ['a rule that names POST', { rules: [{ path: '^/login$', methods: ['POST'], action: Action.BLOCK }] }],
+      ['a rule without methods', { rules: [{ path: '^/login$', action: Action.BLOCK }] }],
+    ])('matches a method in another case against %s', (_, settings) => {
+      // Act & Assert
+      expect(svc(settings).getActionOnSuspicious('post', '/login')).toBe(Action.BLOCK);
     });
 
     test('a matching rule wins over the method default; the first match wins', () => {
@@ -406,14 +588,32 @@ describe('RTIHelperService', () => {
       expect(s.getActionOnSuspicious('POST', '/x')).toBe(Action.REDIRECT);
     });
 
-    test.each(['GET', 'HEAD', 'CONNECT', 'TRACE'])('%s is always ALLOW here (not a body method)', (method) => {
-      const s = svc({ rules: [{ path: '.*', action: Action.BLOCK }] });
+    test.each([
+      ['a rule that names it decides', { rules: [{ path: '^/api/', methods: ['GET', 'HEAD'], action: Action.BLOCK }] }, Action.BLOCK],
+      ['its default decides', { methods: { GET: Action.REDIRECT, HEAD: Action.REDIRECT } }, Action.REDIRECT],
+      ['with neither, it is ALLOW', { methods: { POST: Action.BLOCK } }, Action.ALLOW],
+      ['a rule without methods does not cover it, so it is ALLOW', { rules: [{ path: '^/api/', action: Action.BLOCK }] }, Action.ALLOW],
+    ])('GET and HEAD: %s', (_, settings, expected) => {
+      // Arrange
+      const s = svc(settings);
+
+      // Act & Assert
+      expect(s.getActionOnSuspicious('GET', '/api/cart')).toBe(expected);
+      expect(s.getActionOnSuspicious('HEAD', '/api/cart')).toBe(expected);
+    });
+
+    test.each(['CONNECT', 'TRACE', 'PROPFIND'])('%s is ALLOW here: not one of the seven methods, so no rule or default is used', (method) => {
+      // Arrange: a rule and a default that name the method, forced past the type
+      const s = svc({ methods: { [method]: Action.BLOCK }, rules: [{ path: '.*', methods: [method], action: Action.BLOCK }] });
+
+      // Act & Assert
       expect(s.getActionOnSuspicious(method, '/x')).toBe(Action.ALLOW);
     });
 
-    test.each([undefined, 'BLOCK', 99, -1, null])('a value that is not an Action (%j) is ALLOW, so a typo never blocks', (value) => {
+    test.each([undefined, 'BLOCK', 99, -1, null])('a value that is not an Action (%j) counts as ALLOW', (value) => {
       expect(svc({ methods: { POST: value } }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
-      expect(svc({ rules: [{ path: '.*', action: value }] }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
+      // The rule still decides: the default behind it is not used.
+      expect(svc({ methods: { POST: Action.BLOCK }, rules: [{ path: '.*', action: value }] }).getActionOnSuspicious('POST', '/x')).toBe(Action.ALLOW);
     });
   });
 
@@ -428,16 +628,27 @@ describe('RTIHelperService', () => {
 
     test('names every problem: an unknown method, a value that is not an Action, a bad regex', () => {
       const problems = new RTIHelperService({ actionOnSuspicious: {
-        methods: { GET: Action.BLOCK, POST: 'BLOCK' },
-        rules: [{ path: '([', methods: ['HEAD'], action: 7 }],
+        methods: { FETCH: Action.BLOCK, POST: 'BLOCK' },
+        rules: [{ path: '([', methods: ['FETCH'], action: 7 }],
       } } as any).validateActionOnSuspicious();
       expect(problems).toEqual([
-        "actionOnSuspicious.methods: 'GET' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        "actionOnSuspicious.methods: 'FETCH' is not one of GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
         'actionOnSuspicious.methods.POST: "BLOCK" is not an Action',
         "actionOnSuspicious.rules[0].path: '([' is not a valid regex",
-        "actionOnSuspicious.rules[0].methods: 'HEAD' is not one of POST, PUT, PATCH, DELETE, OPTIONS",
+        "actionOnSuspicious.rules[0].methods: 'FETCH' is not one of GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
         'actionOnSuspicious.rules[0].action: 7 is not an Action',
       ]);
+    });
+
+    test('GET and HEAD are valid in methods and in a rule: no problem', () => {
+      // Act
+      const problems = new RTIHelperService({ actionOnSuspicious: {
+        methods: { GET: Action.ALLOW, HEAD: Action.CHALLENGE },
+        rules: [{ path: '^/api/', methods: ['GET', 'HEAD'], action: Action.ALLOW }],
+      } } as any).validateActionOnSuspicious();
+
+      // Assert
+      expect(problems).toEqual([]);
     });
 
     test('validateConfig includes these problems', () => {
@@ -445,7 +656,7 @@ describe('RTIHelperService', () => {
       expect(svc.validateConfig()).toContain('actionOnSuspicious.methods.POST: 9 is not an Action');
     });
 
-    test('a rule without methods (every method) has no problem, and a wrong one still gets its own message', () => {
+    test('a rule without methods (the five methods with a body) has no problem, and a wrong one still gets its own message', () => {
       // Act
       const found = new RTIHelperService({ actionOnSuspicious: {
         rules: [{ path: '^/api/', action: Action.BLOCK }, { path: '([', action: Action.BLOCK }],

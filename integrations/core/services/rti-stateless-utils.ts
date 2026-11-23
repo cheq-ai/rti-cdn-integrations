@@ -1,4 +1,4 @@
-// cspell:ignore nums CHEQ duid pvid bodyless
+// cspell:ignore nums CHEQ duid pvid bodyless prerendered
 import { RTIResponse } from "../models/rti-response.model";
 import { RTIParams } from "../models/rti-params.model";
 import { HeadersMap } from "../models/headers-map.model";
@@ -6,12 +6,13 @@ import { ActionStrategy } from "../models/action-strategy.model";
 import { RequestHeaders, RTIRequest } from "../models/rti-request.model";
 import { Action } from "../models/action.model";
 import { CHALLENGEABLE_METHODS } from "../models/action-on-suspicious.model";
+import { PageLoadHeaders } from "../models/page-load-headers.model";
 
 /**
  * The RTI helpers that need no configuration: cookie and header parsing, comma-separated list
- * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the bodyless-method and
- * Action checks, safe regex path matching, the challenge return-path check, host normalization,
- * debug-log redaction and safe error messages.
+ * parsing, the `x-cheq-rti-result` header, the challenge-reply check, the bodyless-method,
+ * page-load, prefetch and Action checks, safe regex path matching, the challenge return-path
+ * check, host normalization, debug-log redaction and safe error messages.
  *
  * Every method works only on its arguments. The class takes no constructor arguments, holds no
  * instance state and imports nothing but models, so it can be used on its own wherever no config
@@ -39,6 +40,89 @@ export class RTIStatelessUtils {
   /** True for GET and HEAD: they can get the CAPTCHA page in place, since they have no body to lose. Any case. */
   isBodylessMethod(method: string): boolean {
     return CHALLENGEABLE_METHODS.includes(method.toUpperCase());
+  }
+
+  /**
+   * Whether `Sec-Fetch-Dest` or `Accept` has a value, so that {@link isPageLoad} can decide by them (steps 2 and 3).
+   * When neither has one, isPageLoad counts a GET as a page load.
+   * @param headers the request's headers
+   */
+  hasPageLoadHeaders(headers: PageLoadHeaders): boolean {
+    return this.hasHeaderValue(headers.secFetchDest) || this.hasHeaderValue(headers.accept);
+  }
+
+  /**
+   * Whether the request is a page load. The answer is the fourth argument of RTIHelperService.getStrategyForRequest,
+   * which decides with it which GET gets the CAPTCHA page. The steps, in this order:
+   * 1. The method is not GET (any case): no.
+   * 2. `Sec-Fetch-Dest` has a value: yes only when it is `document`.
+   * 3. Else, `Accept` has a value: yes only when it contains `text/html`.
+   * 4. Else, neither header has a value and the function cannot tell: the GET counts as a page load. This is the
+   *    behavior from before this function existed: a GET that RTI wants challenged gets the CAPTCHA page.
+   * A header has a value when it is a string that is not empty after trimming. Values are compared in any case.
+   * `Sec-Purpose` and `Purpose` are not read: a prefetch of a page is a page load. {@link isPrefetch} tells a prefetch.
+   *
+   * The headers can be missing. A client can leave them out. At origin-request, CloudFront's Lambda@Edge function gets
+   * only the headers that CloudFront sends to the origin: those its origin request policy or cache policy includes, or
+   * with legacy cache settings, those that these settings forward (AWS docs: "Lambda@Edge event structure", whose
+   * origin request example holds the headers CloudFront sends to the origin, and "Control origin requests with a
+   * policy"). Without `Sec-Fetch-Dest` and `Accept`, a GET reaches step 4.
+   * {@link hasPageLoadHeaders} says whether step 2 or 3 can decide.
+   *
+   * A header that a client sends more than once reaches this function as one value, its values joined with ", "
+   * (the caller joins them: see {@link PageLoadHeaders}). So `Sec-Fetch-Dest: document` sent twice reads
+   * `document, document`, which is not `document` (step 2 compares the whole value): that GET is not a page load, and
+   * it follows actionOnSuspicious (a rule, else the GET default), like any GET that is not a page load. A browser sets
+   * this header once, as one token (W3C Fetch Metadata, "Set the Sec-Fetch-Dest header for a request"; the Fetch
+   * standard's "set" keeps one header of a name), so this is rare. It is left as it is on purpose: the owner's
+   * decision of 2026-11-22. The spec row "a Sec-Fetch-Dest sent twice" pins it.
+   * @param method the request method
+   * @param headers the request's headers
+   */
+  isPageLoad(method: string, headers: PageLoadHeaders): boolean {
+    if (method.toUpperCase() !== 'GET') {
+      return false;
+    }
+    if (this.hasHeaderValue(headers.secFetchDest)) {
+      return headers.secFetchDest.trim().toLowerCase() === 'document';
+    }
+    if (this.hasHeaderValue(headers.accept)) {
+      return this.headerContains(headers.accept, 'text/html');
+    }
+    return true;
+  }
+
+  /**
+   * Whether the request is a prefetch: `Sec-Purpose` or `Purpose` contains `prefetch`, in any case. A missing, `null`
+   * or blank header has no value. The method and the other headers are not read.
+   *
+   * What it is for: the handlers answer a prefetch that would get the CAPTCHA page with an empty 403 (the owner's
+   * decision of 2026-11-23). MDN's page "Speculation Rules API" says that prefetched and prerendered page requests are
+   * sent with the `Sec-Purpose` header (`prefetch`, or `prefetch;prerender`), and that a page answered with a status
+   * outside 200 to 299 is not prefetched or prerendered. Nobody ran this in a browser here.
+   *
+   * Known limit, left as it is on purpose (the owner's decision of 2026-11-23: not fixed, written down here and in both
+   * READMEs): a page that a site names in `<link rel="prefetch">`. MDN's page for `rel="prefetch"` says that the
+   * browser asks for it with `Sec-Purpose: prefetch` and `Sec-Fetch-Dest: empty`, and that the result is kept in the
+   * HTTP cache. This function says yes for such a request, but with `Sec-Fetch-Dest: empty` it is not a page load
+   * ({@link isPageLoad}, step 2). So it follows actionOnSuspicious like any GET that is not a page load: as shipped it
+   * is forwarded with the verdict, and it never reaches the handlers' check for the empty 403. The browser may then
+   * show that page from its cache when the visitor opens it, without the CAPTCHA. A customer who wants the empty 403
+   * for it sets `methods: { GET: Action.CHALLENGE }`, with ALLOW rules for the paths of the site's background calls.
+   * @param headers the request's headers
+   */
+  isPrefetch(headers: PageLoadHeaders): boolean {
+    return this.headerContains(headers.secPurpose, 'prefetch') || this.headerContains(headers.purpose, 'prefetch');
+  }
+
+  // A header has a value when it is a string that is not empty after trimming.
+  private hasHeaderValue(value: string | null | undefined): value is string {
+    return typeof value === 'string' && value.trim() !== '';
+  }
+
+  // Whether a header value contains `text` (written in lower case), in any case. A missing header contains nothing.
+  private headerContains(value: string | null | undefined, text: string): boolean {
+    return typeof value === 'string' && value.toLowerCase().includes(text);
   }
 
   /**

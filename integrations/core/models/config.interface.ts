@@ -100,14 +100,19 @@ export interface Config {
   ignorePaths?: string[];
 
   /**
-   * What to do when RTI says CHALLENGE for a request with a body (POST, PUT, PATCH, DELETE, OPTIONS). GET and HEAD
-   * always get the CAPTCHA page. Every default is ALLOW: forwarded with `x-cheq-rti-result`.
-   * See {@link ActionOnSuspicious}.
+   * What to do when RTI says CHALLENGE and the request is not a page load: a request with a body (POST, PUT, PATCH,
+   * DELETE, OPTIONS), or another GET or HEAD. A page load gets the CAPTCHA page, unless a rule covers it. Every default
+   * is ALLOW: forwarded with `x-cheq-rti-result`.
+   * `methods: { GET: Action.CHALLENGE, HEAD: Action.CHALLENGE }` gives a GET or HEAD that no rule covers the CAPTCHA
+   * page, as before. See {@link ActionOnSuspicious}.
    * @example
    * ```ts
    * {
    *   methods: { POST: Action.ALLOW, PUT: Action.BLOCK },
-   *   rules: [{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }],
+   *   rules: [
+   *     { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
+   *     { path: '^/api/', methods: ['GET'], action: Action.ALLOW },
+   *   ],
    * }
    * ```
    */

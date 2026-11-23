@@ -1,4 +1,4 @@
-// cspell:ignore cheq rayid bodyless
+// cspell:ignore cheq rayid bodyless prerender xhtml
 import { describe, test, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { RTIStatelessUtils } from './rti-stateless-utils';
@@ -151,6 +151,105 @@ describe('RTIStatelessUtils', () => {
     });
   });
   // #endregion isBodylessMethod Method Tests
+
+  // #region isPageLoad Method Tests
+  describe('isPageLoad', () => {
+    const utils = new RTIStatelessUtils();
+
+    // The rule's table, one row per value of each cell. A header left out of the object is not there.
+    test.each([
+      // Sec-Fetch-Dest decides
+      ['GET', { secFetchDest: 'document', accept: '*/*' }, true],
+      ['GET', { secFetchDest: 'document' }, true],
+      ['get', { secFetchDest: ' Document ' }, true],
+      ['GET', { secFetchDest: 'empty', accept: 'text/html' }, false],
+      ['GET', { secFetchDest: 'iframe', accept: 'text/html' }, false],
+      ['GET', { secFetchDest: 'image', accept: 'text/html' }, false],
+      ['GET', { secFetchDest: 'script', accept: 'text/html' }, false],
+      // no Sec-Fetch-Dest: Accept decides
+      ['GET', { accept: 'text/html,application/xhtml+xml,*/*;q=0.8' }, true],
+      ['GET', { secFetchDest: '', accept: 'text/html,application/xhtml+xml,*/*;q=0.8' }, true],
+      ['GET', { accept: 'TEXT/HTML' }, true],
+      ['GET', { accept: '*/*' }, false],
+      // neither header has a value: the GET counts as a page load, as before
+      ['GET', {}, true],
+      ['GET', { accept: '' }, true],
+      ['GET', { secFetchDest: '  ' }, true],
+      ['GET', { secFetchDest: '  ', accept: '' }, true],
+      // Sec-Purpose and Purpose are not read here (isPrefetch reads them): a prefetch of a page is a page load
+      ['GET', { secPurpose: 'prefetch', secFetchDest: 'document', accept: 'text/html' }, true],
+      ['GET', { secPurpose: 'prefetch;prerender', secFetchDest: 'document', accept: 'text/html' }, true],
+      ['GET', { purpose: 'prefetch', accept: 'text/html' }, true],
+      ['GET', { secPurpose: 'prefetch', secFetchDest: 'empty' }, false],
+      // only a GET is a page load
+      ['HEAD', { secFetchDest: 'document', accept: 'text/html' }, false],
+      ['POST', { secFetchDest: 'document', accept: 'text/html' }, false],
+      ['PUT', { secFetchDest: 'document', accept: 'text/html' }, false],
+      ['PATCH', { secFetchDest: 'document', accept: 'text/html' }, false],
+      ['DELETE', { secFetchDest: 'document', accept: 'text/html' }, false],
+      ['OPTIONS', { secFetchDest: 'document', accept: 'text/html' }, false],
+    ])('%s with %j is a page load: %s', (method, headers, expected) => {
+      // Act & Assert
+      expect(utils.isPageLoad(method, headers)).toBe(expected);
+    });
+
+    test.each([
+      ['a missing header given as null', 'GET', { secFetchDest: null, accept: null }, true],
+      ['a prefetch header in upper case is not read either', 'GET', { secPurpose: 'PREFETCH', secFetchDest: 'document' }, true],
+      ['an Accept sent twice, joined with ", " and judged as one value', 'GET', { accept: 'application/json, text/html' }, true],
+      ['a Sec-Fetch-Dest sent twice, joined with ", ": the whole value is not document', 'GET', { secFetchDest: 'document, document' }, false],
+    ])('%s: %s with %j is a page load: %s', (_, method, headers, expected) => {
+      // Act & Assert
+      expect(utils.isPageLoad(method, headers)).toBe(expected);
+    });
+  });
+  // #endregion isPageLoad Method Tests
+
+  // #region hasPageLoadHeaders Method Tests
+  describe('hasPageLoadHeaders', () => {
+    const utils = new RTIStatelessUtils();
+
+    test.each([
+      ['no header', {}],
+      ['both null', { secFetchDest: null, accept: null }],
+      ['only spaces and an empty value', { secFetchDest: '  ', accept: '' }],
+      ['only Sec-Purpose and Purpose', { secPurpose: 'prefetch', purpose: 'prefetch' }],
+    ])('false for %s: neither Sec-Fetch-Dest nor Accept has a value', (_, headers) => {
+      // Act & Assert
+      expect(utils.hasPageLoadHeaders(headers)).toBe(false);
+    });
+
+    test.each([
+      ['Sec-Fetch-Dest', { secFetchDest: 'empty' }],
+      ['Accept', { accept: '*/*' }],
+    ])('true when %s has a value', (_, headers) => {
+      // Act & Assert
+      expect(utils.hasPageLoadHeaders(headers)).toBe(true);
+    });
+  });
+  // #endregion hasPageLoadHeaders Method Tests
+
+  // #region isPrefetch Method Tests
+  describe('isPrefetch', () => {
+    const utils = new RTIStatelessUtils();
+
+    // Sec-Purpose or Purpose contains "prefetch", in any case. A missing, null or blank header has no value.
+    test.each([
+      [{ secPurpose: 'prefetch' }, true],
+      [{ secPurpose: 'prefetch;prerender' }, true],
+      [{ secPurpose: 'prefetch;anonymous-client-ip' }, true],
+      [{ purpose: 'Prefetch' }, true],
+      [{ secPurpose: 'prefetch', purpose: 'prefetch' }, true],
+      [{ secPurpose: 'prerender' }, false],
+      [{ secPurpose: '  ', purpose: '' }, false],
+      [{ secPurpose: null, purpose: null }, false],
+      [{}, false],
+    ])('%j is a prefetch: %s', (headers, expected) => {
+      // Act & Assert
+      expect(utils.isPrefetch(headers)).toBe(expected);
+    });
+  });
+  // #endregion isPrefetch Method Tests
 
   // #region isAction Method Tests
   describe('isAction', () => {

@@ -453,7 +453,8 @@ Coverage thresholds are 95% statements / 90% branches / 95% functions / 95% line
 2. Extend `Config` with any CDN-specific fields (see `AkamaiConfig`, `CloudfrontConfig`).
 3. Write the adapter: collect headers, build the `RTIRequest`, then drive the core pipeline. CloudFront
    and Cloudflare call RTI first — `shouldIgnore` → `getEventType` / `parseCookies` → `callRTI` →
-   `getAction` → `getStrategyForRequest` — and check `validateChallenge` only for a `CAPTCHA` strategy;
+   `getAction` → `isPageLoad` → `getStrategyForRequest` (pass the `isPageLoad` answer as its fourth
+   argument) — and check `validateChallenge` only for a `CAPTCHA` strategy;
    new adapters should follow them. Akamai has the old order: `shouldIgnore` → `validateChallenge` →
    `getEventType` / `parseCookies` → `callRTI` → `getAction` → `getActionStrategy`.
 4. Reuse `core/services/rti.service.ts` if the runtime has `fetch()`. On a low-CPU Node runtime
