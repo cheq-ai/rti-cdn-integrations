@@ -1378,6 +1378,9 @@ came from (Google, an ad, a partner). The example carries the original Referer t
    - from this host, the full URL without the `#fragment`: `https://shop.com/category?page=2`
    - cut to 420 characters (the most GA4 keeps for `page_referrer`), never in the middle of an encoded character
    - nothing for no Referer, or one that is not an http(s) URL
+
+   The page takes it from the request's `x-cheq-original-referer` header when that header has a value, else from the
+   request's `Referer`.
 2. The form sends it with the token. It is in the answer's URL, like the Referer already is in CloudFront's logs.
 3. Only on the 302 after a **verified** solve, the Lambda checks it again (the client controls the URL) and hands it
    on in a cookie (below). A failed token, a retry page or a paused CAPTCHA set nothing.
@@ -1453,6 +1456,10 @@ request it recognizes, also when RTI allows it, when the visitor has a valid ses
 `response` with only `ids`, where `ids.rayId` is the CloudFront request id and not an RTI ray id, and no
 `addRtiResultHeader`: see the **RTI down** item there). Without `isChallengeResponse`, replies are not recognized (a warning is
 logged once per cold start): in `BLOCKING` mode a reply that RTI allows then reaches the origin with the form fields.
+
+A custom `challenge` finds the original Referer where the example's challenge page finds it: in the
+`x-cheq-original-referer` header of the request it gets when that header has a value, else in its `Referer` (see
+[The original Referer](#the-original-referer)).
 
 > **Note:** If `config.challenge` throws, the error is caught and the request is passed through (fail-open). Errors are logged via `console.error`, and to the RTI logger unless `logErrors` is `false`. For a reply to the challenge page, passing it through means the origin gets the token and the form fields in place of the visitor's query string: handle errors on a reply inside `challenge` instead (the Turnstile example shows the widget again, then redirects to `original_url` once paused).
 

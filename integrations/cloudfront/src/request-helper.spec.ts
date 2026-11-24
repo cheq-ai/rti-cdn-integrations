@@ -677,6 +677,7 @@ describe('request-helper handle', () => {
 
         afterEach(() => {
             delete (config as any).actionOnSuspicious;
+            delete (config as any).originalReferer;
         });
 
         it('with no setting, a POST is forwarded with x-cheq-rti-result (every default is ALLOW)', async () => {
@@ -742,6 +743,46 @@ describe('request-helper handle', () => {
             (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
             await handle(post('/api/login', headers), RequestType.VIEWER_REQUEST);
             expect(challenge.mock.calls[0][0]).toMatchObject({ method: 'GET', uri: '/', querystring: '' });
+        });
+
+        it('CHALLENGE takes x-cheq-original-referer off the GET for the CAPTCHA page only: the POST forwarded when config.challenge throws keeps it', async () => {
+            // Arrange
+            expectError = true;
+            const challenge = captchaVerdict().mockRejectedValue(new Error('challenge crash'));
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
+            (config as any).originalReferer = vi.fn().mockReturnValue('https://www.google.com/');
+            const event = post('/api/login', { Referer: 'https://example.com/account/login' });
+
+            // Act
+            const result = await handle(event, RequestType.VIEWER_REQUEST);
+
+            // Assert: the GET that config.challenge got
+            const pageRequest = challenge.mock.calls[0][0];
+            expect(pageRequest.method).toBe('GET');
+            expect(pageRequest.headers['x-cheq-original-referer']).toBeUndefined();
+            expect(pageRequest.headers['referer']).toEqual([{ key: 'Referer', value: 'https://example.com/account/login' }]);
+            // Assert: the POST, forwarded as it is
+            expect(result).toBe(event.Records[0].cf.request);
+            expect(event.Records[0].cf.request.method).toBe('POST');
+            expect(event.Records[0].cf.request.headers['x-cheq-original-referer']).toEqual([{ key: 'x-cheq-original-referer', value: 'https://www.google.com/' }]);
+            expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge error handling request 'req-123': challenge crash`);
+        });
+
+        it('CHALLENGE of a GET: the request config.challenge gets keeps x-cheq-original-referer', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            realStrategies();
+            (config as any).originalReferer = vi.fn().mockReturnValue('https://www.google.com/');
+            const event = buildEvent('/page', 'example.com', '1.2.3.4', '', '', { extraHeaders: { Referer: 'https://example.com/sofas' } });
+
+            // Act
+            await handle(event, RequestType.VIEWER_REQUEST);
+
+            // Assert
+            const pageRequest = challenge.mock.calls[0][0];
+            expect(pageRequest).toBe(event.Records[0].cf.request);
+            expect(pageRequest.headers['x-cheq-original-referer']).toEqual([{ key: 'x-cheq-original-referer', value: 'https://www.google.com/' }]);
         });
 
         it('CHALLENGE with a valid session: no CAPTCHA, forwarded with the real POST', async () => {

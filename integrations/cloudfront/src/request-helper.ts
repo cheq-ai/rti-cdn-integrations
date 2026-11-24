@@ -411,12 +411,19 @@ function getHeaders(keepHeadersNames: string[], headers: CloudFrontHeaders): Req
  * a GET for the page the visitor came from (the Referer, same host only), so after solving they are back on the form
  * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the site's home page
  * ("/"): an address on another site is never used, so the CAPTCHA can't be turned into an open redirect.
- * The body is not kept. The real request is not changed: it is still the one checked for a session.
+ * The body is not kept, and neither is x-cheq-original-referer: the CAPTCHA page takes that header first, and the form
+ * page carries its own Referer (README, "The original Referer"). The real request is not changed: it is still the one
+ * checked for a session, and it keeps x-cheq-original-referer.
  */
 function refererAfterChallengeRequest(request: CloudFrontRequest): CloudFrontRequest {
     const { body: _body, ...withoutBody } = request;
     const referer = rtiHelperService.sameSiteReferer(request.headers['referer']?.[0]?.value, request.headers['host']?.[0]?.value);
-    return { ...withoutBody, method: 'GET', uri: referer?.path ?? '/', querystring: referer?.query ?? '' };
+    // A new headers object for the GET: the spread above copies only a reference to the request's headers object.
+    // Deleting x-cheq-original-referer from that object would take it off the real request too, which is forwarded
+    // when config.challenge throws.
+    const headers = { ...request.headers };
+    delete headers[ORIGINAL_REFERER_HEADER];
+    return { ...withoutBody, method: 'GET', uri: referer?.path ?? '/', querystring: referer?.query ?? '', headers };
 }
 
 // After a solved CAPTCHA: where the visitor came from before it, as x-cheq-original-referer for RTI and the origin.

@@ -349,7 +349,10 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
         // Not solved yet. The return URL keeps the query string (gclid, utm_*, ...): request.uri is only the path.
         const originalUrl = request.querystring ? `${request.uri}?${request.querystring}` : request.uri;
         // Where the visitor came from, carried by the form: after the CAPTCHA the browser only knows this page.
-        const originalReferer = statelessUtils.originalReferer(request.headers["referer"]?.[0]?.value, request.headers["host"]?.[0]?.value);
+        // The page takes x-cheq-original-referer when that header has a value, else the request's Referer. The header
+        // can be trusted here: request-helper removes a copy the client sent, and sets it only from a valid _cq_rf
+        // cookie.
+        const originalReferer = statelessUtils.originalReferer(request.headers["x-cheq-original-referer"]?.[0]?.value || request.headers["referer"]?.[0]?.value, request.headers["host"]?.[0]?.value);
         return challengePage(settings, response, originalUrl, undefined, originalReferer);
     }
     // else : user already solved the challenge and submitted the form with the token. Verify it with Cloudflare's siteverify.
