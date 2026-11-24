@@ -147,9 +147,9 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
      one of its log lines is logged and changes nothing else (see [Monitoring and logs](#monitoring-and-logs)).
 7. **Allow.** Every other request (ALLOW, a request that `actionOnSuspicious` lets through, such as a `GET` that is not
     a page load, the `CAPTCHA` cases above that are forwarded with the verdict, and the interstitial's forwards) gets
-    `x-cheq-rti-result` on the copy, and the copy is forwarded. When `actionOnSuspicious` let a suspicious request
-    through and the origin answers with an HTML page, that answer gets `Cache-Control: no-store` (see
-    [Which request gets a page](#which-request-gets-a-page)).
+    `x-cheq-rti-result` on the copy, and the copy is forwarded. When RTI wants the request challenged or blocked
+    (`BLOCKING` mode) and no valid CAPTCHA session let it through, the origin's HTML answer gets
+    `Cache-Control: no-store` (see [Which request gets a page](#which-request-gets-a-page)).
 8. **Any error before the decision** (an RTI error or timeout, a malformed RTI response): logged. A recognized challenge
    reply (the same conditions as step 5) still goes to `config.challenge`, with a stand-in response and no
    `addRtiResultHeader` (see [Challenge callbacks](#challenge-callbacks)). Everything else is forwarded, without the
@@ -272,14 +272,36 @@ An example with two rules and no defaults: `{ path: '^/login$', methods: ['POST'
 Before this version, every request that RTI wanted challenged got the CAPTCHA page, whatever its method. "Forwarded"
 means sent to the origin with `x-cheq-rti-result`, so the origin decides.
 
-**The browser does not keep a page forwarded this way.** When a rule or a default lets a request through
-(`Action.ALLOW`) and the origin answers with an HTML page (`Content-Type` `text/html` or `application/xhtml+xml`), the
-Worker sets `Cache-Control: no-store, no-cache, must-revalidate` on that answer. Without it, a page that a script
-fetched could stay in the browser's cache, and the browser could show it later for a link click, a redirect or Back
-without asking the Worker: the visitor would get the page without the CAPTCHA. That was seen in Chromium 131 and
-Firefox 132 on 2026-11-23, with an origin that sends no `Cache-Control`. The rest of the answer (status, body, the
-other headers) is not changed. An answer that is not HTML (JSON, an image, a script) keeps the origin's caching
-headers, and so does every answer on a benign verdict, and a page load that a valid CAPTCHA session lets through.
+**The browser does not keep a flagged page let through without a CAPTCHA pass.** In `BLOCKING` mode the Worker can
+forward a request that RTI wants challenged or blocked. Then the origin's HTML answer (`Content-Type` `text/html` or
+`application/xhtml+xml`) gets `Cache-Control: no-store, no-cache, must-revalidate`, unless a valid CAPTCHA session
+let the request through or the request is forwarded without the verdict (after an error). The
+rest of the answer (status, body, the other headers) is not changed. A page that the browser keeps could be shown
+later for a link click, a redirect or Back without asking the Worker, so the visitor would get it without the
+interstitial or the CAPTCHA. That was seen in Chromium 131 and Firefox 132 on 2026-11-23, for a page that a script
+fetched, with an origin that sends no `Cache-Control`. These requests get `no-store` on the origin's HTML answer:
+
+- a request that a rule or a default of `actionOnSuspicious` lets through (`Action.ALLOW`), such as a `GET` that is
+  not a page load;
+- a page load that the interstitial lets through, with `onSecondVerdict` or `onSessionNotFound` set to `Action.ALLOW`
+  (see [Interstitial](#interstitial)), and a request that the Worker forwards after an error in the interstitial's
+  code;
+- a request that would get the CAPTCHA page but is forwarded because `config.challenge` is not set (as shipped, until
+  the three Turnstile secrets are set), also when the interstitial's `Action.CHALLENGE` or `blockingStrategy: CAPTCHA`
+  led there.
+
+These keep the origin's caching headers:
+
+- an answer that is not HTML (JSON, an image, a script);
+- the answer to a request that RTI lets through (its action is `ALLOW`, as for a benign verdict), and every answer in
+  `MONITORING` mode;
+- the answer to a request that a valid CAPTCHA session lets through (`validateChallenge` gives `true`; with the
+  Turnstile example also during a [siteverify pause](#siteverify-pause));
+- the answer to a request forwarded without the verdict (an ignored path, an RTI error, a throw from
+  `validateChallenge` or `challenge`), and to a `Request` that `config.challenge` returns.
+
+CloudFront cannot do this: it runs on the request and cannot change the origin's answer (see its README,
+[Which request gets a page](../cloudfront/README.md#which-request-gets-a-page)).
 
 **While the interstitial is on**, the page of question 2 for a `GET` page load is the interstitial, whatever
 `challengingStrategy` says, and a rule's `Action.CHALLENGE` for a `GET` page load means the interstitial too (row 1).
@@ -367,7 +389,7 @@ in row 2.
   [`rel=prefetch`](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/rel/prefetch) page says that
   the browser asks for it with `Sec-Purpose: prefetch` and `Sec-Fetch-Dest: empty`, and that "The result is kept in the
   HTTP cache on disk". Its HTML answer gets `Cache-Control: no-store` like any page forwarded this way (see
-  [The browser does not keep a page forwarded this way](#which-request-gets-a-page)), so the browser does not reuse it
+  [The browser does not keep a flagged page let through without a CAPTCHA pass](#which-request-gets-a-page)), so the browser does not reuse it
   for the click. Seen on 2026-11-24 in Chromium 131: with the mark, the click on a prefetched page went to the Worker
   and got the CAPTCHA page. Without it (the Worker before this change) the click showed the prefetched page, without
   the CAPTCHA. Firefox 132 and WebKit 18.2 sent no prefetch request in the same test. The prefetch itself still reaches
@@ -766,7 +788,8 @@ What a suspicious page load gets when the tag has run.
 - It does not apply when RTI says benign (the page) or malicious (the block), nor to a request that is not a page
   load.
 - `Action.ALLOW` (the default, as the product spec asks): the page, forwarded to your origin with
-  `x-cheq-rti-result` (`verdict=suspicious`).
+  `x-cheq-rti-result` (`verdict=suspicious`). The origin's HTML answer reaches the visitor with
+  `Cache-Control: no-store` (see [Which request gets a page](#which-request-gets-a-page)).
 - `Action.BLOCK`: what `blockingStrategy` gives. By default that is the block page (403). It can also be a 404, a
   redirect or the CAPTCHA, if `blockingStrategy` says so.
 - `Action.REDIRECT`: a 302 to `redirectLocation`. Set `redirectLocation`. The config check of `npm run test` then
@@ -789,8 +812,9 @@ What a suspicious page load gets when the tag did not run, right after the inter
   interstitial (the product spec's loop guard, FR-6).
 - The mark counts on every page of your site for its 60 seconds. So such a visitor gets this setting's answer on each
   page in that time, not a new interstitial.
-- The values are the four of `onSecondVerdict`, with the same results: `ALLOW` forwards with the verdict, `BLOCK` gives
-  what `blockingStrategy` gives, `REDIRECT` a 302 to `redirectLocation`, `CHALLENGE` the CAPTCHA.
+- The values are the four of `onSecondVerdict`, with the same results: `ALLOW` forwards with the verdict (the origin's
+  HTML answer reaches the visitor with `Cache-Control: no-store`), `BLOCK` gives what `blockingStrategy` gives,
+  `REDIRECT` a 302 to `redirectLocation`, `CHALLENGE` the CAPTCHA.
 - Default `Action.ALLOW`: the product spec's FR-6 makes "open" the default and leaves the choice to each site.
 - The trade-off. `ALLOW` lets a client pass after one extra request when it blocks the tag, or copies the mark out of
   the page without running it. `BLOCK` or `CHALLENGE` stops such a client, but also stops real visitors whose ad

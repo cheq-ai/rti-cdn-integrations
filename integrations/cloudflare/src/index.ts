@@ -42,9 +42,15 @@ const RELOAD_OUTCOMES: Partial<Record<Action, string>> = {
 // Our block, 404 and redirect answers, and the empty 403 for a prefetch, are never cached.
 const responseHeaders = new ResponseHeaders();
 
-// The requests that handle passes on for a suspicious visitor because actionOnSuspicious let them through (a GET that is
-// not a page load, say). An HTML answer to one of them is made no-store in fetch (see keepOutOfBrowserCache).
+// The requests that handle sends on with the verdict while RTI wants them challenged or blocked (in BLOCKING mode only:
+// getAction gives ALLOW in any other mode), unless a valid CAPTCHA pass let them through (waivedByValidSession). An HTML
+// answer to one of them is made no-store in fetch (see keepOutOfBrowserCache).
 const passedOnForSuspicious = new WeakSet<Request>();
+
+// The requests for which a valid challenge session waived the CAPTCHA (validateChallenge gave true, in the CAPTCHA case
+// of carryOutStrategy). handle does not add them to passedOnForSuspicious: their answer keeps the origin's caching
+// headers.
+const waivedByValidSession = new WeakSet<Request>();
 
 // Once per cold start, and never fatal: an exception while the module loads breaks every request of the Worker. Only
 // reads the config and logs. The [challenge] and [interstitial] checks run first: an actionOnSuspicious check that
@@ -111,10 +117,13 @@ export default {
 };
 
 /**
- * An HTML answer that handle passed on for a suspicious visitor (actionOnSuspicious let the request through, e.g. a
- * script's fetch of a page) gets Cache-Control: no-store. Kept, the browser could show that page later for a link click,
- * a redirect or Back without asking the Worker, and the CAPTCHA would never come (seen in Chromium and Firefox; README,
- * "Which request gets a page"). Any other answer, and the rest of this one, is returned as the site sent it.
+ * An HTML answer to a request that handle passed on while RTI wanted it challenged or blocked gets
+ * Cache-Control: no-store, unless a valid CAPTCHA pass let the request through (passedOnForSuspicious; the owner's
+ * decision of 2026-11-24). Such a request was let through by actionOnSuspicious, the interstitial or a missing
+ * config.challenge. Kept, the browser could show that page later for a link click, a redirect or Back without asking
+ * the Worker, and the interstitial or the CAPTCHA would not come (seen in Chromium and Firefox for a page that a script
+ * fetched; README, "Which request gets a page"). Any other answer, and the rest of this one, is returned as the site
+ * sent it.
  */
 function keepOutOfBrowserCache(response: Response): Response {
     const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
@@ -319,7 +328,9 @@ async function handle(request: Request, originRequest: Request, context: Executi
         // Set the RTI result header for the origin to consume. It is not visible to the client; the origin can log it
         // or act on it.
         setHeaders(originRequest.headers, rtiResponse);
-        if (actionOnSuspicious === Action.ALLOW) {
+        // RTI wants the request challenged or blocked, and no valid CAPTCHA pass let it through: fetch makes the origin's
+        // HTML answer no-store (see passedOnForSuspicious).
+        if (action !== Action.ALLOW && !waivedByValidSession.has(originRequest)) {
             passedOnForSuspicious.add(originRequest);
         }
         return originRequest;
@@ -369,6 +380,9 @@ async function carryOutStrategy(strategy: ActionStrategy | null, request: Reques
                         if (config.debug) {
                             console.log("valid challenge session, waiving CAPTCHA");
                         }
+                        // handle does not mark a request waived here, so the origin's answer keeps its caching headers
+                        // (see passedOnForSuspicious).
+                        waivedByValidSession.add(originRequest);
                         return undefined;
                     }
                     // A prefetch (Sec-Purpose or Purpose contains "prefetch") gets an empty 403 in place of the

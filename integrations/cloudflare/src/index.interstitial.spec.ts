@@ -1,7 +1,8 @@
 // cspell:ignore gclid duid pvid siteverify
 // The passive interstitial in the Worker: the strategy INTERSTITIAL, the line for MONITORING mode, the outcome lines,
-// the empty 403 for a prefetch, the mark (_cq_it) on the reload, and "cookie" mode. Core is real (RTIHelperService,
-// InterstitialService, the page). Only RTI (callRTI) and the RTI logger are mocks, so nothing reaches CHEQ's services.
+// the empty 403 for a prefetch, the mark (_cq_it) on the reload, "cookie" mode, and the caching headers of a forwarded
+// answer. Core is real (RTIHelperService, InterstitialService, the page). Only RTI (callRTI) and the RTI logger are
+// mocks, so nothing reaches CHEQ's services.
 // index reads config.interstitial once, when it loads, so each test loads a fresh copy of index against its own config.
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { Mode } from '../../core/models/mode.model';
@@ -112,9 +113,10 @@ const rtiAnswer = (sessionFound: boolean | null, overrides: Parameters<typeof bu
 // A config.challenge that answers with its own page.
 const captchaPage = () => vi.fn<NonNullable<CloudflareConfig['challenge']>>(async () => new Response('<html>captcha</html>', { status: 403 }));
 
-// Sends a request through the Worker. `forwarded` is the request the origin got, if any.
-async function run(worker: Worker, request: Request) {
-    const originFetch = vi.fn(async (_request: Request) => new Response('origin'));
+// Sends a request through the Worker. `forwarded` is the request the origin got, if any. `origin` gives the origin's
+// answer: by default the text "origin" (Content-Type text/plain), which the Worker passes on as it is.
+async function run(worker: Worker, request: Request, origin: () => Promise<Response> = async () => new Response('origin')) {
+    const originFetch = vi.fn<(request: Request) => Promise<Response>>(origin);
     vi.stubGlobal('fetch', originFetch);
     const ctx = { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as unknown as ExecutionContext;
     const response = await worker.fetch(request, {}, ctx);
@@ -1465,5 +1467,170 @@ describe('"cookie" mode (originalRefererVia "cookie")', () => {
         expect(page).toHaveBeenCalledOnce();
         expect(page.mock.calls[0][1]).toBe('ray-2');
         expect(page.mock.calls[0][2]).toBe('https://www.google.com/');
+    });
+});
+
+// What the browser may keep of the origin's answer (keepOutOfBrowserCache in fetch; the owner's decision of 2026-11-24).
+// In BLOCKING mode, when RTI wanted a request challenged or blocked and the Worker forwards it with the verdict, the
+// origin's HTML answer gets no-store, unless a valid CAPTCHA pass let the request through: a page that the browser keeps
+// could be shown later without asking the Worker. A benign verdict, MONITORING mode and a valid pass keep the origin's
+// caching headers.
+describe('what the browser may keep of an answer forwarded while the interstitial is on', () => {
+    // The origin's answer: an HTML page with its own Cache-Control. Its text is "origin", as expectForwardedWithVerdict
+    // checks.
+    const originPage = async () => new Response('origin', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'max-age=600' } });
+    const NO_STORE = 'no-store, no-cache, must-revalidate';
+
+    it('a suspicious GET that is not a page load (Sec-Fetch-Dest: empty), no rule, GET: Action.ALLOW: forwarded with the verdict, and the origin\'s HTML answer gets no-store', async () => {
+        // Arrange
+        const { worker } = await loadWorker({ actionOnSuspicious: { methods: { GET: Action.ALLOW } } });
+
+        // Act
+        const result = await run(worker, pageLoad({ 'Sec-Fetch-Dest': 'empty' }), originPage);
+
+        // Assert
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe(NO_STORE);
+    });
+
+    it.each([
+        ['sessionFound true, onSecondVerdict ALLOW', true, interstitial({ onSecondVerdict: Action.ALLOW }), 'second-verdict:ALLOW'],
+        ['sessionFound false, onSessionNotFound ALLOW', false, interstitial({ onSessionNotFound: Action.ALLOW }), 'no-session:ALLOW'],
+    ])('the reload with a valid mark for its page, %s: forwarded with the verdict, and the origin\'s HTML answer gets no-store', async (_label, sessionFound, config, outcome) => {
+        // Arrange
+        const { worker } = await loadWorker(config);
+        const mark = await markFromPage(worker);
+        mocks.callRTI.mockResolvedValue(rtiAnswer(sessionFound, { rayId: 'ray-2' }));
+
+        // Act
+        const result = await run(worker, reload(mark), originPage);
+
+        // Assert: the reload line shows that the mark was valid for its page, and which setting let the request through
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe(NO_STORE);
+        expect(mocks.loggerInfo.mock.calls).toEqual([[SHOWN], [reloadLine(outcome, sessionFound)]]);
+    });
+
+    it('sessionFound true, onSecondVerdict CHALLENGE, no config.challenge: forwarded with the verdict, and the origin\'s HTML answer gets no-store', async () => {
+        // Arrange
+        mocks.callRTI.mockResolvedValue(rtiAnswer(true));
+        const { worker } = await loadWorker(interstitial({ onSecondVerdict: Action.CHALLENGE }));
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe(NO_STORE);
+    });
+
+    it('the forward outcome of decide (a GET that is not a page load gets the strategy INTERSTITIAL, which only a spy gives): forwarded with the verdict, and the origin\'s HTML answer gets no-store', async () => {
+        // Arrange
+        const { worker, InterstitialService } = await loadWorker();
+        const { RTIHelperService } = await import('../../core/services/rti-helper.service');
+        vi.spyOn(RTIHelperService.prototype, 'getStrategyForRequest').mockReturnValue({ strategy: ActionStrategy.INTERSTITIAL });
+        const decide = vi.spyOn(InterstitialService.prototype, 'decide');
+
+        // Act
+        const result = await run(worker, pageLoad({ 'Sec-Fetch-Dest': 'empty' }), originPage);
+
+        // Assert
+        expect(decide).toHaveReturnedWith({ kind: 'forward', reason: 'not-a-page-load' });
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe(NO_STORE);
+    });
+
+    it('an error in the interstitial\'s code (crypto.subtle.sign rejects once, so the page cannot be built): forwarded with the verdict, and the origin\'s HTML answer gets no-store', async () => {
+        // Arrange
+        expectError = true;
+        const { worker } = await loadWorker();
+        vi.spyOn(crypto.subtle, 'sign').mockRejectedValueOnce(new Error('sign failed'));
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        expect(mocks.loggerError).toHaveBeenCalledWith("Interstitial error handling request 'ray-cf': sign failed");
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe(NO_STORE);
+    });
+
+    it('sessionFound true, onSecondVerdict CHALLENGE, a valid CAPTCHA pass (validateChallenge gives true): forwarded with the verdict, and the origin\'s HTML answer keeps its Cache-Control: max-age=600', async () => {
+        // Arrange
+        mocks.callRTI.mockResolvedValue(rtiAnswer(true));
+        const challenge = captchaPage();
+        const validateChallenge = vi.fn(async () => true);
+        const { worker } = await loadWorker({ challenge, validateChallenge, ...interstitial({ onSecondVerdict: Action.CHALLENGE }) });
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        expect(validateChallenge).toHaveBeenCalledOnce();
+        expect(challenge).not.toHaveBeenCalled();
+        await expectForwardedWithVerdict(result);
+        expect(result.response.headers.get('cache-control')).toBe('max-age=600');
+    });
+
+    it.each([
+        ['MONITORING mode, a suspicious page load', { mode: Mode.MONITORING }, () => rtiAnswer(null), 'suspicious'],
+        ['a benign verdict on a page load', {}, () => rtiAnswer(null, { verdict: 'benign' }), 'benign'],
+    ])('%s: forwarded with the verdict, and the origin\'s HTML answer keeps its Cache-Control: max-age=600', async (_label, config, answer, verdict) => {
+        // Arrange
+        mocks.callRTI.mockResolvedValue(answer());
+        const { worker } = await loadWorker(config);
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        await expectForwardedWithVerdict(result, verdict);
+        expect(result.response.headers.get('cache-control')).toBe('max-age=600');
+    });
+
+    it('a block shown as the CAPTCHA (blockingStrategy CAPTCHA) with a valid CAPTCHA pass: forwarded with the verdict, and the origin\'s HTML answer keeps its Cache-Control: max-age=600', async () => {
+        // Arrange
+        mocks.callRTI.mockResolvedValue(rtiAnswer(null, { verdict: 'malicious' }));
+        const challenge = captchaPage();
+        const validateChallenge = vi.fn(async () => true);
+        const { worker } = await loadWorker({ challenge, validateChallenge, blockingStrategy: ActionStrategy.CAPTCHA });
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        expect(validateChallenge).toHaveBeenCalledOnce();
+        expect(challenge).not.toHaveBeenCalled();
+        await expectForwardedWithVerdict(result, 'malicious');
+        expect(result.response.headers.get('cache-control')).toBe('max-age=600');
+    });
+
+    it('validateChallenge throws (the CAPTCHA case fails open): forwarded without the verdict, and the origin\'s HTML answer keeps its Cache-Control: max-age=600', async () => {
+        // Arrange
+        expectError = true;
+        mocks.callRTI.mockResolvedValue(rtiAnswer(true));
+        const challenge = captchaPage();
+        const { worker } = await loadWorker({ challenge, validateChallenge: vi.fn(async () => { throw new Error('vc'); }), ...interstitial({ onSecondVerdict: Action.CHALLENGE }) });
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        expect(result.forwarded!.headers.get('x-cheq-rti-result')).toBeNull();
+        expect(result.response.headers.get('cache-control')).toBe('max-age=600');
+    });
+
+    it('RTI rejects (handle fails open): forwarded without the verdict, and the origin\'s HTML answer keeps its Cache-Control: max-age=600', async () => {
+        // Arrange
+        expectError = true;
+        mocks.callRTI.mockRejectedValue(new Error('rti down'));
+        const { worker } = await loadWorker();
+
+        // Act
+        const result = await run(worker, pageLoad(), originPage);
+
+        // Assert
+        expect(result.forwarded!.headers.get('x-cheq-rti-result')).toBeNull();
+        expect(result.response.headers.get('cache-control')).toBe('max-age=600');
     });
 });

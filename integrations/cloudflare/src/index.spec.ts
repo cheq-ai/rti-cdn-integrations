@@ -2343,6 +2343,27 @@ describe('cloudflare worker', () => {
             expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=suspicious');
             expect(response.headers.get('cache-control')).toBe('max-age=600');
         });
+
+        it.each([
+            ['RTI wants it challenged', () => captchaVerdict(), 'suspicious'],
+            ['a block shown as a CAPTCHA (blockingStrategy: CAPTCHA)', () => {
+                captchaVerdict();
+                mocks.getAction.mockReturnValue(Action.BLOCK);
+                mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'malicious' }));
+            }, 'malicious'],
+        ])('an HTML answer to a page load that would get the CAPTCHA page (%s) but is forwarded because config.challenge is not set gets Cache-Control: no-store', async (_label, arrange, verdict) => {
+            // Arrange
+            arrange();
+            (config as any).challenge = undefined;
+            const pageLoad = buildWorkerRequest('/page', { extraHeaders: { 'sec-fetch-dest': 'document' }, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
+
+            // Act
+            const { response, forwarded } = await run(pageLoad, origin({ 'content-type': 'text/html' }));
+
+            // Assert
+            expect(forwarded!.headers.get('x-cheq-rti-result')).toContain(`verdict=${verdict}`);
+            expect(response.headers.get('cache-control')).toBe('no-store, no-cache, must-revalidate');
+        });
     });
 
     describe('forwarding to the origin', () => {
