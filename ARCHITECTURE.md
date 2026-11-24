@@ -59,6 +59,9 @@ core.
 | `core/services/https-client.ts` | Keep-alive `node:http`/`node:https` POST client with a single retry on a dropped pooled connection |
 | `core/helpers/block-page-helpers.ts` | Renders the HTML 403/404 block page. Its `escapeHtml` is reused by the interstitial page |
 | `core/helpers/interstitial-page-helpers.ts` | Renders the interstitial page, with its script as one string constant (`INTERSTITIAL_SCRIPT`): it adds the customer's tag, waits for a new `_cq_pvid`, writes the mark cookie `_cq_it` and reloads |
+| `core/helpers/page-look.ts` | The look that the block page and the interstitial page share: CHEQ's logo (`assets/cheq-logo.svg`, inline), the CSS and the footer "Protected by Cheq.ai". Constants only, no import |
+| `core/helpers/page-setting-checks.ts` | The checks of `logoUrl`, `headline`, `message` and `lang`, which the interstitial's settings and the block page's settings share, and the `https://` check of the tag line's `src` |
+| `core/helpers/block-page-settings.ts` | `readBlockPageSettings`: reads `config.blockPage` once, at cold start, for the glue (Cloudflare only for now). It does not throw. Gives the checked settings for `generateDefaultBlockPage` and one problem text per wrong value |
 | `core/testing/` | Shared test harness — see [Testing](#testing) |
 
 Fastly is the exception: it shares no `core/` code, for reasons covered under
@@ -276,7 +279,8 @@ valid mark sets `x-cheq-original-referer`), passes `customId3` to RTI for the ma
 to `getStrategyForRequest`. For `INTERSTITIAL` it gives `decide` the plain facts, turns the page into a `Response`, and
 carries an `Action` out like the other strategies. It sends the outcome lines to the RTI logger through `waitUntil`,
 and in `MONITORING` mode a `would-show` line in place of the page. See "Interstitial" in
-`integrations/cloudflare/README.md`.
+`integrations/cloudflare/README.md`. The Worker also reads `config.blockPage` once at cold start
+(`readBlockPageSettings`), logs a `[blockPage]` warning per problem, and hands the checked settings to the block page.
 
 ### CloudFront — Lambda@Edge
 

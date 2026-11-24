@@ -125,9 +125,15 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
    `INTERSTITIAL`, whatever session the visitor has. A throwing `isChallengeResponse` counts as no reply. A throwing
    `challenge` is logged and the request is forwarded.
 6. **By strategy.**
-   - `ACCESS_DENIED`, `NOT_FOUND`: our 403 or 404 block page, with HTML and no-store headers.
+   - `ACCESS_DENIED`, `NOT_FOUND`: our 403 or 404 block page, with HTML and no-store headers (see
+     [Block page](#block-page)).
    - `REDIRECT`: a 302 to `redirectLocation` (default `https://www.cheq.ai/`), with `x-cheq-cdn-request-id`,
-     `x-cheq-id`, `x-cheq-page-view-id` and no-store.
+     `x-cheq-id`, `x-cheq-page-view-id` and no-store. When a setting can redirect and `redirectLocation` is not set
+     (left out or `""`), the config check of `npm run test` fails, and so does `npm run deploy`, which runs the tests
+     first. For any of them but `redirectReasons`, the check reports once:
+     `redirectLocation is not set, but a setting can redirect (blockingStrategy or challengingStrategy REDIRECT, Action.REDIRECT in actionOnSuspicious or interstitial, or redirectTTCodes): those visitors would be sent to https://www.cheq.ai/`.
+     The check reads the settings as written: `mode` and `interstitial.enabled` do not matter. The Worker itself does
+     not run this check: without `redirectLocation` it redirects to `https://www.cheq.ai/`.
    - `CAPTCHA` without `config.challenge`: forwarded with the verdict.
    - `CAPTCHA`, and `validateChallenge` returns `true` (a valid session): forwarded with the verdict. The session waives
      only the CAPTCHA, never a block, a 404 or a redirect.
@@ -167,9 +173,10 @@ lines go to the RTI logger as info lines (see [Monitoring and logs](#monitoring-
 **Cold start.** When the module loads, the Worker logs one warning when `challenge` is set without
 `isChallengeResponse`, then one per problem in `interstitial`
 (`[interstitial] <problem> (see "Interstitial" in the README)`, see [Settings](#settings)), then one per problem in
-`actionOnSuspicious` (`[config] <problem> (see "actionOnSuspicious" in the README)`). If the `actionOnSuspicious`
-check throws, it logs `[config] the config check failed, continuing: …` and the Worker still starts. While the three
-Turnstile secrets are `REPLACE_ME` (as shipped), it also logs
+`blockPage` (`[blockPage] <problem> (see "Block page" in the README)`, see [Block page](#block-page)), then one per
+problem in `actionOnSuspicious` (`[config] <problem> (see "actionOnSuspicious" in the README)`). If the
+`actionOnSuspicious` check throws, it logs `[config] the config check failed, continuing: …` and the Worker still
+starts. While the three Turnstile secrets are `REPLACE_ME` (as shipped), it also logs
 `[turnstile] CAPTCHA disabled, not configured: siteKey, secretKey, sessionSigningSecret (set them in config.ts)`.
 With `enabled: true` and `interstitial.tag` still `REPLACE_ME` (as shipped), it logs
 `[interstitial] interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console (see "Interstitial" in the README)`.
@@ -603,6 +610,85 @@ forwarded as the client sent it. That matters only for an origin that treats `-`
 as CGI does (by RFC 3875's rule both spellings become `HTTP_X_CHEQ_RTI_RESULT`): such an origin should drop the
 underscore spellings itself.
 
+### Block page
+
+The block page is our own HTML page for a blocked request. The Worker answers with it when the strategy is
+`ACCESS_DENIED` (403) or `NOT_FOUND` (404): by default for a request that RTI wants blocked (`blockingStrategy`), and
+for a challenged request when `challengingStrategy` is one of the two (not a `GET` page load while the interstitial is
+on, see step 4 of [How a request is handled](#how-a-request-is-handled)). It comes with that status, as HTML, with
+`Cache-Control: no-store, no-cache, must-revalidate`.
+
+The page is white, in the look of the [interstitial](#interstitial) page. With no settings, a blocked visitor sees,
+from top to bottom:
+
+1. CHEQ's logo: the pink CHEQ wordmark, inline in the page.
+2. The status number, `403` or `404`.
+3. The heading: "Access Denied" for a 403, "Not Found" for a 404.
+4. The sentence "Access to this resource has been denied by security policy."
+5. A box "Reference ID" with RTI's ray id. When RTI also gave a page view id, the box is "Reference IDs", with
+   `rayId: …` and `pageViewId: …`.
+6. A box "Additional Platform ID" with the request's `cf-ray` value, Cloudflare's own id of the request, when the
+   request has one.
+7. The footer "Protected by Cheq.ai". "Cheq.ai" is a link to `https://cheq.ai`, which the design says opens in a new
+   tab (`target="_blank" rel="noopener noreferrer"`).
+
+The page's `<title>` is the status and the heading, for example `403 Access Denied`. These words are the ones the
+block page had before it turned white. The logo and the footer are new.
+
+**Settings.** `config.blockPage` in [`src/config.ts`](src/config.ts) gives the page your own logo, texts and
+language (the product spec's FR-9). The shipped `config.ts` has the block as a comment, after the `interstitial`
+block. An example:
+
+```ts
+blockPage: {
+    logoUrl: "https://www.example.com/logo.svg",
+    headline: "Zugriff verweigert",
+    message: "Diese Anfrage wurde aus Sicherheitsgründen blockiert.",
+    lang: "de",
+},
+```
+
+| Setting | What it sets | Default | Allowed | A wrong value |
+|---|---|---|---|---|
+| `logoUrl` | The logo, in place of CHEQ's: an image with an empty `alt` | The CHEQ wordmark, inline | an `https://` URL of at most 200 characters, also as the URL parser writes it | A warning, and CHEQ's logo |
+| `headline` | The heading and the `<title>`, in place of "Access Denied" or "Not Found" | The title of the block | text of 1 to 60 characters | A warning, and the title of the block |
+| `message` | The sentence under the heading | "Access to this resource has been denied by security policy." | text of 1 to 160 characters | A warning, and the default sentence |
+| `lang` | The page's language, as in `<html lang="…">` | `"en"` | a language tag such as `"en"` or `"en-US"`, at most 35 characters | A warning, and `"en"` |
+
+- These are the rules of the interstitial's settings of the same names (see
+  [The page's look](#the-pages-look-logourl-headline-message-lang)).
+- Each setting is optional. Left out, a setting keeps its default without a warning, and `null` is a wrong value. No
+  `blockPage` at all, or `blockPage: null`, means no settings and no warning.
+- One `headline` and one `message` serve both forms of the page, the 403 and the 404.
+- The texts are escaped for HTML: they are shown as written and cannot add markup.
+- The settings change only the page. The status (403 or 404) and the headers stay as they are.
+- They work with the interstitial on or off: the block page is also shown while the interstitial is off.
+- `interstitial.logoUrl` and `blockPage.logoUrl` are two settings. For one logo on both pages, write the URL in both.
+- The status number, the labels of the ids ("Reference ID", "Reference IDs", `rayId:`, `pageViewId:`, "Additional
+  Platform ID") and the footer "Protected by Cheq.ai" are not settings. They stay as they are, in English, whatever
+  `lang` says.
+- Cloudflare only for now: CloudFront shows the same white page, but does not read `blockPage`.
+
+**Cold start.** The Worker reads `blockPage` once, when the module loads, and logs one warning per problem, as
+`[blockPage] <problem> (see "Block page" in the README)`. They come after the `[interstitial]` warnings and before
+the `[config]` warnings of `actionOnSuspicious`. A wrong value does not stop the Worker: it gets its default. The
+problems, where `<value>` is the value as JSON:
+
+- `blockPage: <value> is not a settings block, using the defaults`, for example for a string, a number or a list
+- `blockPage.logoUrl: <value> is not an https:// URL of at most 200 characters, using CHEQ's logo`
+- `blockPage.headline: <value> is not text of 1 to 60 characters, using the title of the block`
+- `blockPage.message: <value> is not text of 1 to 160 characters, using the default message`
+- `blockPage.lang: <value> is not a language tag such as "en" or "en-US", using "en"`
+- `blockPage settings could not be read (<error>), using the defaults`, when reading the block throws (for example
+  on a value that JSON cannot write, such as a bigint). Then no setting of the block is used.
+
+For example, `blockPage: { headline: "", lang: "english" }` gives these two lines, in this order:
+
+```
+[blockPage] blockPage.headline: "" is not text of 1 to 60 characters, using the title of the block (see "Block page" in the README)
+[blockPage] blockPage.lang: "english" is not a language tag such as "en" or "en-US", using "en" (see "Block page" in the README)
+```
+
 ### Interstitial
 
 Cloudflare only for now. While the interstitial is on, a page load that RTI wants challenged first gets a short CHEQ
@@ -654,6 +740,10 @@ get a benign verdict from RTI, and so no interstitial. If your policy makes such
 interstitial like any visitor, and a crawler that runs no JavaScript cannot pass it. The fix is in the policy screen of
 the CHEQ console, not in the Worker.
 
+The same happens when a crawler's request matches a code that you listed in `challengeReasons` or `challengeTTCodes`:
+the Worker then wants it challenged even with a benign verdict, and the policy screen cannot change that. The fix for
+this case is in `config.ts`: take the code out of the list, or use a policy rule in its place.
+
 Two more cases: a prefetch of the page (`Sec-Purpose` or `Purpose` contains `prefetch`) gets an empty 403 in its place,
 as in place of the CAPTCHA page. A reply to the CAPTCHA page that `isChallengeResponse` recognizes goes to
 `config.challenge` first (step 5 of [How a request is handled](#how-a-request-is-handled)).
@@ -664,10 +754,13 @@ stop such page loads, set them (see [The interstitial and the CAPTCHA](#the-inte
 
 **The page** is our own HTML, answered at the URL the visitor asked for, with the status `statusCode` (403 by default)
 and the headers `Content-Type: text/html;charset=UTF-8`, `Cache-Control: no-store, no-cache, must-revalidate` and
-`X-Robots-Tag: noindex`. It shows the logo, the headline ("Checking your browser"), the message ("This usually takes
-about a second.") in a live region, a turning ring (it stands still for `prefers-reduced-motion`), `Ray ID:` with the
-ray id of RTI call 1, and "Protected by Cheq.ai". The `<title>` is the headline. Without JavaScript it shows "Please
-turn on JavaScript, then reload the page." Its one script does this:
+`X-Robots-Tag: noindex`. It is white, and shows, from top to bottom: the logo (the pink CHEQ wordmark, or your
+`logoUrl`), a turning gray ring (it stands still for `prefers-reduced-motion`), the headline ("Checking your
+browser"), the message ("This usually takes about a second.") in a live region, `Ray ID:` with the ray id of RTI
+call 1, and the footer "Protected by Cheq.ai". "Cheq.ai" is a link to `https://cheq.ai`. The design says that it opens
+in a new tab (`target="_blank" rel="noopener noreferrer"`), so that a click does not take the visitor away from the
+page that is about to reload. The [block page](#block-page) has the same look. The `<title>` is the headline. Without
+JavaScript it shows "Please turn on JavaScript, then reload the page." Its one script does this:
 
 1. If a mark of this setup is already there, the Worker did not accept it, and another reload would loop. The page
    stops and shows "We could not check your browser." with a **Try again** button, which deletes the mark and reloads.
@@ -699,7 +792,7 @@ on. Left out, such a setting gets its default without a warning (`null` is a wro
 | `statusCode` | The HTTP status of the page | `403` | `200`, or a whole number from 400 to 599 | A warning, and `403` |
 | `originalRefererVia` | How the original Referer is delivered after the reload, see [The original Referer after the interstitial](#the-original-referer-after-the-interstitial) | `"header"` | `"header"` or `"cookie"` | A warning, and `"header"` |
 | `binding` | Which client a mark belongs to, see [The mark cookie](#the-mark-cookie) | `{ ip: "exact", userAgent: true }` | `ip`: `"exact"` or `"none"`, `userAgent`: `true` or `false` | A warning, and the default |
-| `logoUrl` | The logo on the page | CHEQ's logo, inline | an `https://` URL of at most 200 characters, also as the URL parser writes it | A warning, and CHEQ's logo |
+| `logoUrl` | The logo on the page | The CHEQ wordmark, inline | an `https://` URL of at most 200 characters, also as the URL parser writes it | A warning, and CHEQ's logo |
 | `headline` | The page's headline and `<title>` | `"Checking your browser"` | text of 1 to 60 characters | A warning, and the default |
 | `message` | The text under the headline | `"This usually takes about a second."` | text of 1 to 160 characters | A warning, and the default |
 | `lang` | The page's language | `"en"` | a language tag such as `"en"` or `"en-US"` | A warning, and `"en"` |
@@ -707,8 +800,9 @@ on. Left out, such a setting gets its default without a warning (`null` is a wro
 
 `Action.CHALLENGE` in `onSecondVerdict` or `onSessionNotFound` is the CAPTCHA, see
 [The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha). `Action.REDIRECT` there sends the visitor to
-`redirectLocation`, and the config check of `npm run test` then accepts a `redirectLocation` without
-`redirectReasons`. The page's other texts are fixed, in English: "We could not check your browser.", **Try again**,
+`redirectLocation`. Set `redirectLocation` too: without it the config check of `npm run test` fails (see step 6 of
+[How a request is handled](#how-a-request-is-handled)), and with it the check accepts it without `redirectReasons`.
+The page's other texts are fixed, in English: "We could not check your browser.", **Try again**,
 "Please allow cookies for this site, then reload the page.", "Please turn on JavaScript, then reload the page.",
 `Ray ID:` and "Protected by Cheq.ai".
 
@@ -792,8 +886,8 @@ What a suspicious page load gets when the tag has run.
   `Cache-Control: no-store` (see [Which request gets a page](#which-request-gets-a-page)).
 - `Action.BLOCK`: what `blockingStrategy` gives. By default that is the block page (403). It can also be a 404, a
   redirect or the CAPTCHA, if `blockingStrategy` says so.
-- `Action.REDIRECT`: a 302 to `redirectLocation`. Set `redirectLocation`. The config check of `npm run test` then
-  accepts it without `redirectReasons`.
+- `Action.REDIRECT`: a 302 to `redirectLocation`. Set `redirectLocation`: without it the config check of
+  `npm run test` fails. With it, the check accepts it without `redirectReasons`.
 - `Action.CHALLENGE`: the CAPTCHA of `challenge` (the Turnstile example), whatever `challengingStrategy` says. A
   valid CAPTCHA pass (`_cq_se`) skips it, and the page is forwarded. Without a `challenge` the page is forwarded with
   the verdict. See [The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha).
@@ -852,6 +946,15 @@ The HTTP status that the interstitial page is sent with.
   your policy makes them suspicious, they get the page like any visitor, whatever the status (see
   [How it works](#how-it-works)).
 - The product spec leaves the status to an SEO review. `403` is the default until then.
+- **`403` or `503`.** The choice matters only for a search crawler that gets the page. This is what Google does with
+  the status ("How HTTP status codes affect Google's crawlers" on developers.google.com, read on 2026-11-24):
+  - `403`, like every 4xx except 429: the content "doesn't exist". A URL that is already indexed is removed from the
+    index. The crawl rate does not change.
+  - `503`, like every 5xx: already indexed URLs "are preserved in the index, but eventually dropped", and URLs that
+    persistently return it are removed. Google slows down its crawling of the site meanwhile.
+
+  So `403` fits a bot, and `503` is gentler for a real crawler that gets the page by mistake, at the price of a slower
+  crawl. Dashboards and uptime monitors usually count a 5xx as a failure of the site, and a `403` as a refusal.
 - A prefetch never gets the page. Where the page would be shown, a prefetch gets an empty 403, whatever this setting
   says.
 
@@ -896,8 +999,8 @@ Which client a mark belongs to. The same shape and default as the CAPTCHA's `ses
 Your branding on the page (the product spec's FR-9). Leave them out for CHEQ's look.
 
 - `logoUrl`: the `https://` address of an image you host, at most 200 characters, also as the URL parser writes it.
-  It is shown in place of CHEQ's logo, as an image with an empty `alt`. Default: CHEQ's logo, inline in the page. If
-  your image does not load, the page still works.
+  It is shown in place of CHEQ's logo, as an image with an empty `alt`. Default: the CHEQ wordmark, inline in the
+  page. If your image does not load, the page still works.
 - `headline`: the page's heading and its `<title>`, 1 to 60 characters. Default `Checking your browser`.
 - `message`: the text under the heading, 1 to 160 characters. It sits in a live region (`role="status"`), so screen
   readers announce it. Default `This usually takes about a second.`
@@ -1234,7 +1337,9 @@ the verdict. A CAPTCHA that the decision leads to keeps its own error handling (
   visitors stay on the page as long as RTI wants their page loads challenged.
 - **A good bot that your policy makes suspicious gets the interstitial like any visitor.** Good bots (crawlers such as
   Google's and Bing's) are expected to get a benign verdict from RTI, and so no page. A crawler that runs no JavaScript
-  cannot pass the page. Fix it in the policy screen of the CHEQ console, not in the Worker.
+  cannot pass the page. Fix it in the policy screen of the CHEQ console, not in the Worker. A good bot whose request
+  matches a code in `challengeReasons` or `challengeTTCodes` gets the page too, even with a benign verdict: fix that
+  in `config.ts`, by taking the code out of the list.
 - **A second page load of the same page within the mark's 60 seconds that brings no Referer of its own** (the visitor
   reloads, or types the address again) gets the mark's Referer once more, and `customId3` again.
 - **After a redirect of the origin, the target page gets no original Referer from the mark,** as the CAPTCHA's `_cq_rf`
@@ -1339,6 +1444,13 @@ the verdict. A CAPTCHA that the decision leads to keeps its own error handling (
 >   fetched again); Cloudflare's pass-through may send it again ([Local or demo origin](#local-or-demo-origin)).
 > - **The OPTION 1 / OPTION 2 switch is now in `forwardToOrigin`**: redo a local or demo edit of the old `index.ts`
 >   there ([Local or demo origin](#local-or-demo-origin)).
+> - **The block page is white now**, in the look of the interstitial page, with CHEQ's logo on top and "Protected by
+>   Cheq.ai" at the bottom. Its words, its status and its headers are the same. Nothing to change. A site can give it
+>   its own logo, heading, message and language ([Block page](#block-page)).
+> - **`npm run test` fails when a setting can redirect and `redirectLocation` is not set**, and so does
+>   `npm run deploy`. Before, such visitors were sent to `https://www.cheq.ai/`, and only `redirectReasons` without a
+>   `redirectLocation` failed the test. The check reads the settings as written: `mode` and `interstitial.enabled` do
+>   not matter. Set `redirectLocation` (step 6 of [How a request is handled](#how-a-request-is-handled)).
 
 The CAPTCHA is an example, using [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/). Replace it with
 any implementation you want (see [Implementing a custom challenge](#implementing-a-custom-challenge)).

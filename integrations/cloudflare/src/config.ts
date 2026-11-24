@@ -143,7 +143,13 @@ export const config: CloudflareConfig = {
     // By default we use ActionStrategy.CAPTCHA but you can set it to REDIRECT or ACCESS_DENIED as well, but make sure to implement the relevant functions and configurations for each strategy
     //challengingStrategy: ActionStrategy.CAPTCHA
 
-    // The redirect url when decision was made to redirect the traffic
+    // The redirect url when decision was made to redirect the traffic: your own page for these visitors (for
+    // blockingStrategy: REDIRECT it is your block URL).
+    // Set it whenever one of these can redirect: blockingStrategy or challengingStrategy set to REDIRECT,
+    // Action.REDIRECT in actionOnSuspicious or in the interstitial's onSecondVerdict / onSessionNotFound,
+    // redirectReasons, or redirectTTCodes.
+    // Without it, `npm run test` fails, and `npm run deploy` with it: the visitors that such a setting redirects would
+    // be sent to https://www.cheq.ai/.
     //redirectLocation: 'https://www.cheq.ai/',
 
     challenge: turnstileChallenge.challenge,
@@ -210,9 +216,25 @@ export const config: CloudflareConfig = {
         // Per path (regex, like ignorePaths) and method. The first matching rule wins over the defaults above.
         // Every rule needs a path, written as a string ('^/login$', not /^\/login$/): a rule without one matches EVERY
         // path. Keep this exact shape (see "actionOnSuspicious" in the README).
+        //
+        // GET addresses that a program calls (a mobile app, a partner's server, a monitoring tool, your own back end):
+        // give them a rule with Action.ALLOW, like the '^/api/' example below.
+        // Why: a GET counts as a page load when it says so (Sec-Fetch-Dest: document, or without that header an Accept
+        // that contains text/html), and also when it has neither header, because the Worker then cannot tell. A script
+        // in a browser sends Sec-Fetch-Dest: empty, so its calls are not page loads. A program is different: many HTTP
+        // libraries send neither header unless the programmer sets one, and some send an Accept with text/html in it.
+        // When RTI wants such a call challenged, it gets a page in place of its data: the CAPTCHA page or, while the
+        // interstitial below is on, the interstitial page (HTML, status 403). A program that runs no JavaScript cannot
+        // pass either page, so it gets the page on every call for as long as RTI flags it.
+        // With the rule, the call is forwarded with x-cheq-rti-result, and your API decides. Three things to know:
+        //   - Name GET in the rule. A rule without `methods` covers only the methods with a body, not GET or HEAD.
+        //   - The rule also covers a browser that opens such an address as a page: no CAPTCHA and no interstitial
+        //     there. So list the paths of your API only, not the paths of your pages.
+        //   - It changes nothing for a request RTI wants blocked: that is still blocked.
+        // The other way is ignorePaths above: such a path skips RTI, and the origin gets no verdict for it.
         rules: [
             // { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
-            // { path: '^/api/', methods: ['GET'], action: Action.ALLOW },
+            // { path: '^/api/', methods: ['GET'], action: Action.ALLOW }, // GET calls of an app or a server
         ],
     },
 
@@ -228,6 +250,17 @@ export const config: CloudflareConfig = {
         onSecondVerdict: Action.ALLOW,       // suspicious, and RTI has the tag's session (on the reload, or the tag ran on an earlier page): ALLOW, BLOCK, REDIRECT or CHALLENGE (the CAPTCHA)
         onSessionNotFound: Action.ALLOW,     // suspicious again, with a valid mark, and RTI has no tag session: the same four
         maxWaitMs: 5000,                     // how long the page waits for the tag before it reloads anyway
+        // statusCode, 403 or 503. A visitor sees the same page with either, so the choice matters only for a search
+        // crawler that gets this page. A crawler is expected to get a benign verdict from RTI, and so no page (README,
+        // "Interstitial"). If one gets the page anyway, this is what Google does with the status ("How HTTP status
+        // codes affect Google's crawlers" on developers.google.com, read on 2026-11-24):
+        //   403, like every 4xx except 429: the content "doesn't exist". A URL that is already indexed is removed from
+        //        the index. The crawl rate does not change.
+        //   503, like every 5xx: already indexed URLs "are preserved in the index, but eventually dropped", and URLs
+        //        that persistently return it are removed. Google slows down its crawling of the site meanwhile.
+        // So 403 fits a bot, and 503 is gentler for a real crawler that gets the page by mistake, at the price of a
+        // slower crawl. Dashboards and uptime monitors usually count a 5xx as a failure of the site, and a 403 as a
+        // refusal. 403 is the default until the SEO review that the product spec asks for.
         statusCode: 403,                     // the status of the interstitial page
         originalRefererVia: "header",        // as the CAPTCHA: "header" (x-cheq-original-referer) or "cookie" (_cq_ref)
         binding: { ip: "exact", userAgent: true }, // which client a mark belongs to, as the CAPTCHA's sessionBinding
@@ -237,6 +270,15 @@ export const config: CloudflareConfig = {
         // lang: "en",
         logOutcomes: true,                   // one line per interstitial decision to the RTI logger
     },
+
+    // The block page is the white page of a 403 or 404 block (ActionStrategy.ACCESS_DENIED or NOT_FOUND). Its settings
+    // work with the interstitial on or off (see "Block page" in the README).
+    // blockPage: {
+    //     logoUrl: "https://www.example.com/logo.svg", // default: CHEQ's logo
+    //     headline: "Access Denied",                   // the heading on both pages, 403 and 404. Leave it out to keep "Access Denied" (403) and "Not Found" (404)
+    //     message: "Access to this resource has been denied by security policy.", // default: this sentence
+    //     lang: "en",                                  // default: "en"
+    // },
 
     timeout: 500,
     debug: false, // Set to true to enable debug logging, false for production

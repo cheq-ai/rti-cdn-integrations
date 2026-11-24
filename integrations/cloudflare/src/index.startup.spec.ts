@@ -6,6 +6,10 @@ import { CONSOLE_LINE, CONSOLE_TAG_HASH } from '../../core/testing/interstitial.
 
 const CHALLENGE_WARNING = '[challenge] config.isChallengeResponse is not set: replies to the challenge page are not recognized (see "Challenge callbacks" in the README)';
 const TAG_NOT_SET_WARNING = '[interstitial] interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console (see "Interstitial" in the README)';
+const LANG_WARNING = '[blockPage] blockPage.lang: "english" is not a language tag such as "en" or "en-US", using "en" (see "Block page" in the README)';
+
+// A blockPage block whose headline throws when read.
+const THROWING_HEADLINE = Object.defineProperty({}, 'headline', { get() { throw new Error('boom'); }, enumerable: true });
 
 const loadWorker = async (config: Record<string, unknown>) => {
     vi.resetModules();
@@ -204,6 +208,69 @@ describe('index at load', () => {
             [CHALLENGE_WARNING],
             [TAG_NOT_SET_WARNING],
             ['[config] the config check failed, continuing: boom'],
+        ]);
+    });
+
+    it('warns once per blockPage problem, in the order of the settings, pointing to the README for each', async () => {
+        // Arrange: an empty headline and a lang that is not a language tag
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        // Act
+        await loadWorker({ mode: Mode.BLOCKING, blockPage: { headline: '', lang: 'english' } });
+
+        // Assert
+        expect(warn.mock.calls).toEqual([
+            ['[blockPage] blockPage.headline: "" is not text of 1 to 60 characters, using the title of the block (see "Block page" in the README)'],
+            [LANG_WARNING],
+        ]);
+    });
+
+    it.each([
+        ['a valid blockPage', { blockPage: { logoUrl: 'https://cdn.example/l.svg', headline: 'Stop', message: 'Not for you.', lang: 'de' } }],
+        ['no blockPage', {}],
+    ])('does not warn with %s', async (_, config) => {
+        // Arrange
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        // Act
+        await loadWorker({ mode: Mode.BLOCKING, ...config });
+
+        // Assert
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['a string', 'x', 'blockPage: "x" is not a settings block, using the defaults'],
+        ['a block whose headline throws when read', THROWING_HEADLINE, 'blockPage settings could not be read (boom), using the defaults'],
+    ])('still loads when blockPage is %s, and warns once', async (_, blockPage, problem) => {
+        // Arrange
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.resetModules();
+        vi.doMock('./config', () => ({ config: { apiKey: 'k', tagHash: 't', mode: Mode.BLOCKING, blockPage } }));
+
+        // Act and Assert: index loads, and says what is wrong
+        await expect(import('./index')).resolves.toBeDefined();
+        expect(warn.mock.calls).toEqual([[`[blockPage] ${problem} (see "Block page" in the README)`]]);
+    });
+
+    it('warns about the interstitial, then about blockPage, then about actionOnSuspicious', async () => {
+        // Arrange: an interstitial.enabled that is not true or false, a blockPage.lang that is not a language tag, and a
+        // method's value that is not an Action
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        // Act
+        await loadWorker({
+            mode: Mode.BLOCKING,
+            interstitial: { enabled: 'yes' },
+            blockPage: { lang: 'english' },
+            actionOnSuspicious: { methods: { POST: 9 } },
+        });
+
+        // Assert
+        expect(warn.mock.calls).toEqual([
+            ['[interstitial] interstitial.enabled: "yes" is not true or false, the interstitial is off (see "Interstitial" in the README)'],
+            [LANG_WARNING],
+            ['[config] actionOnSuspicious.methods.POST: 9 is not an Action (see "actionOnSuspicious" in the README)'],
         ]);
     });
 });

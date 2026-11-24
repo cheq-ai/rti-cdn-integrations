@@ -10,6 +10,7 @@ import { name, version } from "../package.json";
 import { RequestHeaders, RTIRequest } from "../../core/models/rti-request.model";
 import { ActionStrategy } from "../../core/models/action-strategy.model";
 import { generateDefaultBlockPage } from "../../core/helpers/block-page-helpers";
+import { readBlockPageSettings } from "../../core/helpers/block-page-settings";
 import { ResponseHeaders } from "./response-headers";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
 import { InterstitialService } from "../../core/services/interstitial.service";
@@ -23,6 +24,9 @@ const rtiService = new RTIService(config);
 // The passive interstitial (README, "Interstitial"). It reads config.interstitial and its tag line once, here, and does
 // not throw. It holds nothing of a request.
 const interstitialService = new InterstitialService(config, hmacHex32);
+// The block page's settings (README, "Block page"): config.blockPage, read once, here. readBlockPageSettings does not
+// throw. A wrong value keeps its default, and the cold-start check below logs its problem.
+const blockPageSettings = readBlockPageSettings(config);
 
 // Set only from config.originalReferer (see restoreOriginalReferer; with the shipped example, after a solved CAPTCHA),
 // or in the interstitial's "header" mode from a valid mark (see readMark). In "cookie" mode a valid mark sets it only
@@ -53,8 +57,8 @@ const passedOnForSuspicious = new WeakSet<Request>();
 const waivedByValidSession = new WeakSet<Request>();
 
 // Once per cold start, and never fatal: an exception while the module loads breaks every request of the Worker. Only
-// reads the config and logs. The [challenge] and [interstitial] checks run first: an actionOnSuspicious check that
-// throws can't hide them.
+// reads the config and logs. The [challenge], [interstitial] and [blockPage] checks run first: an actionOnSuspicious
+// check that throws can't hide them.
 try {
     // Without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING mode it is handled
     // like any request (e.g. forwarded with the form fields when RTI allows it).
@@ -66,6 +70,12 @@ try {
     // challenge is handled as before it existed.
     for (const problem of interstitialService.problems) {
         console.warn(`[interstitial] ${problem} (see "Interstitial" in the README)`);
+    }
+
+    // One warning per problem in config.blockPage. A wrong value keeps its default: a blocked request still gets the
+    // block page.
+    for (const problem of blockPageSettings.problems) {
+        console.warn(`[blockPage] ${problem} (see "Block page" in the README)`);
     }
 
     // A wrong value in actionOnSuspicious never stops the Worker, so say what to fix. What it does instead depends on the
@@ -751,10 +761,10 @@ async function restoreOriginalReferer(request: Request): Promise<void> {
     }
 }
 
-// Our own 403 or 404 page for a blocked request.
+// Our own 403 or 404 page for a blocked request, with the checked settings of config.blockPage.
 function blockPage(status: 403 | 404, title: string, request: Request, rtiResponse: RTIResponse): Response {
     return new Response(
-        generateDefaultBlockPage(String(status), title, rtiResponse.ids, request.headers.get("cf-ray")),
+        generateDefaultBlockPage(String(status), title, rtiResponse.ids, request.headers.get("cf-ray"), blockPageSettings.settings),
         { status, headers: responseHeaders.html() }
     );
 }

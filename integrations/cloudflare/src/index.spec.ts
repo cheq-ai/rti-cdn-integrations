@@ -2162,7 +2162,7 @@ describe('cloudflare worker', () => {
         await worker.fetch(buildWorkerRequest('/page', { cfRay: 'ray-abc-123' }), {}, buildContext());
 
         // Assert
-        expect(mocks.generateDefaultBlockPage).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.anything(), 'ray-abc-123');
+        expect(mocks.generateDefaultBlockPage).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.anything(), 'ray-abc-123', {});
     });
 
     // --- cf-ray on redirect response ---
