@@ -1,4 +1,7 @@
+// cspell:ignore CHEQ
 import { Ids } from "../models/rti-response.model";
+import { BlockPageSettings } from "../models/block-page.model";
+import { CHEQ_LOGO, PAGE_FOOTER, PAGE_STYLE } from "./page-look";
 
 /**
  * Escapes a value for safe interpolation into HTML text content.
@@ -39,17 +42,44 @@ function stealth404Page(): string {
     return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404 - Page Not Found</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center}.c{text-align:center;padding:40px 20px}.e{font-size:120px;font-weight:700;color:#e5e5e5;line-height:1;margin-bottom:16px}h1{font-size:24px;color:#333;margin-bottom:8px;font-weight:600}p{color:#666;margin-bottom:24px}a{display:inline-block;color:#0066cc;text-decoration:none;padding:12px 24px;border:1px solid #0066cc;border-radius:6px}a:hover{background:#0066cc;color:#fff}</style></head><body><div class="c"><div class="e">404</div><h1>Page Not Found</h1><p>The page you're looking for doesn't exist or has been moved.</p><a href="/">Return Home</a></div></body></html>`;
 }
 
+/** The sentence under the heading of the block page, when the settings give no message. */
+const BLOCK_MESSAGE = 'Access to this resource has been denied by security policy.';
+
 /**
- * Generates an HTML block page to return to the client when a request is denied.
+ * The block page's own CSS, minified, after PAGE_STYLE: the gray status number above the heading, the sentence, and
+ * the light gray boxes of the ids. The heading and the sentence may break a long word of the settings, such as an
+ * address (`overflow-wrap:anywhere`), as the ids may (`word-break:break-all`). Without it, a heading of one word of 60
+ * characters made the page scroll sideways in a frame 360px wide (headless Chrome, 2026-11-24).
+ */
+const BLOCK_STYLE = '.status{margin-top:24px;font-size:48px;font-weight:800;line-height:1;color:#7b8794}'
+    + 'h1{margin-top:8px;overflow-wrap:anywhere}p{margin:0 0 24px;color:#52606d;overflow-wrap:anywhere}'
+    + '.ref-box{margin-bottom:12px;padding:12px 16px;border:1px solid #e4e7eb;'
+    + 'border-radius:8px;background:#f5f7fa;text-align:left}.ref-label{margin-bottom:4px;font-size:12px;'
+    + 'letter-spacing:.05em;color:#616e7c}.ref-id{font:13px/1.5 "SF Mono",Monaco,"Courier New",monospace;'
+    + 'word-break:break-all}';
+
+/**
+ * Generates an HTML block page to return to the client when a request is denied: a white page in the look of the
+ * interstitial page (page-look.ts). It shows, in this order, the logo, the status number, the heading, the sentence,
+ * the box of the RTI ids, the box of the CDN's id when there is one, and the footer "Protected by Cheq.ai".
+ * A missing status or title gives "500 Internal Server Error". The headline setting does not replace these words: only
+ * the other settings apply then.
  *
  * @param status - HTTP status code to display (e.g. "403", "404"). Must be non-empty.
  * @param title - Human-readable status title (e.g. "Access Denied"). Must be non-empty.
  * @param rtiIds - RTI Ids object used for tracking and support.
  * @param additionalCdnId - Optional CDN-specific request ID (e.g. CloudFront x-amz-cf-id).
  *                          When provided, rendered as a secondary reference box on the page.
+ * @param settings - Optional: the settings of `config.blockPage`, as readBlockPageSettings gives them. A setting that
+ *                   is given and not empty replaces its default: logoUrl CHEQ's logo, headline the title (in `<title>`
+ *                   too), message the sentence, lang "en". Left out: the page without settings. Each one is
+ *                   HTML-escaped, also one that was not checked.
  * @returns Full HTML page as a string.
  */
-export function generateDefaultBlockPage(status: string, title: string, rtiIds: Ids, additionalCdnId?: string | null): string {
+export function generateDefaultBlockPage(status: string, title: string, rtiIds: Ids, additionalCdnId?: string | null,
+    settings?: BlockPageSettings): string {
+    // The headline setting replaces the title, but not the "Internal Server Error" of a missing status or title.
+    const headlineSetting = status && title ? settings?.headline : undefined;
     if (!status || !title) {
         status = '500';
         title = 'Internal Server Error';
@@ -70,66 +100,21 @@ export function generateDefaultBlockPage(status: string, title: string, rtiIds: 
         }
     }
 
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${escapeHtml(status)} ${escapeHtml(title)}</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #070F18;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #E2E8F0;
-            padding: 20px;
-        }
-        .card {
-            background: linear-gradient(135deg, #0D1B2A 0%, rgba(13, 27, 42, 0.9) 100%);
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            border-radius: 16px;
-            padding: 48px 40px;
-            max-width: 480px;
-            width: 100%;
-            text-align: center;
-        }
-        h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 8px; color: #FCA5A5; }
-        .status { font-size: 4rem; font-weight: 800; color: rgba(239, 68, 68, 0.4); margin-bottom: 16px; }
-        p { color: #94A3B8; font-size: 1rem; line-height: 1.6; margin-bottom: 32px; }
-        .ref-box {
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 12px;
-            text-align: left;
-        }
-        .ref-label { font-size: 0.75rem; color: #94A3B8; letter-spacing: 0.05em; margin-bottom: 4px; }
-        .ref-id { font-family: 'SF Mono', Monaco, 'Courier New', monospace; font-size: 0.8rem; color: #00D4AA; word-break: break-all; }
-        .footer { margin-top: 24px; font-size: 0.75rem; color: #94A3B8; }
-        .footer a { color: #00D4AA; text-decoration: none; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="status">${escapeHtml(status)}</div>
-        <h1>${escapeHtml(title)}</h1>
-        <p>Access to this resource has been denied by security policy.</p>
-        <div class="ref-box">
-            <div class="ref-label">${rtiIdsDisplayHeader}</div>
-            <div class="ref-id">${rtiIdsDisplay}</div>
-        </div>
-        ${additionalCdnId ? `<div class="ref-box">  <!-- The specific CDN unique request Id (may not be present for some CDNs) -->
-            <div class="ref-label">Additional Platform ID</div>
-            <div class="ref-id">${escapeHtml(additionalCdnId)}</div>
-        </div>` : ''}
-    </div>
-</body>
-</html>`;
+    const headline = escapeHtml(headlineSetting || title);
+    const logo = settings?.logoUrl ? `<img src="${escapeHtml(settings.logoUrl)}" alt="">` : CHEQ_LOGO;
+    // The specific CDN unique request id (may not be present for some CDNs).
+    const cdnIdBox = additionalCdnId
+        ? '<div class="ref-box"><div class="ref-label">Additional Platform ID</div>'
+            + `<div class="ref-id">${escapeHtml(additionalCdnId)}</div></div>`
+        : '';
+
+    return `<!DOCTYPE html><html lang="${escapeHtml(settings?.lang || 'en')}"><head><meta charset="UTF-8">`
+        + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + `<title>${escapeHtml(status)} ${headline}</title><style>${PAGE_STYLE}${BLOCK_STYLE}</style></head><body><main>`
+        + `${logo}<div class="status">${escapeHtml(status)}</div><h1>${headline}</h1>`
+        + `<p>${escapeHtml(settings?.message || BLOCK_MESSAGE)}</p>`
+        + `<div class="ref-box"><div class="ref-label">${rtiIdsDisplayHeader}</div><div class="ref-id">${rtiIdsDisplay}</div></div>`
+        + `${cdnIdBox}${PAGE_FOOTER}</main></body></html>`;
 }
 
 /**

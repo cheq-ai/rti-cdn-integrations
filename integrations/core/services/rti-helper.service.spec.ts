@@ -917,6 +917,57 @@ describe('RTIHelperService', () => {
       // Act & Assert
       expect(svc.validateConfig()).toEqual([REDIRECT_MESSAGE]);
     });
+
+    const MISSING_LOCATION_MESSAGE = 'redirectLocation is not set, but a setting can redirect (blockingStrategy or challengingStrategy REDIRECT, Action.REDIRECT in actionOnSuspicious or interstitial, or redirectTTCodes): those visitors would be sent to https://www.cheq.ai/';
+
+    test.each([
+      ['redirectTTCodes', { redirectTTCodes: [5] }],
+      ['blockingStrategy REDIRECT', { blockingStrategy: ActionStrategy.REDIRECT }],
+      ['challengingStrategy REDIRECT', { challengingStrategy: ActionStrategy.REDIRECT }],
+      ['actionOnSuspicious.methods.POST REDIRECT', { actionOnSuspicious: { methods: { POST: Action.REDIRECT } } }],
+      ['a rule with REDIRECT', { actionOnSuspicious: { rules: [{ path: '^/login$', methods: ['POST'], action: Action.REDIRECT }] } }],
+      ['interstitial.onSecondVerdict REDIRECT', { interstitial: { onSecondVerdict: Action.REDIRECT } }],
+      ['interstitial.onSessionNotFound REDIRECT', { interstitial: { onSessionNotFound: Action.REDIRECT } }],
+    ])('%s without a redirectLocation gives the missing-location message', (_, settings) => {
+      // Arrange
+      const left = new RTIHelperService({ ...settings } as any);
+      const empty = new RTIHelperService({ redirectLocation: '', ...settings } as any);
+
+      // Act & Assert
+      expect(left.validateConfig()).toEqual([MISSING_LOCATION_MESSAGE]);
+      expect(empty.validateConfig()).toEqual([MISSING_LOCATION_MESSAGE]);
+    });
+
+    test('redirectReasons alone without a redirectLocation keeps its own message only', () => {
+      // Arrange
+      const svc = new RTIHelperService({ redirectReasons: [1] } as any);
+
+      // Act & Assert
+      expect(svc.validateConfig()).toEqual([REDIRECT_MESSAGE]);
+    });
+
+    test('redirectReasons and blockingStrategy REDIRECT without a redirectLocation give both messages', () => {
+      // Arrange
+      const svc = new RTIHelperService({ redirectReasons: [1], blockingStrategy: ActionStrategy.REDIRECT } as any);
+
+      // Act & Assert
+      expect(svc.validateConfig()).toEqual([REDIRECT_MESSAGE, MISSING_LOCATION_MESSAGE]);
+    });
+
+    test('settings that can not redirect give no message without a redirectLocation', () => {
+      // Arrange: each of those settings at a value that can not redirect
+      const settings = {
+        redirectTTCodes: [],
+        blockingStrategy: ActionStrategy.NOT_FOUND,
+        challengingStrategy: ActionStrategy.CAPTCHA,
+        actionOnSuspicious: { methods: { POST: Action.BLOCK }, rules: [{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }] },
+        interstitial: { onSecondVerdict: Action.BLOCK, onSessionNotFound: Action.CHALLENGE },
+      };
+
+      // Act & Assert
+      expect(new RTIHelperService(settings as any).validateConfig()).toEqual([]);
+      expect(new RTIHelperService({ redirectLocation: '', ...settings } as any).validateConfig()).toEqual([]);
+    });
   });
   // #endregion validateConfig Method Tests
 

@@ -2,6 +2,7 @@
 import { describe, test, expect, vi, afterEach, type Mock } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { INTERSTITIAL_SCRIPT, interstitialPage, scriptJson, type InterstitialScriptValues } from './interstitial-page-helpers';
+import { PAGE_FOOTER } from './page-look';
 import { InterstitialService } from '../services/interstitial.service';
 import { RTIStatelessUtils } from '../services/rti-stateless-utils';
 import { CONSOLE_LINE, CONSOLE_TAG_HASH } from '../testing/interstitial.fixture';
@@ -56,7 +57,7 @@ describe('interstitialPage', () => {
     // Assert
     expect(page.startsWith('<!DOCTYPE html>')).toBe(true);
     for (const part of ['<html lang="en">', '<meta name="robots" content="noindex">', '<title>Checking your browser</title>',
-      '<h1>Checking your browser</h1>', 'Ray ID: ray-1', 'Protected by Cheq.ai', 'background:#fff', '<svg']) {
+      '<h1>Checking your browser</h1>', 'Ray ID: ray-1', PAGE_FOOTER, 'background:#fff', '<svg', 'fill="#FE0072"']) {
       expect(page).toContain(part);
     }
     expect(page).toMatch(/<(\w+) [^>]*role="status" aria-live="polite"[^>]*>This usually takes about a second\.<\/\1>/);
@@ -79,6 +80,19 @@ describe('interstitialPage', () => {
     const animation = new RegExp(`#${ring}\\{[^}]*animation:(\\w+) [^}]*\\}`).exec(page)?.[1];
     expect(page).toContain(`@keyframes ${animation}{`);
     expect(page).toContain(`@media (prefers-reduced-motion:reduce){#${ring}{animation:none}}`);
+  });
+
+  test('shows the ring above the headline, in gray', () => {
+    // Arrange
+    const settings = settingsWith();
+
+    // Act
+    const page = interstitialPage(settings, 'ray-1', valuesFor(settings));
+
+    // Assert
+    expect(page.indexOf('<div id="r" aria-hidden="true"></div>')).toBeGreaterThan(page.indexOf('</svg>'));
+    expect(page.indexOf('<div id="r" aria-hidden="true"></div>')).toBeLessThan(page.indexOf('<h1>'));
+    expect(page.toLowerCase()).not.toContain('00d4aa');
   });
 
   test('shows the logo of logoUrl, escaped, in place of the inline logo (row 2)', () => {
@@ -126,23 +140,33 @@ describe('interstitialPage', () => {
     expect(JSON.parse(json)).toEqual(values);
   });
 
-  test('stays below 12288 bytes with the longest values the settings allow (row 6)', () => {
-    // Arrange: a tag line of 800 characters, with values of " (in single quotes) and of a three-byte character.
+  test.each([
+    ['a logoUrl of 200 characters', 'https://cdn.example/l.svg?' + '&'.repeat(200 - 'https://cdn.example/l.svg?'.length), 200, '<img src='],
+    ['no logoUrl, so the inline logo', undefined, undefined, '<svg'],
+  ])('stays below 12288 bytes with the longest values the settings allow and %s (row 6)', (_, logoUrl, logoUrlLength, logo) => {
+    // Arrange: a tag line of 800 characters, with values of " (in single quotes) and of a three-byte character. The
+    // cookie attributes of a page on https (with Secure), and the longest maxWaitMs.
     const start = `<script src='https://rocky.lordofthesuperfrogs.com/i/${CONSOLE_TAG_HASH}.js' class='${'"'.repeat(100)}' data-x='`;
     const end = `'></script>`;
     const tag = start + CHINESE.repeat(800 - start.length - end.length) + end;
-    const logoUrl = 'https://cdn.example/l.svg?' + '&'.repeat(200 - 'https://cdn.example/l.svg?'.length);
-    const settings = settingsWith({ tag, logoUrl, headline: '"'.repeat(60), message: '"'.repeat(160) });
-    const values = valuesFor(settings, { markValue: 'm'.repeat(1500), referer: 'r'.repeat(420) });
+    const lang = 'en-abcdefgh-abcdefgh-abcdefgh-abcde';
+    const settings = settingsWith({ tag, logoUrl, headline: '"'.repeat(60), message: '"'.repeat(160), lang, maxWaitMs: 30000 });
+    const values = valuesFor(settings, {
+      markValue: 'm'.repeat(1500), referer: 'r'.repeat(420), cookieAttributes: '; Path=/; SameSite=Lax; Secure',
+    });
 
     // Act
     const page = interstitialPage(settings, 'f'.repeat(64), values);
 
     // Assert
     expect(tag).toHaveLength(800);
-    expect(settings.logoUrl).toHaveLength(200);
+    expect(settings.logoUrl?.length).toBe(logoUrlLength);
     expect(settings.headline).toHaveLength(60);
     expect(settings.message).toHaveLength(160);
+    expect(settings.lang).toBe(lang);
+    expect(lang).toHaveLength(35);
+    expect(values).toMatchObject({ cookieAttributes: '; Path=/; SameSite=Lax; Secure', maxWaitMs: 30000 });
+    expect(page).toContain(logo);
     expect(new TextEncoder().encode(page).length).toBeLessThan(12288);
   });
 });

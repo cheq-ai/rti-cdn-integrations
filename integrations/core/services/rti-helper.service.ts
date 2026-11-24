@@ -219,14 +219,23 @@ export class RTIHelperService extends RTIStatelessUtils {
   }
 
   /**
-   * Validates configuration, returns list of errors found
-   * @param config
+   * Validates configuration, returns list of errors found, in this order:
+   * 1. redirectReasons with a code but no redirectLocation, or a redirectLocation with redirectReasons left out and no
+   *    other setting that can redirect.
+   * 2. No redirectLocation (left out or `""`), while another setting can redirect ({@link otherSettingCanRedirect}):
+   *    the visitors it redirects would be sent to https://www.cheq.ai/.
+   * 3. The problems of {@link validateActionOnSuspicious}.
    */
   validateConfig(): string[] {
     const errors: string[] = [];
     if ((this.config.redirectReasons && this.config.redirectReasons.length > 0 && !this.config.redirectLocation) ||
         (this.config.redirectLocation && !this.config.redirectReasons && !this.otherSettingCanRedirect())) {
           errors.push("For redirecting as an Action you must define both redirectCodes and redirectLocation");
+    }
+    if (!this.config.redirectLocation && this.otherSettingCanRedirect()) {
+      errors.push("redirectLocation is not set, but a setting can redirect (blockingStrategy or challengingStrategy REDIRECT, "
+        + "Action.REDIRECT in actionOnSuspicious or interstitial, or redirectTTCodes): those visitors would be sent to "
+        + "https://www.cheq.ai/");
     }
     errors.push(...this.validateActionOnSuspicious());
     return errors;
@@ -237,6 +246,8 @@ export class RTIHelperService extends RTIStatelessUtils {
    * in it, REDIRECT as blockingStrategy or challengingStrategy, or Action.REDIRECT in actionOnSuspicious (a method's
    * default or a rule), in interstitial.onSecondVerdict or in interstitial.onSessionNotFound. A setting counts as
    * written: the mode and interstitial.enabled are not read.
+   * validateConfig uses it twice: it reports a redirectLocation with redirectReasons left out and no such setting, and
+   * it reports such a setting without a redirectLocation.
    */
   private otherSettingCanRedirect(): boolean {
     const { redirectTTCodes, blockingStrategy, challengingStrategy, actionOnSuspicious, interstitial } = this.config;

@@ -13,6 +13,7 @@ import {
   ValidMark,
 } from "../models/interstitial.model";
 import { InterstitialScriptValues, interstitialPage } from "../helpers/interstitial-page-helpers";
+import { isHttpsUrl, isLanguageTag, isLogoUrl, isTextUpTo } from "../helpers/page-setting-checks";
 import { RTIStatelessUtils } from "./rti-stateless-utils";
 
 /** For isAction, errorMessage, getCookieValue, parseExpiresAt and originalReferer. It holds no state. */
@@ -459,19 +460,6 @@ function hasUnsafeCharacter(value: string): boolean {
   return /[<>\x00-\x1F\x7F-\x9F]/.test(value) || value.includes(LINE_SEPARATOR) || value.includes(PARAGRAPH_SEPARATOR);
 }
 
-/** Whether `value` starts with `https://` and `new URL` can read it. */
-function isHttpsUrl(value: string): boolean {
-  if (!value.startsWith("https://")) {
-    return false;
-  }
-  try {
-    new URL(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 const isAction = (value: unknown): value is Action => utils.isAction(value);
 
 const isBoolean = (value: unknown): value is boolean => typeof value === "boolean";
@@ -489,21 +477,6 @@ const isClientBinding = (value: unknown): value is ClientBinding =>
   typeof value === "object" && value !== null
   && ((value as ClientBinding).ip === "exact" || (value as ClientBinding).ip === "none")
   && typeof (value as ClientBinding).userAgent === "boolean";
-
-/** Text of 1 to `max` characters. */
-const isTextUpTo = (max: number) => (value: unknown): value is string =>
-  typeof value === "string" && value.length >= 1 && value.length <= max;
-
-/** A language tag such as "en" or "en-US": 2 or 3 letters, then parts of 1 to 8 letters or digits. At most 35 characters. */
-const isLanguageTag = (value: unknown): value is string =>
-  typeof value === "string" && value.length <= 35 && /^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/.test(value);
-
-/**
- * An https:// URL of at most 200 characters, as written and as `new URL(value).href`, the text the page gets. The href
- * can be longer: an `é` is 1 character as written and 6 in the href (`%C3%A9`).
- */
-const isLogoUrl = (value: unknown): value is string =>
-  typeof value === "string" && value.length <= 200 && isHttpsUrl(value) && new URL(value).href.length <= 200;
 
 /** Freezes the settings, their tag attributes, each pair of them and their binding, and gives the settings back. */
 function freezeSettings(settings: ResolvedInterstitialSettings): ResolvedInterstitialSettings {

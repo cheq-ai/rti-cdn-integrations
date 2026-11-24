@@ -1,6 +1,7 @@
 // cspell:ignore CHEQ adserver jsonp
 import { ResolvedInterstitialSettings } from "../models/interstitial.model";
 import { escapeHtml } from "./block-page-helpers";
+import { CHEQ_LOGO, PAGE_FOOTER, PAGE_STYLE } from "./page-look";
 
 /** The values the interstitial page hands its script, as one JSON object. They are made per request. */
 export interface InterstitialScriptValues {
@@ -144,30 +145,20 @@ export function scriptJson(value: unknown): string {
 }
 
 /**
- * CHEQ's logo: the inline SVG of the CAPTCHA page (`turnstile-challenge-example.ts` in the Cloudflare folder), so that
- * the two pages look alike, and the page needs no second request. `aria-hidden`: the logo says nothing that the page
- * does not say, as the `alt=""` of a logo from logoUrl.
+ * The page's CSS, minified: {@link PAGE_STYLE}, which the block page shares, then the ring's and the button's. The ring
+ * `#r` is gray: a darker part turns on a light track, and it stands still for prefers-reduced-motion.
  */
-const CHEQ_LOGO = '<svg width="120" height="40" viewBox="0 0 120 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
-  + '<path d="M20 8C12.268 8 6 14.268 6 22s6.268 14 14 14 14-6.268 14-14S27.732 8 20 8zm0 24c-5.523 0-10-4.477-10-10s4.477-10 10-10 10 4.477 10 10-4.477 10-10 10z" fill="#00D4AA"/>'
-  + '<path d="M20 14c-4.418 0-8 3.582-8 8s3.582 8 8 8 8-3.582 8-8-3.582-8-8-8zm3.707 6.293a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0l-2-2a1 1 0 111.414-1.414L19 23.586l3.293-3.293a1 1 0 011.414 0z" fill="#00D4AA"/>'
-  + '<text x="42" y="28" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700" fill="#00D4AA">CHEQ</text>'
-  + '</svg>';
-
-/** The page's CSS, minified. White background. The ring `#r` turns, and stands still for prefers-reduced-motion. */
-const STYLE = 'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fff;'
-  + 'color:#1f2933;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;text-align:center}'
-  + 'main{max-width:440px;padding:24px}img{max-width:200px;max-height:60px}h1{font-size:24px;margin:24px 0 8px}'
-  + '#r{width:32px;height:32px;margin:16px auto;border:4px solid #e4e7eb;border-top-color:#00d4aa;border-radius:50%;'
+const STYLE = PAGE_STYLE
+  + '#r{width:32px;height:32px;margin:24px auto;border:4px solid #e4e7eb;border-top-color:#7b8794;border-radius:50%;'
   + 'animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}'
-  + '@media (prefers-reduced-motion:reduce){#r{animation:none}}button{font:inherit;margin-left:4px;cursor:pointer}'
-  + 'small{display:block;margin-top:16px;color:#616e7c}';
+  + '@media (prefers-reduced-motion:reduce){#r{animation:none}}button{font:inherit;margin-left:4px;cursor:pointer}';
 
 /**
- * The interstitial page: our own HTML, answered at the URL the visitor asked for. It shows the logo, the headline, the
- * message in a live region, a ring, the ray id of RTI call 1 and "Protected by Cheq.ai". The fail text and the cookie
- * text are there and hidden, for the script. Each setting and the ray id are HTML-escaped. The page ends with one
- * `<script>` element: {@link INTERSTITIAL_SCRIPT}, called with {@link scriptJson} of the values.
+ * The interstitial page: our own HTML, answered at the URL the visitor asked for. It shows, in this order, the logo
+ * ({@link CHEQ_LOGO} or the image of logoUrl), the ring, the headline, the message in a live region, the ray id of RTI
+ * call 1 and the footer "Protected by Cheq.ai" ({@link PAGE_FOOTER}). The fail text and the cookie text are there and
+ * hidden, for the script. Each setting and the ray id are HTML-escaped. The page ends with one `<script>` element:
+ * {@link INTERSTITIAL_SCRIPT}, called with {@link scriptJson} of the values.
  * @param settings the checked settings
  * @param rayId the ray id of RTI call 1
  * @param values the values for the page's script, made for this request
@@ -177,12 +168,12 @@ export function interstitialPage(settings: ResolvedInterstitialSettings, rayId: 
   const logo = settings.logoUrl === undefined ? CHEQ_LOGO : `<img src="${escapeHtml(settings.logoUrl)}" alt="">`;
   return `<!DOCTYPE html><html lang="${escapeHtml(settings.lang)}"><head><meta charset="utf-8">`
     + '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">'
-    + `<title>${headline}</title><style>${STYLE}</style></head><body><main>${logo}<h1>${headline}</h1>`
+    + `<title>${headline}</title><style>${STYLE}</style></head><body><main>${logo}`
     + '<div id="r" aria-hidden="true"></div>'
-    + `<div id="s" role="status" aria-live="polite">${escapeHtml(settings.message)}</div>`
+    + `<h1>${headline}</h1><div id="s" role="status" aria-live="polite">${escapeHtml(settings.message)}</div>`
     + '<p id="f" hidden>We could not check your browser. <button type="button">Try again</button></p>'
     + '<p id="k" hidden>Please allow cookies for this site, then reload the page.</p>'
     + '<noscript><p>Please turn on JavaScript, then reload the page.</p></noscript>'
-    + `<small>Ray ID: ${escapeHtml(rayId)}</small><small>Protected by Cheq.ai</small></main>`
+    + `<small>Ray ID: ${escapeHtml(rayId)}</small>${PAGE_FOOTER}</main>`
     + `<script>${INTERSTITIAL_SCRIPT}(${scriptJson(values)})</script></body></html>`;
 }

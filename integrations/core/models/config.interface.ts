@@ -4,6 +4,7 @@ import { RTIResponse } from "./rti-response.model";
 import { ActionStrategy } from "./action-strategy.model";
 import { ActionOnSuspicious } from "./action-on-suspicious.model";
 import { InterstitialSettings } from "./interstitial.model";
+import { BlockPageSettings } from "./block-page.model";
 
 export interface Config {
   /**
@@ -133,6 +134,22 @@ export interface Config {
    * Cloudflare only for now: the other CDNs do not read it.
    */
   interstitial?: InterstitialSettings;
+
+  /**
+   * The block page's own logo, texts and language. The block page is the white page of a 403 or 404 block
+   * ({@link ActionStrategy.ACCESS_DENIED} or {@link ActionStrategy.NOT_FOUND}). Each setting is optional:
+   * - `logoUrl`: the logo, in place of CHEQ's logo. An https:// URL of at most 200 characters.
+   * - `headline`: the heading and the `<title>`, in place of the title of the block ("Access Denied" or "Not Found").
+   *   Text of 1 to 60 characters.
+   * - `message`: the sentence under the heading, in place of "Access to this resource has been denied by security
+   *   policy.". Text of 1 to 160 characters.
+   * - `lang`: the page's language (`<html lang>`), in place of "en". A tag such as "en" or "en-US", at most 35
+   *   characters.
+   * A wrong value gets a warning at cold start, and its default. Each setting is HTML-escaped on the page. The status
+   * number, the labels of the ids and the footer stay as they are. See {@link BlockPageSettings}.
+   * Cloudflare only for now: the other CDNs do not read it.
+   */
+  blockPage?: BlockPageSettings;
 
   /**
    * List of {@link RouteToEventType} mappings

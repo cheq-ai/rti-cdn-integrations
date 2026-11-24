@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { generateDefaultBlockPage, generateCompactBlockPage } from './block-page-helpers';
+import { PAGE_FOOTER } from './page-look';
 import { Ids } from '../models/rti-response.model';
 
 const rayOnlyIds: Ids = {
@@ -118,6 +119,102 @@ describe('generateDefaultBlockPage', () => {
         expect(html).toContain('unique-ray-id');
         expect(html).not.toContain('<h1>404</h1>');
         expect(html).not.toContain('<div class="status">Not Found</div>');
+    });
+});
+
+describe('generateDefaultBlockPage, the white look and the settings', () => {
+
+    // --- The look, with no settings ---
+
+    it('is white, with the logo, the sentence and the footer, and no image', () => {
+        const html = generateDefaultBlockPage('403', 'Access Denied', fullIds, 'cdn-1');
+        for (const part of ['<html lang="en">', 'background:#fff', 'fill="#FE0072"', PAGE_FOOTER,
+            'Access to this resource has been denied by security policy.']) {
+            expect(html).toContain(part);
+        }
+        expect(html).toContain('rayId: ray-abc<br>pageViewId: pv-456');
+        expect(html.toLowerCase()).not.toContain('#070f18');
+        expect(html).not.toContain('<img');
+    });
+
+    it('lets the heading and the sentence break a long word (overflow-wrap:anywhere)', () => {
+        const html = generateDefaultBlockPage('403', 'Access Denied', rayOnlyIds);
+        const style = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+        // A rule for h1 or p that starts after the end of the rule before it, and holds the value.
+        expect(style).toMatch(/}h1\{[^}]*overflow-wrap:anywhere/);
+        expect(style).toMatch(/}p\{[^}]*overflow-wrap:anywhere/);
+    });
+
+    it('gives the same page for no settings, an empty block and a block of undefined values', () => {
+        const html = generateDefaultBlockPage('403', 'Access Denied', fullIds, 'cdn-1');
+        expect(generateDefaultBlockPage('403', 'Access Denied', fullIds, 'cdn-1', {})).toBe(html);
+        expect(generateDefaultBlockPage('403', 'Access Denied', fullIds, 'cdn-1',
+            { logoUrl: undefined, headline: undefined, message: undefined, lang: undefined })).toBe(html);
+    });
+
+    // --- The settings ---
+
+    it('shows the image of logoUrl, the headline, the message and the language in place of the defaults', () => {
+        const html = generateDefaultBlockPage('403', 'Access Denied', rayOnlyIds, null,
+            { logoUrl: 'https://cdn.example/l.svg?a=1&b=2', headline: 'Stop', message: 'Not for you.', lang: 'de' });
+        for (const part of ['<html lang="de">', '<title>403 Stop</title>', '<h1>Stop</h1>', 'Not for you.',
+            '<img src="https://cdn.example/l.svg?a=1&amp;b=2" alt="">', '<div class="status">403</div>']) {
+            expect(html).toContain(part);
+        }
+        expect(html).not.toContain('<svg');
+        expect(html).not.toContain('Access Denied');
+        expect(html).not.toContain('denied by security policy');
+    });
+
+    it('escapes each setting, also one that was not checked', () => {
+        const text = `<script>alert(1)</script>"'&`;
+        const html = generateDefaultBlockPage('403', 'Access Denied', rayOnlyIds, null,
+            { logoUrl: text, headline: text, message: text, lang: text });
+        // lang, the image, <title>, <h1> and the message
+        expect(html.split('&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&amp;').length - 1).toBe(5);
+        expect(html).not.toContain('<script>alert');
+        expect(html).not.toContain('<script');
+    });
+
+    it('shows the headline and the status 404 on the 404 page', () => {
+        const html = generateDefaultBlockPage('404', 'Not Found', rayOnlyIds, null, { headline: 'Gone' });
+        expect(html).toContain('<div class="status">404</div>');
+        expect(html).toContain('<h1>Gone</h1>');
+        expect(html).toContain('<title>404 Gone</title>');
+        expect(html).not.toContain('Not Found');
+    });
+
+    it.each([
+        ['status', '', 'Access Denied'],
+        ['title', '403', ''],
+    ])('keeps "500 Internal Server Error", not the headline, when the %s is empty', (_label, status, title) => {
+        const html = generateDefaultBlockPage(status, title, rayOnlyIds, null,
+            { logoUrl: 'https://cdn.example/l.svg', headline: 'Stop', message: 'Not for you.', lang: 'de' });
+        for (const part of ['<title>500 Internal Server Error</title>', '<div class="status">500</div>',
+            '<h1>Internal Server Error</h1>', '<html lang="de">', '<img src="https://cdn.example/l.svg" alt="">',
+            'Not for you.']) {
+            expect(html).toContain(part);
+        }
+        expect(html).not.toContain('Stop');
+    });
+
+    // --- The size ---
+
+    const idsOf64: Ids = { ...fullIds, rayId: 'f'.repeat(64), pageViewId: 'e'.repeat(64) };
+    const logoUrlOf200 = 'https://cdn.example/l.svg?' + '&'.repeat(200 - 'https://cdn.example/l.svg?'.length);
+    const longestSettings = {
+        logoUrl: logoUrlOf200, headline: '"'.repeat(60), message: '"'.repeat(160), lang: 'en-abcdefgh-abcdefgh-abcdefgh-abcde',
+    };
+
+    // A logoUrl makes the page smaller: its <img> takes the place of the inline logo. So the third row is the largest.
+    it.each([
+        ['the longest settings', longestSettings],
+        ['no settings', undefined],
+        ['the longest settings but no logoUrl, so the inline logo', { ...longestSettings, logoUrl: undefined }],
+    ])('stays below 12288 bytes with ids and a CDN id of 64 characters and %s', (_label, settings) => {
+        const html = generateDefaultBlockPage('403', 'Access Denied', idsOf64, 'c'.repeat(64), settings);
+        expect(Object.values(longestSettings).map(value => value.length)).toEqual([200, 60, 160, 35]);
+        expect(Buffer.byteLength(html, 'utf8')).toBeLessThan(12288);
     });
 });
 
