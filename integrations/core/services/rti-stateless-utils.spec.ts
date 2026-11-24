@@ -56,6 +56,7 @@ describe('RTIStatelessUtils', () => {
     test.each([
       [true, 'no strategy (ALLOW)', null],
       [true, 'CAPTCHA', ActionStrategy.CAPTCHA],
+      [true, 'INTERSTITIAL', ActionStrategy.INTERSTITIAL],
       [false, 'ACCESS_DENIED', ActionStrategy.ACCESS_DENIED],
       [false, 'NOT_FOUND', ActionStrategy.NOT_FOUND],
       [false, 'REDIRECT', ActionStrategy.REDIRECT],
@@ -69,7 +70,7 @@ describe('RTIStatelessUtils', () => {
 
     test('covers every ActionStrategy (a new strategy must be added to the table above)', () => {
       // Arrange
-      const tested = [ActionStrategy.CAPTCHA, ActionStrategy.ACCESS_DENIED, ActionStrategy.NOT_FOUND, ActionStrategy.REDIRECT];
+      const tested = [ActionStrategy.CAPTCHA, ActionStrategy.ACCESS_DENIED, ActionStrategy.NOT_FOUND, ActionStrategy.REDIRECT, ActionStrategy.INTERSTITIAL];
 
       // Act & Assert
       expect(Object.values(ActionStrategy).filter(v => typeof v === 'number').sort()).toEqual([...tested].sort());

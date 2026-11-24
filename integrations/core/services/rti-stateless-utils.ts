@@ -28,13 +28,18 @@ import { PageLoadHeaders } from "../models/page-load-headers.model";
  */
 export class RTIStatelessUtils {
   /**
-   * Whether a reply to a challenge page goes to the challenge callback: when RTI allows it (no strategy) or asks for
-   * a CAPTCHA. Blocks, 404s and redirects are always enforced. Listed positively, so a new strategy is enforced
-   * unless it is added here: a solved token must never bypass it by default.
-   * @param actionStrategy the strategy from `RTIHelperService.getActionStrategy`, or null when the action is ALLOW
+   * Whether a reply to a challenge page goes to the challenge callback: when RTI allows it (no strategy), or the
+   * request's strategy is CAPTCHA or INTERSTITIAL. A CAPTCHA can be shown after the interstitial (onSecondVerdict or
+   * onSessionNotFound set to CHALLENGE), and its reply can get INTERSTITIAL: that reply still goes to the callback.
+   * Blocks, 404s and redirects are always enforced. Listed positively, so a new strategy is enforced unless it is added
+   * here: a solved token must never bypass it by default.
+   * @param actionStrategy the request's strategy (`RTIHelperService.getStrategyForRequest`), or null when the request
+   *   is forwarded
    */
   isChallengeReplyAllowed(actionStrategy: ActionStrategy | null): boolean {
-    return actionStrategy === null || actionStrategy === ActionStrategy.CAPTCHA;
+    return actionStrategy === null
+      || actionStrategy === ActionStrategy.CAPTCHA
+      || actionStrategy === ActionStrategy.INTERSTITIAL;
   }
 
   /** True for GET and HEAD: they can get the CAPTCHA page in place, since they have no body to lose. Any case. */

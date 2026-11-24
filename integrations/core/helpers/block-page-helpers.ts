@@ -10,7 +10,7 @@ import { Ids } from "../models/rti-response.model";
  *
  * `&` must be replaced first, otherwise it would double-escape the entities added after it.
  */
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')

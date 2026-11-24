@@ -3,6 +3,7 @@ import { Mode } from "./mode.model";
 import { RTIResponse } from "./rti-response.model";
 import { ActionStrategy } from "./action-strategy.model";
 import { ActionOnSuspicious } from "./action-on-suspicious.model";
+import { InterstitialSettings } from "./interstitial.model";
 
 export interface Config {
   /**
@@ -86,6 +87,13 @@ export interface Config {
    * {@link ActionStrategy.REDIRECT| Redirect} will return HTTP status 302 and redirect to {@link Config.redirectLocation | Redirect Location}.
    * 
    * {@link ActionStrategy.CAPTCHA| Captcha} will trigger captcha function if configured.
+   *
+   * While the interstitial is on ({@link Config.interstitial}, Cloudflare only for now), it is not used for a GET page
+   * load that RTI wants challenged. A rule of {@link Config.actionOnSuspicious} that covers such a request still
+   * decides, and its `Action.CHALLENGE` means the interstitial. Otherwise the interstitial decides (see
+   * {@link InterstitialSettings}), and `Action.CHALLENGE` in its `onSecondVerdict` or `onSessionNotFound` means the
+   * CAPTCHA. Every other request (a POST, a HEAD, a script's fetch) gets the answer it gets with the interstitial off,
+   * this setting included. When it is set while the interstitial is on, a warning at cold start says so.
    */
   challengingStrategy?: ActionStrategy;
 
@@ -117,6 +125,14 @@ export interface Config {
    * ```
    */
   actionOnSuspicious?: ActionOnSuspicious;
+
+  /**
+   * The passive interstitial: a page load that RTI wants challenged first gets a short CHEQ page, which runs the
+   * customer's CHEQ tag and reloads, and RTI then decides a second time with the tag's data. Left out: no interstitial.
+   * See {@link InterstitialSettings}.
+   * Cloudflare only for now: the other CDNs do not read it.
+   */
+  interstitial?: InterstitialSettings;
 
   /**
    * List of {@link RouteToEventType} mappings

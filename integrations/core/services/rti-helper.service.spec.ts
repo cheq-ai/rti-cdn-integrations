@@ -5,6 +5,8 @@ import { RTIStatelessUtils } from './rti-stateless-utils';
 import { Mode } from '../models/mode.model';
 import { Action } from '../models/action.model';
 import { ActionStrategy } from '../models/action-strategy.model';
+import { RequestStrategy } from '../models/action-on-suspicious.model';
+import { CONSOLE_LINE } from '../testing/interstitial.fixture';
 
 describe('RTIHelperService', () => {
   // #region shouldIgnore Method Tests
@@ -244,6 +246,45 @@ describe('RTIHelperService', () => {
   });
   // #endregion getAction Method Tests
 
+  // #region getEnforcedAction Method Tests
+  describe('getEnforcedAction', () => {
+    const resp = (code: number, verdict: string, reasons: string[] = []) => ({
+      classification: { code },
+      decision: { verdict },
+      cheqDetection: { reasons },
+    } as any);
+
+    // Every row of the getAction tables above, with the Action that getAction gives for it in BLOCKING mode.
+    test.each([
+      ['benign verdict with no matching codes', { code: 1, verdict: 'benign', reasons: [] }, {}, Action.ALLOW],
+      ['all TTCodes and reasons configured but none match', { code: 1, verdict: 'benign', reasons: ['other-reason'] }, {
+        blockTTCodes: [100], blockReasons: ['block-reason'],
+        challengeTTCodes: [200], challengeReasons: ['challenge-reason'],
+        redirectTTCodes: [300], redirectReasons: ['redirect-reason'],
+      }, Action.ALLOW],
+      ['malicious verdict',        { code: 1,   verdict: 'malicious',  reasons: [] },     {},                            Action.BLOCK],
+      ['matching blockTTCode',     { code: 100, verdict: 'benign',     reasons: [] },     { blockTTCodes: [100] },       Action.BLOCK],
+      ['matching blockReason',     { code: 1,   verdict: 'benign',     reasons: ['rx'] }, { blockReasons: ['rx'] },      Action.BLOCK],
+      ['suspicious verdict',       { code: 1,   verdict: 'suspicious', reasons: [] },     {},                            Action.CHALLENGE],
+      ['matching challengeTTCode', { code: 200, verdict: 'benign',     reasons: [] },     { challengeTTCodes: [200] },   Action.CHALLENGE],
+      ['matching challengeReason', { code: 1,   verdict: 'benign',     reasons: ['ry'] }, { challengeReasons: ['ry'] },  Action.CHALLENGE],
+      ['matching redirectTTCode',  { code: 300, verdict: 'benign',     reasons: [] },     { redirectTTCodes: [300] },    Action.REDIRECT],
+      ['matching redirectReason',  { code: 1,   verdict: 'benign',     reasons: ['rz'] }, { redirectReasons: ['rz'] },   Action.REDIRECT],
+    ])('in MONITORING mode gives what getAction gives in BLOCKING mode: %s', (_label, { code, verdict, reasons }, extra, expected) => {
+      // Arrange
+      const monitoring = new RTIHelperService({ mode: Mode.MONITORING, ...extra } as any);
+      const blocking = new RTIHelperService({ mode: Mode.BLOCKING, ...extra } as any);
+
+      // Act
+      const enforced = monitoring.getEnforcedAction(resp(code, verdict, reasons));
+
+      // Assert
+      expect(enforced).toBe(expected);
+      expect(enforced).toBe(blocking.getAction(resp(code, verdict, reasons)));
+    });
+  });
+  // #endregion getEnforcedAction Method Tests
+
   // #region getActionStrategy Method Tests
   describe('getActionStrategy', () => {
     test('returns configured blockingStrategy', () => {
@@ -308,6 +349,33 @@ describe('RTIHelperService', () => {
 
       // Act & Assert
       expect(svc.getActionStrategy(Action.BLOCK)).toBe(ActionStrategy.CAPTCHA);
+    });
+
+    test.each([
+      ['challengingStrategy INTERSTITIAL: a CHALLENGE gets CAPTCHA', { challengingStrategy: ActionStrategy.INTERSTITIAL }, Action.CHALLENGE, ActionStrategy.CAPTCHA],
+      ['blockingStrategy INTERSTITIAL: a BLOCK gets ACCESS_DENIED', { blockingStrategy: ActionStrategy.INTERSTITIAL }, Action.BLOCK, ActionStrategy.ACCESS_DENIED],
+    ])('a configured INTERSTITIAL counts as not set, so the default applies: %s', (_, settings, action, expected) => {
+      // Arrange: Akamai looks both settings up by name in ActionStrategy, so the name INTERSTITIAL can arrive here
+      const svc = new RTIHelperService(settings as any);
+
+      // Act & Assert
+      expect(svc.getActionStrategy(action)).toBe(expected);
+    });
+
+    test.each([
+      ['BLOCK, nothing set: ACCESS_DENIED', {}, Action.BLOCK, ActionStrategy.ACCESS_DENIED],
+      ['CHALLENGE, nothing set: CAPTCHA', {}, Action.CHALLENGE, ActionStrategy.CAPTCHA],
+      ['REDIRECT: REDIRECT', {}, Action.REDIRECT, ActionStrategy.REDIRECT],
+      ['ALLOW: null', {}, Action.ALLOW, null],
+      ['BLOCK with blockingStrategy NOT_FOUND: NOT_FOUND', { blockingStrategy: ActionStrategy.NOT_FOUND }, Action.BLOCK, ActionStrategy.NOT_FOUND],
+      ['BLOCK with blockingStrategy CAPTCHA: CAPTCHA', { blockingStrategy: ActionStrategy.CAPTCHA }, Action.BLOCK, ActionStrategy.CAPTCHA],
+      ['CHALLENGE with challengingStrategy ACCESS_DENIED: ACCESS_DENIED', { challengingStrategy: ActionStrategy.ACCESS_DENIED }, Action.CHALLENGE, ActionStrategy.ACCESS_DENIED],
+    ])('an interstitial block that is on changes no answer: %s', (_, settings, action, expected) => {
+      // Arrange
+      const svc = new RTIHelperService({ ...settings, interstitial: { enabled: true, tag: CONSOLE_LINE } } as any);
+
+      // Act & Assert
+      expect(svc.getActionStrategy(action)).toBe(expected);
     });
   });
   // #endregion getActionStrategy Method Tests
@@ -533,6 +601,97 @@ describe('RTIHelperService', () => {
       // Act & Assert
       expect(s.getStrategyForRequest(Action.CHALLENGE, 'GET', '/sofas', null as any)).toEqual(PAGE);
     });
+
+    // The interstitial is in play only for a GET page load: RTI says CHALLENGE, the fifth argument is exactly true, the
+    // method is GET (any case) and the page-load fact is exactly true. Then a challenge has the CAPTCHA strategy whatever
+    // challengingStrategy says, a page load that no rule covers gets the interstitial (question 2), and Action.CHALLENGE
+    // from a rule is the interstitial. Any other request gets the answer it gets without the fifth argument,
+    // challengingStrategy included.
+    const INTERSTITIAL = { strategy: ActionStrategy.INTERSTITIAL };
+    const CHALLENGE_DENIED = { challengingStrategy: ActionStrategy.ACCESS_DENIED };
+    const BLOCK_AS_CAPTCHA = { blockingStrategy: ActionStrategy.CAPTCHA };
+    type InterstitialRow = [name: string, config: any, action: Action, method: string, path: string,
+      isPageLoad: boolean | null | undefined, interstitialOn: boolean | undefined, expected: RequestStrategy];
+
+    const INTERSTITIAL_ROWS: InterstitialRow[] = [
+      ['GET /sofas, a page load, no rule: the interstitial (question 2)',
+        {}, Action.CHALLENGE, 'GET', '/sofas', true, true, INTERSTITIAL],
+      ['GET /sofas, not a page load, no rule and no default: forwarded (question 3)',
+        {}, Action.CHALLENGE, 'GET', '/sofas', false, true, FORWARD],
+      ['GET /search, not a page load (an API call), methods { GET: CHALLENGE }: the CAPTCHA, as before',
+        { actionOnSuspicious: { methods: { GET: Action.CHALLENGE } } }, Action.CHALLENGE, 'GET', '/search', false, true, CHALLENGED],
+      ['POST /login (a login form), methods { POST: CHALLENGE }: the CAPTCHA, as before',
+        { actionOnSuspicious: { methods: { POST: Action.CHALLENGE } } }, Action.CHALLENGE, 'POST', '/login', false, true, CHALLENGED],
+      ['GET /sofas, a page load, a GET rule says CHALLENGE: the interstitial (question 1)',
+        { actionOnSuspicious: { rules: [{ path: '^/sofas', methods: ['GET'], action: Action.CHALLENGE }] } }, Action.CHALLENGE, 'GET', '/sofas', true, true,
+        { strategy: ActionStrategy.INTERSTITIAL, actionOnSuspicious: Action.CHALLENGE }],
+      ['GET /api/x, a page load, a GET rule says ALLOW: forwarded (question 1)',
+        { actionOnSuspicious: { rules: [{ path: '^/api/', methods: ['GET'], action: Action.ALLOW }] } }, Action.CHALLENGE, 'GET', '/api/x', true, true, FORWARD],
+      ['GET /x, not a page load, methods { GET: BLOCK }: blocked',
+        { actionOnSuspicious: { methods: { GET: Action.BLOCK } } }, Action.CHALLENGE, 'GET', '/x', false, true,
+        { strategy: ActionStrategy.ACCESS_DENIED, actionOnSuspicious: Action.BLOCK }],
+      ['HEAD /x with isPageLoad true (not used: not a GET), methods { HEAD: CHALLENGE }: the CAPTCHA',
+        { actionOnSuspicious: { methods: { HEAD: Action.CHALLENGE } } }, Action.CHALLENGE, 'HEAD', '/x', true, true, CHALLENGED],
+      ['POST /x with isPageLoad true (not used), no default: forwarded',
+        {}, Action.CHALLENGE, 'POST', '/x', true, true, FORWARD],
+      ['GET /sofas, a page load, challengingStrategy ACCESS_DENIED: the interstitial, challengingStrategy is not used',
+        CHALLENGE_DENIED, Action.CHALLENGE, 'GET', '/sofas', true, true, INTERSTITIAL],
+      ['POST /x, challengingStrategy ACCESS_DENIED and methods { POST: CHALLENGE }: ACCESS_DENIED, as before (not a page load)',
+        { ...CHALLENGE_DENIED, actionOnSuspicious: { methods: { POST: Action.CHALLENGE } } }, Action.CHALLENGE, 'POST', '/x', false, true,
+        { strategy: ActionStrategy.ACCESS_DENIED }],
+      ['a BLOCK verdict with blockingStrategy CAPTCHA, GET /x, a page load: the CAPTCHA page (a block never gets the interstitial)',
+        BLOCK_AS_CAPTCHA, Action.BLOCK, 'GET', '/x', true, true, PAGE],
+      ['a BLOCK verdict with blockingStrategy CAPTCHA and methods { POST: CHALLENGE }, POST /x: the CAPTCHA, as before',
+        { ...BLOCK_AS_CAPTCHA, actionOnSuspicious: { methods: { POST: Action.CHALLENGE } } }, Action.BLOCK, 'POST', '/x', false, true, CHALLENGED],
+      ['GET /sofas, the page-load fact not passed: the CAPTCHA page, as before',
+        {}, Action.CHALLENGE, 'GET', '/sofas', undefined, true, PAGE],
+      ['GET /sofas, the page-load fact null: the CAPTCHA page, as before',
+        {}, Action.CHALLENGE, 'GET', '/sofas', null, true, PAGE],
+      ['PROPFIND /x with isPageLoad true: forwarded, not one of the seven methods',
+        {}, Action.CHALLENGE, 'PROPFIND', '/x', true, true, FORWARD],
+      ['GET /sofas, a page load, the fifth argument not passed: the CAPTCHA page',
+        {}, Action.CHALLENGE, 'GET', '/sofas', true, undefined, PAGE],
+      ['GET /sofas, a page load, the fifth argument false: the CAPTCHA page',
+        {}, Action.CHALLENGE, 'GET', '/sofas', true, false, PAGE],
+      ['GET /sofas, a page load, the fifth argument 1 (not exactly true, forced past the type): the CAPTCHA page',
+        {}, Action.CHALLENGE, 'GET', '/sofas', true, 1 as any, PAGE],
+      ['no fifth argument (CloudFront), an interstitial block that is on, challengingStrategy ACCESS_DENIED, GET /sofas, a page load: ACCESS_DENIED',
+        { ...CHALLENGE_DENIED, interstitial: { enabled: true, tag: CONSOLE_LINE } }, Action.CHALLENGE, 'GET', '/sofas', true, undefined,
+        { strategy: ActionStrategy.ACCESS_DENIED }],
+      ['POST /x, challengingStrategy ACCESS_DENIED, no default: ACCESS_DENIED, as before (not a page load)',
+        CHALLENGE_DENIED, Action.CHALLENGE, 'POST', '/x', false, true, { strategy: ActionStrategy.ACCESS_DENIED }],
+      ['GET /api/x, not a page load, challengingStrategy ACCESS_DENIED: ACCESS_DENIED, as before',
+        CHALLENGE_DENIED, Action.CHALLENGE, 'GET', '/api/x', false, true, { strategy: ActionStrategy.ACCESS_DENIED }],
+      ['HEAD /x with isPageLoad true (not used: not a GET), challengingStrategy ACCESS_DENIED: ACCESS_DENIED, as before',
+        CHALLENGE_DENIED, Action.CHALLENGE, 'HEAD', '/x', true, true, { strategy: ActionStrategy.ACCESS_DENIED }],
+      ['GET /sofas, a page load, challengingStrategy NOT_FOUND, a GET rule says ALLOW: forwarded (question 1), challengingStrategy is not used',
+        { challengingStrategy: ActionStrategy.NOT_FOUND, actionOnSuspicious: { rules: [{ path: '^/sofas', methods: ['GET'], action: Action.ALLOW }] } },
+        Action.CHALLENGE, 'GET', '/sofas', true, true, FORWARD],
+      ['GET /sofas, the page-load fact 1 (not exactly true, forced past the type): the CAPTCHA page, as before',
+        {}, Action.CHALLENGE, 'GET', '/sofas', 1 as any, true, PAGE],
+      ['get /sofas, a page load: the interstitial, a GET in any case is a GET',
+        {}, Action.CHALLENGE, 'get', '/sofas', true, true, INTERSTITIAL],
+    ];
+
+    test.each(INTERSTITIAL_ROWS)('the interstitial: %s', (_, config, action, method, path, isPageLoad, interstitialOn, expected) => {
+      // Arrange
+      const s = svc(config);
+
+      // Act & Assert
+      expect(s.getStrategyForRequest(action, method, path, isPageLoad, interstitialOn)).toEqual(expected);
+    });
+
+    // Each row above whose request is not a GET page load, with the fifth argument true.
+    test.each(INTERSTITIAL_ROWS.filter(([, , , method, , isPageLoad]) => !(method.toUpperCase() === 'GET' && isPageLoad === true)))(
+      'the interstitial on, a request that is not a GET page load gets the answer it gets without the fifth argument: %s',
+      (_, config, action, method, path, isPageLoad) => {
+        // Arrange
+        const s = svc(config);
+
+        // Act & Assert
+        expect(s.getStrategyForRequest(action, method, path, isPageLoad, true))
+          .toEqual(s.getStrategyForRequest(action, method, path, isPageLoad));
+      });
   });
 
   describe('getActionOnSuspicious', () => {
@@ -721,6 +880,42 @@ describe('RTIHelperService', () => {
 
       // Assert
       expect(errors).toHaveLength(0);
+    });
+
+    const REDIRECT_MESSAGE = 'For redirecting as an Action you must define both redirectCodes and redirectLocation';
+
+    test.each([
+      ['redirectReasons', { redirectReasons: [1] }],
+      ['redirectTTCodes', { redirectTTCodes: [5] }],
+      ['blockingStrategy REDIRECT', { blockingStrategy: ActionStrategy.REDIRECT }],
+      ['challengingStrategy REDIRECT', { challengingStrategy: ActionStrategy.REDIRECT }],
+      ['actionOnSuspicious.methods.POST REDIRECT', { actionOnSuspicious: { methods: { POST: Action.REDIRECT } } }],
+      ['a rule with REDIRECT', { actionOnSuspicious: { rules: [{ path: '^/login$', methods: ['POST'], action: Action.REDIRECT }] } }],
+      ['interstitial.onSecondVerdict REDIRECT', { interstitial: { onSecondVerdict: Action.REDIRECT } }],
+      ['interstitial.onSessionNotFound REDIRECT', { interstitial: { onSessionNotFound: Action.REDIRECT } }],
+    ])('redirectLocation with %s gives no message: that setting can redirect', (_, settings) => {
+      // Arrange
+      const svc = new RTIHelperService({ redirectLocation: 'https://x', ...settings } as any);
+
+      // Act & Assert
+      expect(svc.validateConfig()).toEqual([]);
+    });
+
+    test.each([
+      ['nothing else', {}],
+      ['each of those settings at a value that can not redirect', {
+        redirectTTCodes: [],
+        blockingStrategy: ActionStrategy.NOT_FOUND,
+        challengingStrategy: ActionStrategy.CAPTCHA,
+        actionOnSuspicious: { methods: { POST: Action.BLOCK }, rules: [{ path: '^/login$', methods: ['POST'], action: Action.CHALLENGE }] },
+        interstitial: { onSecondVerdict: Action.BLOCK, onSessionNotFound: Action.CHALLENGE },
+      }],
+    ])('redirectLocation with %s still gives the message', (_, settings) => {
+      // Arrange
+      const svc = new RTIHelperService({ redirectLocation: 'https://x', ...settings } as any);
+
+      // Act & Assert
+      expect(svc.validateConfig()).toEqual([REDIRECT_MESSAGE]);
     });
   });
   // #endregion validateConfig Method Tests

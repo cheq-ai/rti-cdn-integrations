@@ -35,8 +35,9 @@ export interface RequestStrategy {
   strategy: ActionStrategy | null;
   /**
    * Set only when {@link ActionOnSuspicious} decided (see RTIHelperService.getStrategyForRequest): the Action it gave,
-   * ALLOW when no rule or default applies. Not set when the CAPTCHA page is the answer without it: for a page load that
-   * no rule covers, or for a GET or HEAD when the caller does not pass `isPageLoad` or RTI wants it blocked with
+   * ALLOW when no rule or default applies. Not set when a page is the answer without it: for a page load that no rule
+   * covers (the CAPTCHA page, or the interstitial for a GET page load while the interstitial is in play), or the
+   * CAPTCHA page for a GET or HEAD when the caller does not pass `isPageLoad` or RTI wants it blocked with
    * `blockingStrategy: CAPTCHA`. For the debug log.
    */
   actionOnSuspicious?: Action;
@@ -65,7 +66,8 @@ export interface ActionOnSuspiciousRule {
  * request with a body (the CAPTCHA page can't carry the body through), or another GET or HEAD. A rule can also decide
  * for a page load. RTIHelperService.getStrategyForRequest asks three questions, in this order:
  * 1. Does a rule match the path and cover the method? The first such rule decides.
- * 2. Is the request a page load (RTIStatelessUtils.isPageLoad)? It gets the CAPTCHA page.
+ * 2. Is the request a page load (RTIStatelessUtils.isPageLoad)? It gets the CAPTCHA page, or the interstitial while
+ *    the interstitial is in play.
  * 3. Otherwise the method's default decides, else ALLOW.
  * isPageLoad is false for a request with a body, so for it this is: the first matching rule, then the default, then
  * ALLOW. A method outside the seven ({@link ActionOnSuspiciousMethod}) is ALLOW: no rule or default is used for it.
@@ -73,9 +75,15 @@ export interface ActionOnSuspiciousRule {
  * - ALLOW: forwarded to the origin with `x-cheq-rti-result`, so the origin can decide.
  * - CHALLENGE: the CAPTCHA page. A GET or HEAD gets it in place. A request with a body gets it built for the page the
  *   visitor came from (Referer, same site only; else the site's home page). After solving they are back on that page
- *   and can send the form again. The body itself is not kept.
+ *   and can send the form again. The body itself is not kept. For a GET page load while the interstitial is in play, a
+ *   rule's CHALLENGE means the interstitial.
  * - BLOCK: the `blockingStrategy` answer (403 by default, or 404).
  * - REDIRECT: a 302 to `redirectLocation`.
+ *
+ * The interstitial is in play only for a GET page load that RTI wants challenged, while the caller passes
+ * `interstitialOn: true` (Cloudflare, with `config.interstitial` on). Then `challengingStrategy` is not used for it.
+ * Every other request (a POST, a HEAD, a script's fetch) gets the answer it gets with the interstitial off,
+ * `challengingStrategy` included.
  *
  * A caller that does not pass `isPageLoad` to RTIHelperService.getStrategyForRequest, and a block verdict shown as a
  * CAPTCHA (`blockingStrategy: CAPTCHA`), keep the behavior from before `isPageLoad` existed: a GET or HEAD gets the

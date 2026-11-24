@@ -20,8 +20,8 @@ import { RTIStatelessUtils } from "./rti-stateless-utils";
  * response leads to, and whether the config itself is valid.
  *
  * The config-free helpers (cookies, headers, list parsing, the `x-cheq-rti-result` header, the
- * challenge-reply check, the bodyless-method, page-load and Action checks, safe path matching and
- * error messages) live in {@link RTIStatelessUtils}, which this class
+ * challenge-reply check, the bodyless-method, page-load, prefetch and Action checks, safe path
+ * matching and error messages) live in {@link RTIStatelessUtils}, which this class
  * extends. The integrations only ever create this service and call everything through it, so the
  * split is invisible to them: `rtiHelperService.parseCookies(...)` and
  * `RTIHelperService.parseNumberList(...)` keep working through inheritance.
@@ -67,31 +67,43 @@ export class RTIHelperService extends RTIStatelessUtils {
   }
 
   /**
-   * Returns the {@link Action} based on configuration and RTI response
+   * Returns the {@link Action} based on configuration and RTI response: {@link getEnforcedAction} in BLOCKING mode,
+   * ALLOW in any other mode.
    * @param rtiResponse
    */
   getAction(rtiResponse: RTIResponse): Action {
-    if (this.config.mode === Mode.BLOCKING) {
-      if (rtiResponse.decision.verdict === "malicious" || this.config.blockTTCodes?.includes(rtiResponse.classification.code) || this.config.blockReasons?.some(br => rtiResponse.cheqDetection.reasons.includes(br))) {
-        return Action.BLOCK;
-      } else if (rtiResponse.decision.verdict === "suspicious" || this.config.challengeTTCodes?.includes(rtiResponse.classification.code) || this.config.challengeReasons?.some(cr => rtiResponse.cheqDetection.reasons.includes(cr))) {
-        return Action.CHALLENGE;
-      } else if (this.config.redirectTTCodes?.includes(rtiResponse.classification.code) || this.config.redirectReasons?.some(rr => rtiResponse.cheqDetection.reasons.includes(rr))) {
-        return Action.REDIRECT;
-      }
+    return this.config.mode === Mode.BLOCKING ? this.getEnforcedAction(rtiResponse) : Action.ALLOW;
+  }
+
+  /**
+   * The {@link Action} the config gives for this RTI response, in any mode: what {@link getAction} gives in BLOCKING
+   * mode. In MONITORING mode it says what BLOCKING mode would do.
+   * @param rtiResponse
+   */
+  getEnforcedAction(rtiResponse: RTIResponse): Action {
+    if (rtiResponse.decision.verdict === "malicious" || this.config.blockTTCodes?.includes(rtiResponse.classification.code) || this.config.blockReasons?.some(br => rtiResponse.cheqDetection.reasons.includes(br))) {
+      return Action.BLOCK;
+    } else if (rtiResponse.decision.verdict === "suspicious" || this.config.challengeTTCodes?.includes(rtiResponse.classification.code) || this.config.challengeReasons?.some(cr => rtiResponse.cheqDetection.reasons.includes(cr))) {
+      return Action.CHALLENGE;
+    } else if (this.config.redirectTTCodes?.includes(rtiResponse.classification.code) || this.config.redirectReasons?.some(rr => rtiResponse.cheqDetection.reasons.includes(rr))) {
+      return Action.REDIRECT;
     }
     return Action.ALLOW;
   }
 
   /**
-   * Returns the {@link ActionStrategy} based on configuration and {@link Action}
+   * Returns the {@link ActionStrategy} based on configuration and {@link Action}.
+   * A configured INTERSTITIAL counts as not set, so the default applies: only {@link getStrategyForRequest} gives
+   * INTERSTITIAL, and only to a caller that passes `interstitialOn: true`. Akamai looks blockingStrategy and
+   * challengingStrategy up by name in ActionStrategy, so the name INTERSTITIAL can arrive here.
    * @param action
    */
   getActionStrategy(action: Action): ActionStrategy | null {
+    const configured = (strategy?: ActionStrategy) => strategy === ActionStrategy.INTERSTITIAL ? undefined : strategy;
     if (action === Action.BLOCK) {
-      return this.config.blockingStrategy ?? ActionStrategy.ACCESS_DENIED;
+      return configured(this.config.blockingStrategy) ?? ActionStrategy.ACCESS_DENIED;
     } else if (action === Action.CHALLENGE) {
-      return this.config.challengingStrategy ?? ActionStrategy.CAPTCHA;
+      return configured(this.config.challengingStrategy) ?? ActionStrategy.CAPTCHA;
     } else if (action === Action.REDIRECT) {
       return ActionStrategy.REDIRECT;
     }
@@ -112,29 +124,55 @@ export class RTIHelperService extends RTIStatelessUtils {
    * - A method outside the seven ({@link ActionOnSuspiciousMethod}) is forwarded, whatever `isPageLoad` says.
    * When actionOnSuspicious decides, its Action is mapped the same way and returned in `actionOnSuspicious`.
    * `strategy: null` means forward to the origin with the verdict.
+   *
+   * The interstitial is in play only for a GET page load: RTI says CHALLENGE, `interstitialOn` is exactly `true`, the
+   * method is GET (any case) and `isPageLoad` is exactly `true`. Then the strategy is CAPTCHA, whatever
+   * challengingStrategy says, so the three questions are asked: the page of question 2 is the interstitial
+   * (INTERSTITIAL), and `Action.CHALLENGE` from a rule also means the interstitial. Any other request (a login POST, a
+   * HEAD, a GET API call) gets the answer it gets without `interstitialOn`: challengingStrategy keeps working for it,
+   * and `Action.CHALLENGE` from a rule or a default is mapped by getActionStrategy, as before (the CAPTCHA, unless
+   * challengingStrategy says otherwise). A caller that does not pass `interstitialOn` (CloudFront) gets the answers
+   * from before it existed. A block verdict never gets INTERSTITIAL, and getActionStrategy never gives it: it comes
+   * only from here, for a caller that passes `true`.
    * @param action RTI's action for this request ({@link getAction})
    * @param method the request method
    * @param path the request path, for actionOnSuspicious rules
    * @param isPageLoad whether the request is a page load ({@link isPageLoad}). Not passed (`undefined` or `null`): the
    *   behavior from before this argument existed.
+   * @param interstitialOn whether the interstitial is on. Only `true` counts, and it changes the answer only for a GET
+   *   page load. Not passed: the answers from before this argument existed.
    */
-  getStrategyForRequest(action: Action, method: string, path: string, isPageLoad?: boolean): RequestStrategy {
-    const strategy = action !== Action.ALLOW ? this.getActionStrategy(action) : null;
+  getStrategyForRequest(
+    action: Action, method: string, path: string, isPageLoad?: boolean | null, interstitialOn?: boolean,
+  ): RequestStrategy {
+    // RTI says CHALLENGE and the page-load fact is passed: the three questions decide, if the strategy is CAPTCHA.
+    const questions = action === Action.CHALLENGE && isPageLoad !== undefined && isPageLoad !== null;
+    // The interstitial is in play only for a GET page load while it is on: the strategy is then CAPTCHA, whatever
+    // challengingStrategy says. Any other request gets the answer it gets without interstitialOn.
+    const interstitial = questions && interstitialOn === true && method.toUpperCase() === 'GET' && isPageLoad === true;
+    const strategy = interstitial ? ActionStrategy.CAPTCHA
+      : action !== Action.ALLOW ? this.getActionStrategy(action) : null;
     if (strategy !== ActionStrategy.CAPTCHA) {
       return { strategy };
     }
-    if (action !== Action.CHALLENGE || isPageLoad === undefined || isPageLoad === null) {
+    // Only a GET can be a page load: a `true` passed for another method is not used.
+    const pageLoad = Boolean(isPageLoad) && method.toUpperCase() === 'GET';
+    if (!questions) {
       // As before isPageLoad was passed: a GET or HEAD gets the page.
       if (this.isBodylessMethod(method)) {
         return { strategy };
       }
-    } else if (isPageLoad && method.toUpperCase() === 'GET' && !this.findActionOnSuspiciousRule(method, path)) {
+    } else if (pageLoad && !this.findActionOnSuspiciousRule(method, path)) {
       // Question 2, asked only for a GET: a page load that no rule covers gets the page. A GET is one of the seven, so
       // here the helper's answer only says whether a rule covers it (its made-up ALLOW is for a method outside them).
-      return { strategy };
+      return { strategy: interstitial ? ActionStrategy.INTERSTITIAL : strategy };
     }
     // Question 1 or 3, or a request with a body as before: actionOnSuspicious decides.
     const suspiciousAction = this.getActionOnSuspicious(method, path);
+    if (interstitial && suspiciousAction === Action.CHALLENGE) {
+      // A rule that covers this GET page load says CHALLENGE: the interstitial.
+      return { strategy: ActionStrategy.INTERSTITIAL, actionOnSuspicious: suspiciousAction };
+    }
     return {
       strategy: suspiciousAction === Action.ALLOW ? null : this.getActionStrategy(suspiciousAction),
       actionOnSuspicious: suspiciousAction,
@@ -187,11 +225,28 @@ export class RTIHelperService extends RTIStatelessUtils {
   validateConfig(): string[] {
     const errors: string[] = [];
     if ((this.config.redirectReasons && this.config.redirectReasons.length > 0 && !this.config.redirectLocation) ||
-        (this.config.redirectLocation && !this.config.redirectReasons)) {
+        (this.config.redirectLocation && !this.config.redirectReasons && !this.otherSettingCanRedirect())) {
           errors.push("For redirecting as an Action you must define both redirectCodes and redirectLocation");
     }
     errors.push(...this.validateActionOnSuspicious());
     return errors;
+  }
+
+  /**
+   * Whether a setting other than redirectReasons can send a request to redirectLocation: redirectTTCodes with a code
+   * in it, REDIRECT as blockingStrategy or challengingStrategy, or Action.REDIRECT in actionOnSuspicious (a method's
+   * default or a rule), in interstitial.onSecondVerdict or in interstitial.onSessionNotFound. A setting counts as
+   * written: the mode and interstitial.enabled are not read.
+   */
+  private otherSettingCanRedirect(): boolean {
+    const { redirectTTCodes, blockingStrategy, challengingStrategy, actionOnSuspicious, interstitial } = this.config;
+    return (redirectTTCodes?.length ?? 0) > 0
+      || blockingStrategy === ActionStrategy.REDIRECT
+      || challengingStrategy === ActionStrategy.REDIRECT
+      || Object.values(actionOnSuspicious?.methods ?? {}).includes(Action.REDIRECT)
+      || (actionOnSuspicious?.rules ?? []).some(rule => rule.action === Action.REDIRECT)
+      || interstitial?.onSecondVerdict === Action.REDIRECT
+      || interstitial?.onSessionNotFound === Action.REDIRECT;
   }
 
   /**
