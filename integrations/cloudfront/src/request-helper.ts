@@ -273,6 +273,13 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
         // action is Action.ALLOW, pass headers
         setHeaders(cfRequest.headers, rtiResponse);
 
+        // Known limit, not fixed here: when actionOnSuspicious lets a suspicious request through (a script's fetch of a
+        // page, say), the site's answer reaches the browser as the site sent it. This function runs on the request
+        // (viewer-request or origin-request) and never sees that answer, so it cannot mark an HTML answer no-store as the
+        // Cloudflare Worker does (keepOutOfBrowserCache in integrations/cloudflare/src/index.ts). A browser that keeps the
+        // page can show it later for a link click, a redirect or Back without a request, and the CAPTCHA never comes (seen
+        // with the Worker in Chromium 131 and Firefox 132 on 2026-11-23). A fix needs a response trigger (viewer-response
+        // or origin-response), which this integration does not have: README, "Which request gets a page", Known limits.
         return cfRequest;
     } catch (e) {
         const cfRequestId = getCfRequestId(event);
