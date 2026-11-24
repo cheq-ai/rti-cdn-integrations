@@ -2258,6 +2258,93 @@ describe('cloudflare worker', () => {
 
     // --- Forwarding to the origin ---
 
+    // A suspicious visitor without a pass must not get a page into the browser cache through a request that is passed on
+    // (a script's fetch of a page, say): the browser could later show that copy for a click or Back without asking the
+    // Worker, so the CAPTCHA would never come. Seen in Chromium and Firefox on the dev Worker (2026-11-23).
+    describe('what the browser may keep of an answer passed on for a suspicious visitor', () => {
+        // A script's fetch: Sec-Fetch-Dest empty, so not a page load, and passed on by actionOnSuspicious (GET: ALLOW).
+        const suspiciousFetch = () => buildWorkerRequest('/page', { extraHeaders: { 'sec-fetch-dest': 'empty', accept: '*/*' }, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
+        // The site's answer, with its own caching headers.
+        const origin = (headers: Record<string, string>, body: BodyInit | null = '<html>page</html>') =>
+            async () => new Response(body, { status: 200, headers: { 'cache-control': 'max-age=600', etag: '"v1"', ...headers } });
+
+        it.each([
+            ['text/html'],
+            ['text/html; charset=utf-8'],
+            ['TEXT/HTML'],
+            ['application/xhtml+xml'],
+        ])('an HTML answer (Content-Type: %s) to a suspicious GET that is not a page load gets Cache-Control: no-store', async (contentType) => {
+            // Arrange
+            captchaVerdict();
+
+            // Act
+            const { response, originFetch } = await run(suspiciousFetch(), origin({ 'content-type': contentType }));
+
+            // Assert
+            expect(originFetch).toHaveBeenCalledOnce();
+            expect(response.headers.get('cache-control')).toBe('no-store, no-cache, must-revalidate');
+        });
+
+        it('keeps the rest of a marked answer as the site sent it: status, body and the other headers', async () => {
+            // Arrange
+            captchaVerdict();
+            const site = async () => new Response('<html>page</html>', { status: 201, headers: { 'content-type': 'text/html', 'cache-control': 'max-age=600', etag: '"v1"', 'x-site': 'kept' } });
+
+            // Act
+            const { response } = await run(suspiciousFetch(), site);
+
+            // Assert
+            expect(response.status).toBe(201);
+            expect(await response.text()).toBe('<html>page</html>');
+            expect(response.headers.get('content-type')).toBe('text/html');
+            expect(response.headers.get('etag')).toBe('"v1"');
+            expect(response.headers.get('x-site')).toBe('kept');
+        });
+
+        it.each([
+            ['application/json', origin({ 'content-type': 'application/json' }, '{"a":1}')],
+            ['text/plain', origin({ 'content-type': 'text/plain' }, 'text')],
+            ['no Content-Type', origin({}, new Uint8Array([1, 2, 3]))],
+        ])('an answer that is not HTML (%s) keeps the site\'s Cache-Control', async (_label, site) => {
+            // Arrange
+            captchaVerdict();
+
+            // Act
+            const { response } = await run(suspiciousFetch(), site);
+
+            // Assert
+            expect(response.headers.get('cache-control')).toBe('max-age=600');
+        });
+
+        it('an HTML answer on a benign verdict keeps the site\'s Cache-Control', async () => {
+            // Arrange
+            mocks.getAction.mockReturnValue(Action.ALLOW);
+            mocks.getActionStrategy.mockReturnValue(null);
+            mocks.callRTI.mockResolvedValue(buildRTIResponse({ verdict: 'benign' }));
+
+            // Act
+            const { response, forwarded } = await run(suspiciousFetch(), origin({ 'content-type': 'text/html' }));
+
+            // Assert
+            expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=benign');
+            expect(response.headers.get('cache-control')).toBe('max-age=600');
+        });
+
+        it('an HTML answer to a suspicious page load with a valid pass keeps the site\'s Cache-Control: the visitor passed the check', async () => {
+            // Arrange
+            captchaVerdict();
+            mocks.validateChallenge.mockResolvedValue(true);
+            const pageLoad = buildWorkerRequest('/page', { cookies: '_cq_se=tok|ray', extraHeaders: { 'sec-fetch-dest': 'document' }, cfRay: CF_RAY, xRealIp: '1.2.3.4' });
+
+            // Act
+            const { response, forwarded } = await run(pageLoad, origin({ 'content-type': 'text/html' }));
+
+            // Assert
+            expect(forwarded!.headers.get('x-cheq-rti-result')).toContain('verdict=suspicious');
+            expect(response.headers.get('cache-control')).toBe('max-age=600');
+        });
+    });
+
     describe('forwarding to the origin', () => {
         it('calls the origin once for an allowed request, with the request that carries the verdict', async () => {
             // Act

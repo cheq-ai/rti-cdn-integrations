@@ -42,6 +42,10 @@ const RELOAD_OUTCOMES: Partial<Record<Action, string>> = {
 // Our block, 404 and redirect answers, and the empty 403 for a prefetch, are never cached.
 const responseHeaders = new ResponseHeaders();
 
+// The requests that handle passes on for a suspicious visitor because actionOnSuspicious let them through (a GET that is
+// not a page load, say). An HTML answer to one of them is made no-store in fetch (see keepOutOfBrowserCache).
+const passedOnForSuspicious = new WeakSet<Request>();
+
 // Once per cold start, and never fatal: an exception while the module loads breaks every request of the Worker. Only
 // reads the config and logs. The [challenge] and [interstitial] checks run first: an actionOnSuspicious check that
 // throws can't hide them.
@@ -101,9 +105,28 @@ export default {
         if (result instanceof Response) {
             return result;
         }
-        return forwardToOrigin(result);
+        const response = await forwardToOrigin(result);
+        return passedOnForSuspicious.has(result) ? keepOutOfBrowserCache(response) : response;
     },
 };
+
+/**
+ * An HTML answer that handle passed on for a suspicious visitor (actionOnSuspicious let the request through, e.g. a
+ * script's fetch of a page) gets Cache-Control: no-store. Kept, the browser could show that page later for a link click,
+ * a redirect or Back without asking the Worker, and the CAPTCHA would never come (seen in Chromium and Firefox; README,
+ * "Which request gets a page"). Any other answer, and the rest of this one, is returned as the site sent it.
+ */
+function keepOutOfBrowserCache(response: Response): Response {
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+    if (!contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
+        return response;
+    }
+    const marked = new Response(response.body, response); // the origin's headers cannot be changed in place
+    for (const [name, value] of Object.entries(responseHeaders.noStore())) {
+        marked.headers.set(name, value);
+    }
+    return marked;
+}
 
 /**
  * The only place that calls the origin. It is outside handle's error handling on purpose: a failing origin
@@ -122,7 +145,8 @@ function forwardToOrigin(request: Request): Promise<Response> {
     //   To also show x-cheq-rti-result to the browser (demo/debugging only), return this instead:
     //return fetch(demoRequest).then((response) => {
     //    const visible = new Response(response.body, response); // origin responses are immutable
-    //    visible.headers.set("x-cheq-rti-result", request.headers.get("x-cheq-rti-result") || "");
+    //    const verdict = request.headers.get("x-cheq-rti-result");
+    //    if (verdict) visible.headers.set("x-cheq-rti-result", verdict); // only when RTI gave one
     //    return visible;
     //});
 
@@ -295,6 +319,9 @@ async function handle(request: Request, originRequest: Request, context: Executi
         // Set the RTI result header for the origin to consume. It is not visible to the client; the origin can log it
         // or act on it.
         setHeaders(originRequest.headers, rtiResponse);
+        if (actionOnSuspicious === Action.ALLOW) {
+            passedOnForSuspicious.add(originRequest);
+        }
         return originRequest;
     } catch (e) {
         logError(context, `Error handling request '${getCdnRequestId(request)}'`, e);
@@ -348,10 +375,11 @@ async function carryOutStrategy(strategy: ActionStrategy | null, request: Reques
                     // challenge page: the owner's decision of 2026-11-23 (README, "Which request gets a page";
                     // RTIStatelessUtils.isPrefetch says what MDN writes about it). Checked after the session
                     // waiver, so a valid session forwards a prefetch with the verdict, as it would a visit.
-                    // Known limit, not fixed on purpose (the owner's decision of 2026-11-23): a page that a
-                    // site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty, so it is not
-                    // a page load and, as shipped, does not get here: it is forwarded with the verdict (the
-                    // JSDoc of RTIStatelessUtils.isPrefetch; README, the known limits of "Which request gets a page").
+                    // A page that a site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty, so it
+                    // is not a page load and, as shipped, does not get here: it is forwarded with the verdict (the JSDoc
+                    // of RTIStatelessUtils.isPrefetch; README, the known limits of "Which request gets a page"). Its
+                    // HTML answer is made no-store in fetch (keepOutOfBrowserCache), so the browser does not reuse it
+                    // for the click: in Chromium 131 the click then got the CAPTCHA (2026-11-24).
                     if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
                         if (config.debug) {
                             console.log("prefetch: an empty 403 in place of the challenge page");

@@ -112,8 +112,11 @@ export class RTIStatelessUtils {
    * HTTP cache. This function says yes for such a request, but with `Sec-Fetch-Dest: empty` it is not a page load
    * ({@link isPageLoad}, step 2). So it follows actionOnSuspicious like any GET that is not a page load: as shipped it
    * is forwarded with the verdict, and it never reaches the handlers' check for the empty 403. The browser may then
-   * show that page from its cache when the visitor opens it, without the CAPTCHA. A customer who wants the empty 403
-   * for it sets `methods: { GET: Action.CHALLENGE }`, with ALLOW rules for the paths of the site's background calls.
+   * show that page from its cache when the visitor opens it, without the CAPTCHA: seen in Chromium 131 on 2026-11-24.
+   * The Cloudflare Worker now marks the HTML answer to such a request no-store (keepOutOfBrowserCache), and with that
+   * the click went to the Worker and got the CAPTCHA. CloudFront cannot change the answer, so there the limit stays
+   * (its README, "Known limits"). A customer who wants the empty 403 for it sets `methods: { GET: Action.CHALLENGE }`,
+   * with ALLOW rules for the paths of the site's background calls.
    * @param headers the request's headers
    */
   isPrefetch(headers: PageLoadHeaders): boolean {

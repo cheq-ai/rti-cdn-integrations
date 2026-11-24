@@ -1044,10 +1044,33 @@ shipped `config.ts` names `GET: Action.ALLOW` and `HEAD: Action.ALLOW`, so the s
   `Sec-Purpose: prefetch` and `Sec-Fetch-Dest: empty`, so it is not a page load and is forwarded like any background
   `GET`. The browser keeps the answer in its HTTP cache and may show it from there when the visitor opens the page
   ([MDN: rel="prefetch"](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/rel/prefetch)).
-  Nobody ran this in a browser here. To give such a request the empty 403, set `GET: Action.CHALLENGE` in `methods`,
+  Seen on 2026-11-24 in Chromium 131, with the Cloudflare Worker before its `no-store` change: the click showed the
+  prefetched page, without the challenge page (Firefox 132 and WebKit 18.2 sent no prefetch request). The Worker now
+  marks that answer `no-store`, and the click gets the challenge page. CloudFront cannot change the answer (next
+  item), so here the limit stays. To give such a request the empty 403, set `GET: Action.CHALLENGE` in `methods`,
   with `ALLOW` rules for the paths of your background calls. At origin-request with a header list that forwards
   `accept` but neither `sec-fetch-dest` nor `sec-purpose` (the lists of `template.yaml`), its `Accept` decides: it is
   the one of a visit (the same MDN page), so the request counts as a page load and gets the challenge page.
+- **A page that a script fetched can be shown from the browser's cache, without the CAPTCHA.** A suspicious `GET`
+  that is not a page load is forwarded, and the origin's answer reaches the browser as the origin sent it: this
+  integration runs on the request (viewer-request or origin-request) and cannot change the answer. If the answer is a
+  page that the browser may keep, the browser can show it later for a link click, a redirect or Back without asking
+  CloudFront, so the challenge page never comes. That was seen with the Cloudflare Worker in Chromium 131 and Firefox
+  132 on 2026-11-23, with an origin that sends no `Cache-Control`; the Worker now sets `Cache-Control: no-store` on
+  such an HTML answer (Cloudflare README, "Which request gets a page"). Here the origin has to: send
+  `Cache-Control: no-store` for its HTML pages (`no-cache` protects a link click but not Back), or add a response
+  trigger that sets it (not part of this integration).
+  A fix in this integration would need a third Lambda@Edge function, on the response side, and a decision on which:
+  - **viewer-response** runs for every answer that goes to the browser and changes only what the browser gets. It
+    costs one more function call on every request, and every deployment has to attach one more trigger.
+  - **origin-response** runs only when CloudFront asks the origin. Marking the answer there also keeps CloudFront's
+    own cache from storing it (a stored copy skips the check at origin-request, see
+    [Cache bypasses RTI (origin-request)](#cache-bypasses-rti-origin-request)), but an answer that
+    is already in that cache does not pass through it.
+
+  Either one has to tell which answers to mark: a suspicious `GET` that was forwarded because `actionOnSuspicious` let
+  it through, with an HTML answer. Whether the response event shows the request headers that our request function set
+  (such as `x-cheq-rti-result`) has not been checked.
 - A suspicious `HEAD` is forwarded by default.
 - The Fetch Metadata spec adds `Sec-Fetch-Dest` only to a request for a potentially trustworthy URL, such as `https:`
   ([Fetch Metadata Request Headers](https://w3c.github.io/webappsec-fetch-metadata/), section 3). Over plain `http:`,

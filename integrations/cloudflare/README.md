@@ -68,6 +68,12 @@ finishes it gets no answer from the Worker.
 npm i; npm run deploy
 ```
 
+**A Worker name for `workers.dev`:** use letters, digits and hyphens only. The Worker's address is
+`https://<name>.<subdomain>.workers.dev`, and a `_` in a host name breaks some clients: on 2026-11-23, Playwright's
+WebKit 18.2 (the engine of Safari) could not open `https://cheq-rti-v4_1-interstitial.cheqai.workers.dev` at all
+("SSL connect error") and opened the same domain without `_`; Chromium, Firefox and `curl` opened both. Real Safari was
+not tried. A Worker on your own domain (a route) is not affected: its name is not in the address.
+
 ### Example Deploy Output
 ```
 Old v4 Deployment ID: 2874786b-81d1-4f73-973e-8ec5a8305b6c (cheq-rti-v4-integration-cloudflare)
@@ -140,12 +146,14 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
      prefetch. A throw in the interstitial's code is logged, and the request is forwarded with the verdict. A throw in
      one of its log lines is logged and changes nothing else (see [Monitoring and logs](#monitoring-and-logs)).
 7. **Allow.** Every other request (ALLOW, a request that `actionOnSuspicious` lets through, such as a `GET` that is not
-   a page load, the `CAPTCHA` cases above that are forwarded with the verdict, and the interstitial's forwards) gets
-   `x-cheq-rti-result` on the copy, and the copy is forwarded.
+    a page load, the `CAPTCHA` cases above that are forwarded with the verdict, and the interstitial's forwards) gets
+    `x-cheq-rti-result` on the copy, and the copy is forwarded. When `actionOnSuspicious` let a suspicious request
+    through and the origin answers with an HTML page, that answer gets `Cache-Control: no-store` (see
+    [Which request gets a page](#which-request-gets-a-page)).
 8. **Any error before the decision** (an RTI error or timeout, a malformed RTI response): logged. A recognized challenge
    reply (the same conditions as step 5) still goes to `config.challenge`, with a stand-in response and no
    `addRtiResultHeader` (see [Challenge callbacks](#challenge-callbacks)). Everything else is forwarded, without the
-   verdict.
+   verdict. Why an RTI call times out, and how to choose `timeout`: [RTI timeout and latency](#rti-timeout-and-latency).
 
 **Logs.** Errors go to `console.error`, and to the RTI logger through `waitUntil` unless `logErrors` is `false`:
 `Error handling request '<id>'`, `Challenge error handling request '<id>'`,
@@ -165,6 +173,58 @@ Turnstile secrets are `REPLACE_ME` (as shipped), it also logs
 `[turnstile] CAPTCHA disabled, not configured: siteKey, secretKey, sessionSigningSecret (set them in config.ts)`.
 With `enabled: true` and `interstitial.tag` still `REPLACE_ME` (as shipped), it logs
 `[interstitial] interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console (see "Interstitial" in the README)`.
+
+### RTI timeout and latency
+
+`timeout` in `config.ts` (500 ms as shipped) is the longest the Worker waits for RTI. The timer starts when the RTI call
+starts. When it runs out, the call fails with `request error: The operation was aborted due to timeout`, which is
+logged as `Error handling request '<id>': …` (step 8 of [How a request is handled](#how-a-request-is-handled)), and the
+request is forwarded without an RTI decision and without `x-cheq-rti-result`: no block and no CAPTCHA. The timeout is a
+limit, not a delay: an answer that comes sooner is used at once.
+
+**Where the time goes.** Not in the Worker. `fetch` is part of the Workers runtime, so nothing is loaded on a cold start,
+and a request used about 1 ms of CPU in the measurement below. The CloudFront integration replaced `fetch` because
+loading it on a small Lambda is slow (see [Memory, CPU and Cold Starts](../cloudfront/README.md#memory-cpu-and-cold-starts));
+the Worker has no such cost. The time is the network between the Cloudflare location that runs the Worker and the RTI
+endpoint:
+
+- On a connection that is already open, a call takes about one round trip to the RTI region.
+- A call that needs a new connection first pays for the DNS lookup, the TCP connect and the TLS handshake: about three
+  round trips more.
+
+Which call finds an open connection is up to Cloudflare; the Worker cannot keep one open itself. So the slow call is not
+only the first request after a deploy. In the measurement below, slow and fast calls alternated for the first requests;
+after that all calls were fast, also after 86 s without traffic.
+
+**Measured** on 2026-11-23: the Worker in Cloudflare's Tel Aviv location (`TLV`), the dev RTI endpoint
+(`obs.dev.cheqzone.com`, in AWS us-east-1), each RTI call timed inside the Worker from the `debug` log lines
+(`RTI Request payload` to `RTI Response`):
+
+| Call | RTI call |
+|---|---|
+| On an open connection | 170–185 ms |
+| On a new connection | 610–620 ms |
+| The first request after a deploy | timed out at `timeout: 1000`; answered at `timeout: 2000` (1.04 s in all, seen from the client) |
+
+From a developer PC in Israel, the production endpoint `rti-global.cheqzone.com` (it resolved to AWS ap-south-1, Mumbai,
+from there) answered in about 160 ms on an open connection and in 670–930 ms on a new one. These numbers are from one
+location: a Cloudflare location close to an RTI region sees much smaller ones.
+
+**Choosing `timeout`.**
+
+- 500 ms (as shipped) covers calls on an open connection. From a location about 150 ms from the RTI region, every call
+  on a new connection times out and the request goes through unchecked. A site with little traffic has the fewest open
+  connections and is hit hardest.
+- Allow about four round trips to the RTI region, plus a margin. From Tel Aviv that is about 1,000 ms, and 2,000 ms
+  also covered the first request after a deploy.
+- A higher value costs only when RTI is slow or cannot be reached: a visitor then waits up to `timeout` before the
+  request goes through unchecked.
+
+**Checking a deployment.** `npx wrangler tail <worker name>` shows each timeout as an `(error)` line with
+`The operation was aborted due to timeout`. With `debug: true` and `npx wrangler tail <worker name> --format json`, every
+log line has a `timestamp`: the gap between `RTI Request payload` and `RTI Response` is the RTI call, and `wallTime` and
+`cpuTime` are the request's totals. With `telemetry: true`, the duration of every call goes to the RTI logger (step 3
+above).
 
 ### actionOnSuspicious and logErrors
 
@@ -211,6 +271,15 @@ An example with two rules and no defaults: `{ path: '^/login$', methods: ['POST'
 
 Before this version, every request that RTI wanted challenged got the CAPTCHA page, whatever its method. "Forwarded"
 means sent to the origin with `x-cheq-rti-result`, so the origin decides.
+
+**The browser does not keep a page forwarded this way.** When a rule or a default lets a request through
+(`Action.ALLOW`) and the origin answers with an HTML page (`Content-Type` `text/html` or `application/xhtml+xml`), the
+Worker sets `Cache-Control: no-store, no-cache, must-revalidate` on that answer. Without it, a page that a script
+fetched could stay in the browser's cache, and the browser could show it later for a link click, a redirect or Back
+without asking the Worker: the visitor would get the page without the CAPTCHA. That was seen in Chromium 131 and
+Firefox 132 on 2026-11-23, with an origin that sends no `Cache-Control`. The rest of the answer (status, body, the
+other headers) is not changed. An answer that is not HTML (JSON, an image, a script) keeps the origin's caching
+headers, and so does every answer on a benign verdict, and a page load that a valid CAPTCHA session lets through.
 
 **While the interstitial is on**, the page of question 2 for a `GET` page load is the interstitial, whatever
 `challengingStrategy` says, and a rule's `Action.CHALLENGE` for a `GET` page load means the interstitial too (row 1).
@@ -297,8 +366,12 @@ in row 2.
   `<link rel="prefetch">`: MDN's
   [`rel=prefetch`](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Attributes/rel/prefetch) page says that
   the browser asks for it with `Sec-Purpose: prefetch` and `Sec-Fetch-Dest: empty`, and that "The result is kept in the
-  HTTP cache on disk". So the browser may show such a page from its cache on the click, without the CAPTCHA. Nobody ran
-  this in a browser here. `methods: { GET: Action.CHALLENGE }` gives such a prefetch the empty 403, unless a rule
+  HTTP cache on disk". Its HTML answer gets `Cache-Control: no-store` like any page forwarded this way (see
+  [The browser does not keep a page forwarded this way](#which-request-gets-a-page)), so the browser does not reuse it
+  for the click. Seen on 2026-11-24 in Chromium 131: with the mark, the click on a prefetched page went to the Worker
+  and got the CAPTCHA page. Without it (the Worker before this change) the click showed the prefetched page, without
+  the CAPTCHA. Firefox 132 and WebKit 18.2 sent no prefetch request in the same test. The prefetch itself still reaches
+  the origin with the verdict. `methods: { GET: Action.CHALLENGE }` gives it the empty 403 instead, unless a rule
   covers it. With that setting, give the paths of background calls `Action.ALLOW` rules.
 
 #### actionOnSuspicious
@@ -450,7 +523,19 @@ between a production and a local or demo origin, in one place:
 - **OPTION 1, local or demo:** every forwarded request goes to one fixed origin (e.g. an S3 static site), and the
   Worker's URL becomes the public entry point. Uncomment it, set your origin URL, and comment out OPTION 2. Its second
   variant also copies `x-cheq-rti-result` into the response, so the browser shows the verdict: for demos and debugging
-  only.
+  only. It copies the header only when the request has one: a request forwarded without a verdict (an ignored path, an
+  RTI error) gets none.
+
+A demo with OPTION 1 differs from the shipped code in three more ways:
+
+- **The tests.** Eight tests expect the request to be forwarded as it is (the same object, the original URL), and fail
+  with OPTION 1, so `npm run deploy` stops after `npm test`. Deploy a demo with `npx wrangler deploy`, and put
+  OPTION 2 back before you commit.
+- **Dev keys need the dev RTI.** `config.ts` calls the production RTI endpoints unless `rtiServiceURI` and
+  `rtiLoggerURI` are set. With keys of the dev environment, set both to the dev endpoints, or every request fails and
+  is forwarded without a verdict.
+- **The timeout.** A demo far from the RTI region needs a `timeout` above the shipped 500 ms (see
+  [RTI timeout and latency](#rti-timeout-and-latency)).
 
 Every request that is forwarded goes through this function (allowed traffic, ignored paths, every error path of
 `handle`), so the one switch covers them all. Our own answers (block pages, redirects, the CAPTCHA page, the
@@ -1092,8 +1177,9 @@ the verdict. A CAPTCHA that the decision leads to keeps its own error handling (
   neither the interstitial nor the CAPTCHA, and is forwarded with the verdict. `methods: { GET: Action.CHALLENGE }`
   gives such a `GET` the CAPTCHA (see [Which request gets a page](#which-request-gets-a-page)).
 - **A page that a site names in `<link rel="prefetch">`** is asked for as a background request and forwarded with the
-  verdict, and the browser may show it from its cache on the click, without the interstitial (see the known limits of
-  [Which request gets a page](#which-request-gets-a-page); nobody ran this in a browser).
+  verdict. Its HTML answer gets `Cache-Control: no-store` (see the known limits of
+  [Which request gets a page](#which-request-gets-a-page)), so the click goes to the Worker and gets the interstitial
+  like any page load. That was seen for the CAPTCHA in Chromium 131 on 2026-11-24; nobody ran it with the interstitial.
 - **A suspicious prefetch of a page gets an empty 403,** with no mark and no log line.
 - **With `onSessionNotFound: Action.ALLOW` (the default), a client that blocks the tag passes** after one extra
   request: the page, then the reload with the mark.
