@@ -711,7 +711,8 @@ browser     the page adds your CHEQ tag, and the tag writes its cookies (_cq_pvi
             the page's script waits for a new _cq_pvid value, writes the mark cookie _cq_it, and reloads
 
 request 2   GET /sofas?gclid=abc             the tag's cookies and the mark
-            the Worker checks the mark ("header" mode: it sets x-cheq-original-referer)
+            the Worker checks the mark ("header" mode: it sets x-cheq-original-referer
+            when the reload's own Referer is missing or is the page itself)
             RTI call 2, now with the tag's data, and customId3: interstitial:<ray id of call 1>
               benign                                    -> the origin
               malicious                                 -> the blockingStrategy answer (the block page by default)
@@ -962,14 +963,18 @@ The HTTP status that the interstitial page is sent with.
 
 How your site learns where the visitor came from, after the interstitial.
 
-- Why it is needed: our page starts the reload, so the reload's own `Referer` is the page itself (seen in a local
-  Chrome run). Without help, your origin would see its own URL as the referrer, instead of a search engine or a
-  campaign.
+- Why it is needed: our page starts the reload. In Chrome the reload's own `Referer` is then the page itself: the
+  design says so (tested on 2026-11-17), and a local run with Chrome 157 saw it (2026-11-23). The dev-Worker tests of
+  2026-11-24 saw the same in Chromium 131 and WebKit 18.2. Without help, your origin would see its own URL as the
+  referrer, instead of a search engine or a campaign. Firefox 132 sent the original Referer again on its reload
+  (2026-11-24).
 - What is carried: the Referer of the first request, as a browser sends it by default. From another site that is only
   its origin, such as `https://www.google.com/`. From your own site it is the full URL, unless it is the page itself.
 - `"header"` (the default): on the reload, the Worker adds `x-cheq-original-referer: <where the visitor came from>` to
-  the request your origin gets, and to the headers RTI gets. Your origin reads that header. It is added on the page the
-  visitor asked for; a page your origin redirects the reload to does not get it, with one exception in
+  the request your origin gets, and to the headers RTI gets, when the reload's own `Referer` is missing or is the page
+  itself. So your origin reads that header when it is there, and otherwise the request's own `Referer` (Firefox 132's
+  reload brought the original Referer itself on 2026-11-24, and got no header). It is added on the page the visitor
+  asked for; a page your origin redirects the reload to does not get it, with one exception in
   [Known limits](#known-limits).
 - `"cookie"`: the page's script writes a `_cq_ref` cookie for 60 seconds, holding the page's address and where the
   visitor came from, in the format of the CAPTCHA's `_cq_ref`. Your site's own script reads it. Neither your origin nor
@@ -1190,7 +1195,10 @@ refuses a cookie for a public suffix (Chrome did for `cloudfront.net`, the desig
 With a `Domain=` kept, the mark is sent to every host of that domain for its 60 seconds, and a reload that the origin
 redirects to the `www` host shows no second interstitial. For an IP address, for a host with one label (`localhost`),
 and when none of the `Domain=` values can be read back, the mark is written for the host only. Nobody has run this in
-a browser yet, and a local run on `localhost` cannot show it.
+a browser on a site's own domain yet, and a local run on `localhost` cannot show it. On `workers.dev` (a demo or a
+test) the mark's `Domain` is the account's subdomain: `.cheqai.workers.dev` in the dev-Worker tests of 2026-11-24, in
+Chromium 131, Firefox 132 and WebKit 18.2. So there, two Workers of the same account with the same `apiKey` and the
+same `binding` accept each other's mark for its 60 seconds.
 
 **The mark counts on every page of the site, not only on the page it was made for** (a decision of 2026-11-22). Why:
 an origin often answers the reload with a redirect (a trailing slash, a locale, a campaign URL), and a mark for one
@@ -1202,17 +1210,31 @@ new interstitial. The mark's Referer and `customId3` stay on the mark's own page
 
 #### The original Referer after the interstitial
 
-The same as after the CAPTCHA (see [The original Referer](#the-original-referer)). After the reload the browser's
-`Referer`, and `document.referrer` on your page, is the page's own URL: the design says that Chrome sends it on a
-script's reload (tested on 2026-11-17), and a local run with Chrome 157 saw it sent without the `#fragment`
-(2026-11-23). So the mark carries the original Referer of the request that got the page,
+The same as after the CAPTCHA (see [The original Referer](#the-original-referer)). What the reload's own `Referer`
+holds depends on the browser:
+
+- **The page's own URL** in Chrome, Chromium 131 and WebKit 18.2: the design says that Chrome sends it on a script's
+  reload (tested on 2026-11-17), and a local run with Chrome 157 saw it sent without the `#fragment` (2026-11-23). The
+  dev-Worker tests of 2026-11-24 found the same in Chromium 131 and WebKit 18.2: `document.referrer` on the site's page
+  was the page's own URL, and in `"header"` mode the Worker added `x-cheq-original-referer`.
+- **The original Referer** in Firefox 132: it sent the original Referer again on the reload, and `document.referrer`
+  on the site's page held the same value (the dev-Worker tests of 2026-11-24).
+
+So the mark carries the original Referer of the request that got the page,
 built as the CAPTCHA builds it: from another site only its origin (`https://www.google.com/`), from this host the full
 URL without the `#fragment`, cut to 420 characters, and nothing for no Referer. When that request already carried an
 `x-cheq-original-referer` that this Worker set, that value goes into the mark.
 
 The Worker uses the mark's Referer only on a page load of the mark's own path whose own `Referer` is missing or is the
 page itself (the same host, path and query). A request that brings another Referer keeps its own, for example a click
-from another page of the site within the 60 seconds.
+from another page of the site within the 60 seconds, or the reload in Firefox 132 (2026-11-24). RTI and the origin
+then get the request's own `Referer`, which already names where the visitor came from.
+
+**What your site reads.** In `"header"` mode, read `x-cheq-original-referer` when it is there, and otherwise the
+request's own `Referer`. The dev-Worker tests of 2026-11-24 saw both ways, with a link on another site: the reloads of
+Chromium 131 and WebKit 18.2 got the header, and the reload of Firefox 132 carried the link's site in its own
+`Referer`, with no header. RTI and the origin got the link's site in all three. In `"cookie"` mode, read `_cq_ref`
+(below).
 
 On plain http a link from an https site brings no Referer under Chrome's default referrer policy: in a local run on
 `http://localhost`, Chrome 157 sent none from `https://www.google.com/`, so the mark had none. With the referrer policy
@@ -1221,22 +1243,29 @@ On plain http a link from an https site brings no Referer under Chrome's default
 `originalRefererVia` (the interstitial's own setting, default `"header"`) says how the value is delivered, as the
 CAPTCHA's setting of the same name does:
 
-- `"header"`: on the reload the Worker adds `x-cheq-original-referer` to the request, before RTI is called. RTI and the
-  origin get it. A value that `config.originalReferer` gives (with the Turnstile example, a valid `_cq_rf`) wins.
+- `"header"`: when the Worker uses the mark's Referer (above), it adds `x-cheq-original-referer` to the reload, before
+  RTI is called. RTI and the origin get it. A value that `config.originalReferer` gives (with the Turnstile example, a
+  valid `_cq_rf`) wins.
 - `"cookie"`: when there is an original Referer, the page's script also writes `_cq_ref`, in the CAPTCHA's format
   `{return URL}|{Referer}` (both URL-encoded; the return URL is the page's path, query and `#fragment`), with
   `Max-Age=60; Path=/; SameSite=Lax`, `Secure` on https, and the mark's domain. The Worker never reads it and adds no
-  header, so RTI does not get the value, and the origin gets it only inside the `Cookie` header. The one exception:
-  when a CAPTCHA follows on the reload, the request that `config.challenge` gets carries the header for that call only,
-  so the CAPTCHA page can carry the value on. It is taken off again before the request goes on.
+  header, so RTI gets no `x-cheq-original-referer`, and the origin gets the value inside the `Cookie` header. The one
+  exception: when a CAPTCHA follows on the reload and the Worker uses the mark's Referer, the request that
+  `config.challenge` gets carries the header for that call only, so the CAPTCHA page can carry the value on. It is
+  taken off again before the request goes on.
 
-The same snippet as for the CAPTCHA reads `_cq_ref` (see [The original Referer](#the-original-referer)). In the chain
-with both pages, the interstitial's `_cq_ref` (for the main domain) and the CAPTCHA's (for the host) can both be
-there. They hold the same Referer.
+The same snippet as for the CAPTCHA reads `_cq_ref` (see [The original Referer](#the-original-referer)): `_cq_ref`
+when it is there, and otherwise `document.referrer`. The page's script writes `_cq_ref` before the reload, so what a
+browser sends on the reload does not change it. The dev-Worker tests of 2026-11-24 found the link's site in `_cq_ref`
+in Chromium 131, Firefox 132 and WebKit 18.2. In the chain with both pages, the interstitial's `_cq_ref` (for the main
+domain) and the CAPTCHA's (for the host) can both be there. They hold the same Referer.
 
 The Referer's way in both modes, with the interstitial and the CAPTCHA set to the same mode (`originalRefererVia` here
 and in `turnstileConfig`). Inside the Worker the way is the same in both modes: the Worker checks the mark and hands the
-value to the CAPTCHA page on the request. The mode decides only who gets the value at the end.
+value to the CAPTCHA page on the request. The mode decides only who gets the value at the end. The table is for a
+reload whose own `Referer` is missing or is the page itself. When the reload brings the original Referer itself
+(Firefox 132 on 2026-11-24), the Worker uses nothing of the mark's Referer: RTI and the origin (or a CAPTCHA page that
+follows) get the request's own `Referer`, and in `"cookie"` mode the site's scripts still find `_cq_ref`.
 
 | Step | `"header"` | `"cookie"` |
 |---|---|---|
@@ -1247,8 +1276,8 @@ value to the CAPTCHA page on the request. The mode decides only who gets the val
 | The 302 after the solve | Sets `_cq_rf` (signed). | Sets `_cq_ref` (readable). |
 | The landing request | The Worker reads `_cq_rf` and sets the header. The origin and RTI get it. | No header is added. The site's scripts read `_cq_ref`, and the origin gets it in the `Cookie` header. |
 
-`document.referrer` on your page is the page's own URL in both modes, as after the CAPTCHA. No page of ours can change
-that.
+`document.referrer` on your page, in both modes, was the page's own URL in Chromium 131 and WebKit 18.2, and the
+original Referer in Firefox 132 (the dev-Worker tests of 2026-11-24). No page of ours can change that.
 
 #### Monitoring and logs
 
@@ -1346,10 +1375,11 @@ the verdict. A CAPTCHA that the decision leads to keeps its own error handling (
   is given only on its landing page. The exception is the next point.
 - **A redirect target with the mark's path that brings no `Referer` of its own also gets the mark's original
   Referer:** the origin redirects the reload to the `www` host, or drops the query, and the browser sends no Referer on
-  the redirect. In `"header"` mode the origin can then see `x-cheq-original-referer` on the reload and again on the
-  target. Seen in a local Chrome run: with `Referrer-Policy: no-referrer` on the origin's 302 from `/sofas?gclid=abc` to
-  `/sofas`, both requests carried the header, at the origin and in RTI's payload. Without that policy only the reload
-  carried it. A signed tag over the host, path and query would prevent it, and was not built.
+  the redirect. In `"header"` mode the origin can then see `x-cheq-original-referer` on the reload (when the Worker set
+  it there) and again on the target. Seen in a local Chrome run: with `Referrer-Policy: no-referrer` on the origin's
+  302 from `/sofas?gclid=abc` to `/sofas`, both requests carried the header, at the origin and in RTI's payload.
+  Without that policy only the reload carried it. A signed tag over the host, path and query would prevent it, and was
+  not built.
 - **A redirect of the reload to a host of another main domain** does not take the mark along, so a visitor without a
   tag session gets a second interstitial there. A host where the Worker does not run ignores the mark.
 - **Hosts of the main domain that run the Worker with different setups** (another `apiKey`) each ignore the other's
@@ -1367,9 +1397,18 @@ the verdict. A CAPTCHA that the decision leads to keeps its own error handling (
   example, `cf-turnstile-response` in the query) goes to `config.challenge` before the interstitial's decision. So with
   `onSecondVerdict` or `onSessionNotFound` set to `Action.BLOCK` or `Action.REDIRECT`, such a request gets the CAPTCHA
   instead. RTI is still called, and the next page load still gets the block.
-- **Not checked: a response header that your zone adds to every answer,** such as a `Content-Security-Policy` from a
-  Transform Rule, could stop the page's inline script, and the page would then not reload. Nobody checked whether such
-  rules apply to an answer the Worker builds. If your zone has one, try a flagged page load once on a test host.
+- **A `Content-Security-Policy` that forbids inline scripts stops the page.** The page's script is written into the
+  page itself (an inline script). The dev-Worker tests of 2026-11-24 added such a header to the Worker's real page in
+  the browser, as a rule of a zone would add it (no zone took part). With `default-src 'self'; script-src 'self'`,
+  Chromium 131, Firefox 132 and WebKit 18.2 refused the script, and the page stayed on "Checking your browser" for
+  good, with no reload and no message. A flagged visitor then cannot reach your site, as long as RTI wants their page
+  loads challenged. With a policy that allows inline scripts (`script-src 'self' 'unsafe-inline' https:`), the page
+  reloaded and the site appeared in all three. Not known: whether Cloudflare applies your zone's response header rules
+  (a Transform Rule, for example) to an answer that the Worker builds. That needs a test on a real zone. What you can
+  do today: check whether your zone adds a `Content-Security-Policy` header to its answers. If it does, try one
+  flagged page load on a test host. A policy that allows inline scripts lets the page reload. In the test, that
+  policy also refused the page's inline styles and the tag's `blob:` worker, which did not stop the reload. A page
+  that works under a policy without `'unsafe-inline'` is not built.
 
 ### Turnstile CAPTCHA
 
@@ -1915,7 +1954,7 @@ came from (Google, an ad, a partner). The example carries the original Referer t
 **What the header is worth.** The value is what the visitor's browser reported as its Referer, carried through the
 CAPTCHA. It is as trustworthy as a `Referer` header, no more: do not treat it as verified. What the signature
 guarantees is that the header is only set after a solved CAPTCHA, for the same client, on the landing page, within 60
-seconds. While the interstitial is on, a valid mark sets it too: after the interstitial, for the same client, on the
+seconds. While the interstitial is on, a valid mark can set it too: after the interstitial, for the same client, on the
 mark's page (see [The original Referer after the interstitial](#the-original-referer-after-the-interstitial)).
 
 **`"header"`:**
