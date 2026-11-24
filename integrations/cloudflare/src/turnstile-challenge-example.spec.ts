@@ -2637,6 +2637,30 @@ describe('original Referer (_cq_ref)', () => {
             const page = await challenge(withReferer(`https://example.com/s?q=${'a'.repeat(1000)}`), buildRTIResponse()) as Response;
             expect(fieldOf(await page.text(), 'original_referer')).toHaveLength(420);
         });
+
+        // The request's x-cheq-original-referer comes first. The Referer counts only when that header has no value.
+        const withOriginalReferer = (originalReferer: string | undefined, referer: string | undefined): Request => {
+            const request = withReferer(referer);
+            if (originalReferer !== undefined) {
+                request.headers.set('x-cheq-original-referer', originalReferer);
+            }
+            return request;
+        };
+
+        it.each([
+            ['x-cheq-original-referer wins over the Referer', 'https://www.google.com/', 'https://example.com/sofas', 'https://www.google.com/'],
+            ['no x-cheq-original-referer: the Referer, as before', undefined, 'https://www.google.com/search?q=x', 'https://www.google.com/'],
+            ['an empty x-cheq-original-referer: the Referer', '', 'https://www.google.com/', 'https://www.google.com/'],
+            ['an x-cheq-original-referer on this host: its full URL', 'https://example.com/a?b=1', 'https://example.com/sofas', 'https://example.com/a?b=1'],
+        ])('%s', async (_name, originalReferer, referer, expected) => {
+            const page = await challenge(withOriginalReferer(originalReferer, referer), buildRTIResponse()) as Response;
+            expect(fieldOf(await page.text(), 'original_referer')).toBe(expected);
+        });
+
+        it('an x-cheq-original-referer that is not http(s), and no Referer: no field', async () => {
+            const page = await challenge(withOriginalReferer('javascript:alert(1)', undefined), buildRTIResponse()) as Response;
+            expect(await page.text()).not.toContain('original_referer');
+        });
     });
 
     describe('a solved CAPTCHA returns it in the _cq_ref cookie', () => {

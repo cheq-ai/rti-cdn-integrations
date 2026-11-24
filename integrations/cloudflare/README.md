@@ -33,10 +33,10 @@ npx wrangler login
 npm i; npm run test
 ```
 
-`npm run test` runs `tsc` and the tests. They check that your config is valid. While `apiKey`, `tagHash` and the three
-Turnstile secrets are all still `REPLACE_ME`, they also check that `config.ts` still has the shipped defaults; those
-checks are skipped once one of the five has your value. `npm run deploy` runs the same tests first, and deploys only
-when they pass.
+`npm run test` runs `tsc` and the tests. They check that your config is valid. While `apiKey`, `tagHash`, the three
+Turnstile secrets and `interstitial.tag` are all still `REPLACE_ME`, they also check that `config.ts` still has the
+shipped defaults; those checks are skipped once one of the six has your value. `npm run deploy` runs the same tests
+first, and deploys only when they pass.
 
 ### Test locally (using Wrangler)
 
@@ -86,9 +86,9 @@ https://developers.cloudflare.com/workers/platform/triggers/routes/
 
 The Worker's `fetch` in [`src/index.ts`](src/index.ts) first calls `context.passThroughOnException()`. Then `handle`
 decides what happens to the request. It never calls the origin: it returns either our own answer (a block page, a
-redirect, a CAPTCHA page, the empty 403 for a prefetch), which the Worker sends as it is, or the request to send on,
-which `forwardToOrigin` passes to the origin. `forwardToOrigin` is the only place that calls the origin (see
-[Local or demo origin](#local-or-demo-origin)).
+redirect, a CAPTCHA page, the interstitial page, the empty 403 for a prefetch), which the Worker sends as it is, or the
+request to send on, which `forwardToOrigin` passes to the origin. `forwardToOrigin` is the only place that calls the
+origin (see [Local or demo origin](#local-or-demo-origin)).
 
 A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
 
@@ -100,17 +100,24 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
    `config.originalReferer` is called (it may return a promise); a value becomes `x-cheq-original-referer`. If it
    throws or rejects, the error is written to the console and the request goes on without the header.
 2. **Ignored path.** A path that matches `ignorePaths` is forwarded without calling RTI.
-3. **RTI.** The RTI payload is built from the copy: a fixed list of headers (`x-cheq-original-referer` among them), the
-   CHEQ cookies, and the JA3 hash from the incoming request's `cf`. With `telemetry: true` the duration of the call goes
-   to the RTI logger through `waitUntil`.
+3. **RTI.** While the interstitial is on, the Worker first reads its mark (`_cq_it`) from the copy (see
+   [The mark cookie](#the-mark-cookie)). In `"header"` mode a valid mark for this page can set `x-cheq-original-referer`
+   on the copy. The RTI payload is built from the copy: a fixed list of headers (`x-cheq-original-referer` among them),
+   the CHEQ cookies, and the JA3 hash from the incoming request's `cf`. A request with a valid mark for its own page
+   also sends `customId3: interstitial:<ray id of the first RTI call>`. With `telemetry: true` the duration of the call
+   goes to the RTI logger through `waitUntil`.
 4. **Decision.** RTI's answer becomes an action (`getAction`), and the action a strategy for this method and path
    (`getStrategyForRequest`). When RTI wants the request challenged and the strategy is `CAPTCHA`, three questions
    decide whether it gets the CAPTCHA page: a rule of [`actionOnSuspicious`](#actiononsuspicious), then whether it is
    a page load (`isPageLoad`), then the method's default (see [Which request gets a page](#which-request-gets-a-page)).
+   While the interstitial is on, a `GET` page load that RTI wants challenged, and that no rule decides otherwise, gets
+   the strategy `INTERSTITIAL` in place of the CAPTCHA page, whatever `challengingStrategy` says (see
+   [Interstitial](#interstitial)). In `MONITORING` mode the Worker logs a `would-show` line where `BLOCKING` mode would
+   show that page.
 5. **Challenge reply.** In `BLOCKING` mode, with `challenge` and `isChallengeResponse` set, a request that
-   `isChallengeResponse` recognizes goes to `config.challenge` when the strategy is none (ALLOW) or `CAPTCHA`, whatever
-   session the visitor has. A throwing `isChallengeResponse` counts as no reply. A throwing `challenge` is logged and the
-   request is forwarded.
+   `isChallengeResponse` recognizes goes to `config.challenge` when the strategy is none (ALLOW), `CAPTCHA` or
+   `INTERSTITIAL`, whatever session the visitor has. A throwing `isChallengeResponse` counts as no reply. A throwing
+   `challenge` is logged and the request is forwarded.
 6. **By strategy.**
    - `ACCESS_DENIED`, `NOT_FOUND`: our 403 or 404 block page, with HTML and no-store headers.
    - `REDIRECT`: a 302 to `redirectLocation` (default `https://www.cheq.ai/`), with `x-cheq-cdn-request-id`,
@@ -127,27 +134,37 @@ A request goes through eight steps (the copy in `fetch`, the rest in `handle`):
      challenged for the page it came from: a `GET`, without the body, for the same-site `Referer`, or for `/` without
      one. Only the path and the query of the request's own URL are changed, so the host cannot change.
    - A throw from `validateChallenge` or `challenge`: logged, and the request is forwarded without the verdict.
+   - `INTERSTITIAL`: the interstitial's decision (see [How it works](#how-it-works)). A request for which RTI found the
+     tag's session gets `onSecondVerdict`, and one with a valid mark `onSessionNotFound`: each is carried out as the
+     cases above, and `Action.CHALLENGE` is the `CAPTCHA` case. Otherwise the interstitial page, or the empty 403 for a
+     prefetch. A throw in the interstitial's code is logged, and the request is forwarded with the verdict. A throw in
+     one of its log lines is logged and changes nothing else (see [Monitoring and logs](#monitoring-and-logs)).
 7. **Allow.** Every other request (ALLOW, a request that `actionOnSuspicious` lets through, such as a `GET` that is not
-   a page load, and the `CAPTCHA` cases above that are forwarded with the verdict) gets `x-cheq-rti-result` on the copy,
-   and the copy is forwarded.
+   a page load, the `CAPTCHA` cases above that are forwarded with the verdict, and the interstitial's forwards) gets
+   `x-cheq-rti-result` on the copy, and the copy is forwarded.
 8. **Any error before the decision** (an RTI error or timeout, a malformed RTI response): logged. A recognized challenge
    reply (the same conditions as step 5) still goes to `config.challenge`, with a stand-in response and no
    `addRtiResultHeader` (see [Challenge callbacks](#challenge-callbacks)). Everything else is forwarded, without the
    verdict.
 
 **Logs.** Errors go to `console.error`, and to the RTI logger through `waitUntil` unless `logErrors` is `false`:
-`Error handling request '<id>'`, `Challenge error handling request '<id>'` and
-`Challenge reply check error handling request '<id>'`, where `<id>` is the `cf-ray` value or `unknown_request_id`.
-With `debug: true` the Worker also logs the RTI payload (redacted), the RTI response, the action, the strategy, and the
-lines `challenge reply, passing it to challenge`, `valid challenge session, waiving CAPTCHA` and
-`prefetch: an empty 403 in place of the challenge page`.
+`Error handling request '<id>'`, `Challenge error handling request '<id>'`,
+`Challenge reply check error handling request '<id>'` and `Interstitial error handling request '<id>'`, where `<id>`
+is the `cf-ray` value or `unknown_request_id`. With `debug: true` the Worker also logs the RTI payload (redacted), the
+RTI response, the action, the strategy, and the lines `challenge reply, passing it to challenge`,
+`valid challenge session, waiving CAPTCHA`, `prefetch: an empty 403 in place of the challenge page`,
+`interstitial: forward, <reason>` and `prefetch: an empty 403 in place of the interstitial`. The interstitial's own
+lines go to the RTI logger as info lines (see [Monitoring and logs](#monitoring-and-logs)).
 
 **Cold start.** When the module loads, the Worker logs one warning when `challenge` is set without
-`isChallengeResponse`, then one per problem in `actionOnSuspicious`
-(`[config] <problem> (see "actionOnSuspicious" in the README)`). If the `actionOnSuspicious` check throws, it logs
-`[config] the config check failed, continuing: …` and the Worker still starts. While the three Turnstile secrets are
-`REPLACE_ME` (as shipped), it also logs
+`isChallengeResponse`, then one per problem in `interstitial`
+(`[interstitial] <problem> (see "Interstitial" in the README)`, see [Settings](#settings)), then one per problem in
+`actionOnSuspicious` (`[config] <problem> (see "actionOnSuspicious" in the README)`). If the `actionOnSuspicious`
+check throws, it logs `[config] the config check failed, continuing: …` and the Worker still starts. While the three
+Turnstile secrets are `REPLACE_ME` (as shipped), it also logs
 `[turnstile] CAPTCHA disabled, not configured: siteKey, secretKey, sessionSigningSecret (set them in config.ts)`.
+With `enabled: true` and `interstitial.tag` still `REPLACE_ME` (as shipped), it logs
+`[interstitial] interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console (see "Interstitial" in the README)`.
 
 ### actionOnSuspicious and logErrors
 
@@ -194,6 +211,11 @@ An example with two rules and no defaults: `{ path: '^/login$', methods: ['POST'
 
 Before this version, every request that RTI wanted challenged got the CAPTCHA page, whatever its method. "Forwarded"
 means sent to the origin with `x-cheq-rti-result`, so the origin decides.
+
+**While the interstitial is on**, the page of question 2 for a `GET` page load is the interstitial, whatever
+`challengingStrategy` says, and a rule's `Action.CHALLENGE` for a `GET` page load means the interstitial too (row 1).
+Every other request gets the answer of this section, `challengingStrategy` included (rows 2 to 7). See
+[Interstitial](#interstitial).
 
 **A page load** is a `GET` that a browser sends to show a page. The Worker tells it by two headers of the request,
 `Sec-Fetch-Dest` and `Accept`, and a prefetch (below) by two more, `Sec-Purpose` and `Purpose`. Cloudflare's docs say
@@ -321,11 +343,12 @@ in row 2.
 #### logErrors
 
 `logErrors` defaults to `true`; only an explicit `false` turns it off. When it is on, the errors the handler catches
-(the three log lines in [How a request is handled](#how-a-request-is-handled)) and the warning about a stand-in `rayId`
+(the four log lines in [How a request is handled](#how-a-request-is-handled)) and the warning about a stand-in `rayId`
 (see [Challenge callbacks](#challenge-callbacks)) also go to the RTI logger, through `waitUntil`, so the visitor's
 answer does not wait for it. `false` stops sending them; they are still written to the console. A failing
 `config.originalReferer`, and the Turnstile example's own `[turnstile]` and `[validateChallenge]` lines, only ever go to
-the console.
+the console. The interstitial's outcome lines follow `logOutcomes`, not `logErrors` (see
+[Monitoring and logs](#monitoring-and-logs)).
 
 ### Challenge callbacks
 
@@ -346,12 +369,14 @@ originalReferer?: (request: Request) => string | undefined | Promise<string | un
 **`challenge(request, response, addRtiResultHeader?)`**
 
 - **When:** the strategy is `CAPTCHA` (a CHALLENGE by default, see `challengingStrategy`, for a page load that no rule
-  covers, or for a request that `actionOnSuspicious` sends to the CAPTCHA, see
-  [Which request gets a page](#which-request-gets-a-page); a BLOCK with `blockingStrategy: CAPTCHA`) and
-  `validateChallenge` does not report a valid session, unless the request is a prefetch (it gets an empty 403, see
+  covers while the interstitial is off, or for a request that `actionOnSuspicious` sends to the CAPTCHA, see
+  [Which request gets a page](#which-request-gets-a-page); a BLOCK with `blockingStrategy: CAPTCHA`; while the
+  interstitial is on, a page load for which `onSecondVerdict` or `onSessionNotFound` gives `Action.CHALLENGE`, see
+  [The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha)) and `validateChallenge` does not report a
+  valid session, unless the request is a prefetch (it gets an empty 403, see
   [Which request gets a page](#which-request-gets-a-page)). In `BLOCKING` mode also for every reply that
-  `isChallengeResponse` recognizes, when the strategy is none (ALLOW) or `CAPTCHA`, with or without a session, and when
-  RTI is down (below).
+  `isChallengeResponse` recognizes, when the strategy is none (ALLOW), `CAPTCHA` or `INTERSTITIAL`, with or without a
+  session, and when RTI is down (below).
 - **Gets:** the copy that is forwarded. For a challenged request with a body, a `GET` without the body for the page it
   came from.
 - **Returns:** a `Response`, sent to the visitor as it is, or a `Request`, forwarded as it is. A returned request carries
@@ -393,9 +418,9 @@ other error before the decision), `challenge` is still called, without `addRtiRe
 **`isChallengeResponse(request)`**
 
 - Recognizes the reply to the challenge page. The Turnstile example looks for `cf-turnstile-response` in the query.
-- **When:** in `BLOCKING` mode, with `challenge` set, when the strategy is none (ALLOW) or `CAPTCHA`, and when RTI is
-  down. Not called in `MONITORING` mode, without `challenge`, or when the request is blocked, 404'd or redirected
-  anyway.
+- **When:** in `BLOCKING` mode, with `challenge` set, when the strategy is none (ALLOW), `CAPTCHA` or `INTERSTITIAL`,
+  and when RTI is down. Not called in `MONITORING` mode, without `challenge`, or when the request is blocked, 404'd or
+  redirected anyway.
 - Only a synchronous `true` counts: any other value, a `Promise` included, means no reply.
 - **A throw:** the request is handled as no reply, and the error is logged as
   `Challenge reply check error handling request '<id>'`.
@@ -428,8 +453,8 @@ between a production and a local or demo origin, in one place:
   only.
 
 Every request that is forwarded goes through this function (allowed traffic, ignored paths, every error path of
-`handle`), so the one switch covers them all. Our own answers (block pages, redirects, the CAPTCHA page, the empty 403
-for a prefetch) never reach it.
+`handle`), so the one switch covers them all. Our own answers (block pages, redirects, the CAPTCHA page, the
+interstitial page, the empty 403 for a prefetch) never reach it.
 `forwardToOrigin` is outside `handle`'s error handling: a failing origin is not logged as our error and not called a
 second time by this Worker. Cloudflare's pass-through still applies, and may send the request to the origin again, with
 the headers the client sent and possibly without its body (see the next section).
@@ -470,6 +495,666 @@ spells with underscores (`x_cheq_rti_result`, `x_cheq_original_referer`) is anot
 forwarded as the client sent it. That matters only for an origin that treats `-` and `_` in header names as the same,
 as CGI does (by RFC 3875's rule both spellings become `HTTP_X_CHEQ_RTI_RESULT`): such an origin should drop the
 underscore spellings itself.
+
+### Interstitial
+
+Cloudflare only for now. While the interstitial is on, a page load that RTI wants challenged first gets a short CHEQ
+page. The page runs your CHEQ tag and reloads by itself, and RTI then decides a second time, with the tag's data.
+Without the interstitial, the tag's data reaches RTI only with the visitor's next request, so a bot that loads one page
+and leaves is judged without that data.
+
+The shipped `config.ts` has the `interstitial` block with `enabled: true` and `tag: "REPLACE_ME"`. So the interstitial
+stays off, with one warning at cold start, until you paste your tag line (see [The tag line](#the-tag-line)).
+`enabled: false` is "Standard mode": a challenge gets the CAPTCHA (if it is set up), as before.
+
+#### How it works
+
+```
+request 1   GET /sofas?gclid=abc             no tag cookies yet
+            RTI call 1: suspicious
+            a GET page load, no mark  ->  the interstitial page, at the same URL (403)
+
+browser     the page adds your CHEQ tag, and the tag writes its cookies (_cq_pvid among them)
+            the page's script waits for a new _cq_pvid value, writes the mark cookie _cq_it, and reloads
+
+request 2   GET /sofas?gclid=abc             the tag's cookies and the mark
+            the Worker checks the mark ("header" mode: it sets x-cheq-original-referer)
+            RTI call 2, now with the tag's data, and customId3: interstitial:<ray id of call 1>
+              benign                                    -> the origin
+              malicious                                 -> the blockingStrategy answer (the block page by default)
+              suspicious, RTI found the tag's session   -> onSecondVerdict (Action.ALLOW by default)
+              suspicious, no tag session, a valid mark  -> onSessionNotFound (Action.ALLOW by default)
+```
+
+The reload keeps the URL, its query and its `#fragment`, so the visitor lands on the page they asked for (the design
+says that Chrome did so for `location.reload()`, tested on 2026-11-17, and a local run with Chrome 157 on 2026-11-23
+saw the same).
+
+A page load gets the interstitial when all of these hold:
+
+1. The mode is `BLOCKING`, and the interstitial is on: `enabled` is `true` and the tag line can be read.
+2. RTI says challenge: a suspicious verdict, or a match in `challengeTTCodes` or `challengeReasons`. A block verdict is
+   checked first, and is handled as before.
+3. The request is a `GET` page load (see [Which request gets a page](#which-request-gets-a-page)), and no rule of
+   `actionOnSuspicious` that covers it says otherwise. A rule's `Action.CHALLENGE` for it means the interstitial too.
+4. RTI has not found the tag's session: `metadata.sessionFound` is not `true`. A visitor whose session RTI has gets
+   `onSecondVerdict` at once, with no page: on the reload, or when the tag ran on an earlier page.
+5. The request has no valid mark (see [The mark cookie](#the-mark-cookie)). A request with one gets
+   `onSessionNotFound`.
+
+**The Worker does not check for good bots.** A declared good bot (a crawler such as Google's or Bing's) is expected to
+get a benign verdict from RTI, and so no interstitial. If your policy makes such a crawler suspicious, it gets the
+interstitial like any visitor, and a crawler that runs no JavaScript cannot pass it. The fix is in the policy screen of
+the CHEQ console, not in the Worker.
+
+Two more cases: a prefetch of the page (`Sec-Purpose` or `Purpose` contains `prefetch`) gets an empty 403 in its place,
+as in place of the CAPTCHA page. A reply to the CAPTCHA page that `isChallengeResponse` recognizes goes to
+`config.challenge` first (step 5 of [How a request is handled](#how-a-request-is-handled)).
+
+**With the defaults, the visitor gets the site after the reload** unless RTI's second answer is a block: both
+`onSecondVerdict` and `onSessionNotFound` are `Action.ALLOW`, which forwards the request with `x-cheq-rti-result`. To
+stop such page loads, set them (see [The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha)).
+
+**The page** is our own HTML, answered at the URL the visitor asked for, with the status `statusCode` (403 by default)
+and the headers `Content-Type: text/html;charset=UTF-8`, `Cache-Control: no-store, no-cache, must-revalidate` and
+`X-Robots-Tag: noindex`. It shows the logo, the headline ("Checking your browser"), the message ("This usually takes
+about a second.") in a live region, a turning ring (it stands still for `prefers-reduced-motion`), `Ray ID:` with the
+ray id of RTI call 1, and "Protected by Cheq.ai". The `<title>` is the headline. Without JavaScript it shows "Please
+turn on JavaScript, then reload the page." Its one script does this:
+
+1. If a mark of this setup is already there, the Worker did not accept it, and another reload would loop. The page
+   stops and shows "We could not check your browser." with a **Try again** button, which deletes the mark and reloads.
+2. It remembers each `_cq_pvid` value there is now, and adds your tag: a `<script>` element with the attributes of
+   your tag line.
+3. It checks every 50 ms for a `_cq_pvid` value that was not there at the start. The tag writes a new value on each
+   run, and it calls its callback (`data-jsonp`) before it writes the cookie, so the callback cannot say that the tag
+   is done (both read in the tag's code, adserver, on 2026-11-17).
+4. When the new value is there, the tag fails to load, or `maxWaitMs` has passed, it writes the mark (and, in
+   `"cookie"` mode, `_cq_ref` when there is an original Referer) and calls `location.reload()`.
+5. If it cannot read the new mark back, cookies are blocked: it does not reload, and shows "Please allow cookies for
+   this site, then reload the page."
+
+The page only reads the tag's cookies. It does not change or delete them.
+
+#### Settings
+
+`config.interstitial` in [`src/config.ts`](src/config.ts). Without the block the interstitial is off. While it is on,
+a wrong value of a setting other than `enabled` and `tag` gets a warning and its default, and the interstitial stays
+on. Left out, such a setting gets its default without a warning (`null` is a wrong value).
+
+| Setting | What it is | Default | Allowed | A wrong value |
+|---|---|---|---|---|
+| `enabled` | Turns the interstitial on | none (`true` in the shipped `config.ts`) | `true` or `false` | Off, with a warning, also when it is left out |
+| `tag` | Your tag line, see [The tag line](#the-tag-line) | none (`"REPLACE_ME"` as shipped) | one `<script …></script>` line | Off, with a warning that says what is wrong |
+| `onSecondVerdict` | What a `GET` page load gets when RTI wants it challenged and has found the tag's session | `Action.ALLOW` | `Action.ALLOW`, `Action.BLOCK`, `Action.REDIRECT` or `Action.CHALLENGE` | A warning, and `Action.ALLOW` |
+| `onSessionNotFound` | What a `GET` page load with a valid mark gets when RTI wants it challenged and has no tag session | `Action.ALLOW` | the same four | A warning, and `Action.ALLOW` |
+| `maxWaitMs` | How long the page waits for the tag before it reloads anyway, in milliseconds | `5000` | a whole number from 1000 to 30000 | A warning, and `5000` |
+| `statusCode` | The HTTP status of the page | `403` | `200`, or a whole number from 400 to 599 | A warning, and `403` |
+| `originalRefererVia` | How the original Referer is delivered after the reload, see [The original Referer after the interstitial](#the-original-referer-after-the-interstitial) | `"header"` | `"header"` or `"cookie"` | A warning, and `"header"` |
+| `binding` | Which client a mark belongs to, see [The mark cookie](#the-mark-cookie) | `{ ip: "exact", userAgent: true }` | `ip`: `"exact"` or `"none"`, `userAgent`: `true` or `false` | A warning, and the default |
+| `logoUrl` | The logo on the page | CHEQ's logo, inline | an `https://` URL of at most 200 characters, also as the URL parser writes it | A warning, and CHEQ's logo |
+| `headline` | The page's headline and `<title>` | `"Checking your browser"` | text of 1 to 60 characters | A warning, and the default |
+| `message` | The text under the headline | `"This usually takes about a second."` | text of 1 to 160 characters | A warning, and the default |
+| `lang` | The page's language | `"en"` | a language tag such as `"en"` or `"en-US"` | A warning, and `"en"` |
+| `logOutcomes` | One line per interstitial decision to the RTI logger, see [Monitoring and logs](#monitoring-and-logs) | `true` | `true` or `false` | A warning, and `true` |
+
+`Action.CHALLENGE` in `onSecondVerdict` or `onSessionNotFound` is the CAPTCHA, see
+[The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha). `Action.REDIRECT` there sends the visitor to
+`redirectLocation`, and the config check of `npm run test` then accepts a `redirectLocation` without
+`redirectReasons`. The page's other texts are fixed, in English: "We could not check your browser.", **Try again**,
+"Please allow cookies for this site, then reload the page.", "Please turn on JavaScript, then reload the page.",
+`Ray ID:` and "Protected by Cheq.ai".
+
+**`challengingStrategy` is not used for page loads while the interstitial is on.** Only a `GET` page load can get the
+interstitial. Every other request (a `POST`, a `HEAD`, a script's `fetch`) gets the answer it gets with the
+interstitial off, `challengingStrategy` included (see
+[The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha)).
+
+**Cold start.** The Worker logs one warning per problem, as
+`[interstitial] <problem> (see "Interstitial" in the README)`, after the `[challenge]` warning and before the
+`[config]` warnings of `actionOnSuspicious`. The problems:
+
+- `interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console` (as shipped)
+- `interstitial.tag cannot be read (<why>), the interstitial is off`, see [The tag line](#the-tag-line)
+- `interstitial.enabled: <value> is not true or false, the interstitial is off`
+- `interstitial.<setting>: <value> is not <what is allowed>, using <default>`, for example
+  `interstitial.maxWaitMs: 10 is not a whole number from 1000 to 30000, using 5000`
+- `interstitial.tag: the hash in its src is not tagHash, check that the tag line and tagHash belong to the same tag`
+- `challengingStrategy is set but not used for page loads while the interstitial is on`
+- `interstitial settings could not be read (<message>), the interstitial is off`, when reading them throws (for
+  example on a value that JSON cannot write, such as a bigint)
+
+Cloudflare only for now: CloudFront and the other CDNs do not read `interstitial`.
+
+Each setting in full, below: [`enabled`](#enabled), [`tag`](#tag), [`onSecondVerdict`](#onsecondverdict),
+[`onSessionNotFound`](#onsessionnotfound), [`maxWaitMs`](#maxwaitms), [`statusCode`](#statuscode),
+[`originalRefererVia`](#originalreferervia), [`binding`](#binding),
+[the page's look](#the-pages-look-logourl-headline-message-lang) and [`logOutcomes`](#logoutcomes).
+
+##### `enabled`
+
+Turns the interstitial on or off.
+
+- `true`: on, as soon as `tag` holds a tag line that can be read. In `BLOCKING` mode a `GET` page load that RTI wants
+  challenged can then get the page (see [How it works](#how-it-works)). In `MONITORING` mode no page is shown, and the
+  Worker logs a `would-show` line instead.
+- `false`: off ("Standard mode"). A suspicious page load gets what it got before the interstitial existed: by default
+  the CAPTCHA, when `challenge` is set (see [Which request gets a page](#which-request-gets-a-page)), and without a
+  `challenge` it is forwarded with `x-cheq-rti-result`.
+- The shipped `config.ts` has `true`. `tag` ships as `"REPLACE_ME"`, so the interstitial stays off until you paste
+  your tag line.
+- Any other value, and a block without `enabled`: off, with the warning
+  `interstitial.enabled: <value> is not true or false, the interstitial is off`. Only the boolean `true` switches it
+  on: the string `"true"` does not.
+- No `interstitial` block at all: off, without a warning.
+
+##### `tag`
+
+Your CHEQ tag line. The page loads your tag from it.
+
+- Paste the whole `<script …></script>` line of the tag snippet in the CHEQ console, as one string in single quotes.
+  [The tag line](#the-tag-line) shows an example and lists what is kept, left out and refused.
+- The Worker never writes the line into the page as text. It reads the line's attributes once, at cold start, and
+  leaves out `async`, `defer` and every `on…` attribute. The page's script builds the tag's `<script>` element from the
+  attributes that are left.
+- Not set (`"REPLACE_ME"`, empty, or not a string): off, with the warning
+  `interstitial.tag is not set, the interstitial is off: paste the tag line from the CHEQ console`. This is the
+  shipped state.
+- A line that cannot be read (not one `<script>` element, text between the tags, a `src` that is not `https://`, no
+  `class`, longer than 800 characters, an unsafe attribute name or value): off, with the warning
+  `interstitial.tag cannot be read (<why>), the interstitial is off`.
+- The hash in the `src` (`/i/<hash>.js`) must be your `tagHash`. If it is not, the Worker warns at cold start, and the
+  interstitial stays on.
+- The tag needs its option `ck4`. The page waits for the tag's `_cq_pvid` cookie, and the tag writes it only with
+  `ck4` (read in adserver on 2026-11-17). RTI looks up the tag's session by that cookie (the product spec, FR-4). So
+  without `ck4` the page waits the whole `maxWaitMs`, RTI finds no tag session on the reload, and `onSessionNotFound`
+  decides. On a test host such as `*.cloudfront.net` the tag also needs `apd` (see [The tag line](#the-tag-line)).
+
+##### `onSecondVerdict`
+
+What a suspicious page load gets when the tag has run.
+
+- When it applies: RTI wants a `GET` page load challenged, and RTI has found the tag's session
+  (`sessionFound: true`). That happens on the reload right after the interstitial, when the tag did its work. It also
+  happens on a later page of a visitor whose tag ran on an earlier page: that visitor gets no interstitial, and this
+  setting decides at once.
+- It does not apply when RTI says benign (the page) or malicious (the block), nor to a request that is not a page
+  load.
+- `Action.ALLOW` (the default, as the product spec asks): the page, forwarded to your origin with
+  `x-cheq-rti-result` (`verdict=suspicious`).
+- `Action.BLOCK`: what `blockingStrategy` gives. By default that is the block page (403). It can also be a 404, a
+  redirect or the CAPTCHA, if `blockingStrategy` says so.
+- `Action.REDIRECT`: a 302 to `redirectLocation`. Set `redirectLocation`. The config check of `npm run test` then
+  accepts it without `redirectReasons`.
+- `Action.CHALLENGE`: the CAPTCHA of `challenge` (the Turnstile example), whatever `challengingStrategy` says. A
+  valid CAPTCHA pass (`_cq_se`) skips it, and the page is forwarded. Without a `challenge` the page is forwarded with
+  the verdict. See [The interstitial and the CAPTCHA](#the-interstitial-and-the-captcha).
+- A wrong value: a warning, and `Action.ALLOW`.
+- On the reload, the log line says `second-verdict:<ACTION>` (see [Monitoring and logs](#monitoring-and-logs)).
+
+##### `onSessionNotFound`
+
+What a suspicious page load gets when the tag did not run, right after the interstitial.
+
+- When it applies: RTI wants a `GET` page load challenged, RTI has no tag session (`sessionFound` is `false` or
+  missing), and the request carries a valid mark: the cookie that the interstitial page wrote, valid for 60 seconds
+  (see [The mark cookie](#the-mark-cookie)). This is the reload of a visitor whose tag was blocked (an ad blocker, a
+  DNS filter), failed to load, or whose session had not reached RTI yet.
+- Without this setting such a visitor would get the interstitial again and again. With it, that visitor gets no second
+  interstitial (the product spec's loop guard, FR-6).
+- The mark counts on every page of your site for its 60 seconds. So such a visitor gets this setting's answer on each
+  page in that time, not a new interstitial.
+- The values are the four of `onSecondVerdict`, with the same results: `ALLOW` forwards with the verdict, `BLOCK` gives
+  what `blockingStrategy` gives, `REDIRECT` a 302 to `redirectLocation`, `CHALLENGE` the CAPTCHA.
+- Default `Action.ALLOW`: the product spec's FR-6 makes "open" the default and leaves the choice to each site.
+- The trade-off. `ALLOW` lets a client pass after one extra request when it blocks the tag, or copies the mark out of
+  the page without running it. `BLOCK` or `CHALLENGE` stops such a client, but also stops real visitors whose ad
+  blocker blocks the tag. The product spec asks to check first whether ad and tracker block lists include
+  `tag.cheqzone.com`.
+- A wrong value: a warning, and `Action.ALLOW`.
+- On the reload, the log line says `no-session:<ACTION>`.
+
+##### `maxWaitMs`
+
+How long the page waits for the tag, in milliseconds.
+
+- The page reloads as soon as one of these happens: the tag writes a new `_cq_pvid` cookie (the page checks every
+  50 ms), the tag's script fails to load, or adding the tag fails. If none happens, it reloads after `maxWaitMs`.
+- Default `5000`. Allowed: a whole number from 1000 to 30000. A wrong value: a warning, and `5000`.
+- Too short: the page can reload before the tag's data has reached RTI, and the visitor gets `onSessionNotFound`
+  instead of the tag's verdict. Too long: a visitor whose tag hangs looks at the page longer. A tag whose script cannot
+  load ends the wait at once, through its load error (seen in a local Chrome run with a tag that answered 404).
+- The Worker accepts the page's mark until `maxWaitMs` plus 70 seconds after the page was served: the cookie's 60
+  seconds, plus 10 seconds for the page to arrive. So a long wait does not make the mark expire early.
+- The product spec's target for a flagged visitor: at most 1.5 seconds added, at p75.
+
+##### `statusCode`
+
+The HTTP status that the interstitial page is sent with.
+
+- Default `403`. Allowed: `200`, or a whole number from 400 to 599. A wrong value: a warning, and `403`.
+- The visitor sees the same page either way: the browser shows it and runs its script. A local Chrome run with `403`
+  reloaded as expected.
+- The status tells crawlers, monitors and log tools whether this answer is the page's content. `403` says it is not.
+  `200` would make the page look like your page in such tools. The page is also sent with
+  `Cache-Control: no-store, no-cache, must-revalidate` and `X-Robots-Tag: noindex`, and holds
+  `<meta name="robots" content="noindex">`, so it is not cached and not indexed.
+- Good bots (crawlers such as Google's and Bing's) are expected to get a benign verdict from RTI, and so no page. If
+  your policy makes them suspicious, they get the page like any visitor, whatever the status (see
+  [How it works](#how-it-works)).
+- The product spec leaves the status to an SEO review. `403` is the default until then.
+- A prefetch never gets the page. Where the page would be shown, a prefetch gets an empty 403, whatever this setting
+  says.
+
+##### `originalRefererVia`
+
+How your site learns where the visitor came from, after the interstitial.
+
+- Why it is needed: our page starts the reload, so the reload's own `Referer` is the page itself (seen in a local
+  Chrome run). Without help, your origin would see its own URL as the referrer, instead of a search engine or a
+  campaign.
+- What is carried: the Referer of the first request, as a browser sends it by default. From another site that is only
+  its origin, such as `https://www.google.com/`. From your own site it is the full URL, unless it is the page itself.
+- `"header"` (the default): on the reload, the Worker adds `x-cheq-original-referer: <where the visitor came from>` to
+  the request your origin gets, and to the headers RTI gets. Your origin reads that header. It is added on the page the
+  visitor asked for; a page your origin redirects the reload to does not get it, with one exception in
+  [Known limits](#known-limits).
+- `"cookie"`: the page's script writes a `_cq_ref` cookie for 60 seconds, holding the page's address and where the
+  visitor came from, in the format of the CAPTCHA's `_cq_ref`. Your site's own script reads it. Neither your origin nor
+  RTI gets `x-cheq-original-referer` in this mode. No `_cq_ref` is written when there is no original Referer.
+- Use the same value as the CAPTCHA's `originalRefererVia` (in `turnstileConfig`, `"header"` when left out), so a
+  visitor who gets both pages gives your site the same signal.
+- A wrong value: a warning, and `"header"`.
+- Details: [The original Referer after the interstitial](#the-original-referer-after-the-interstitial).
+
+##### `binding`
+
+Which client a mark belongs to. The same shape and default as the CAPTCHA's `sessionBinding`.
+
+- The mark is signed together with the client's IP address and User-Agent, as this setting says. A request from
+  another IP address, or with another User-Agent, has no valid mark.
+- `ip: "exact"` (the default): the IP address (`CF-Connecting-IP`) must be the same. `ip: "none"`: not checked.
+- `userAgent: true` (the default): the User-Agent must be the same. `false`: not checked.
+- Give both fields. `{ ip: "none" }` alone is a wrong value: a warning, and the default.
+- When the IP changes between the page and the reload (a VPN, iCloud Private Relay, a phone that switches networks),
+  the Worker finds no valid mark. If RTI still wants the request challenged, the page comes again, and its script
+  finds its own mark and stops with "We could not check your browser." and a **Try again** button. It does not loop.
+- `ip: "none"` spares those visitors. Its cost: a mark copied to another client is accepted from any IP address for
+  its 60 seconds.
+
+##### The page's look: `logoUrl`, `headline`, `message`, `lang`
+
+Your branding on the page (the product spec's FR-9). Leave them out for CHEQ's look.
+
+- `logoUrl`: the `https://` address of an image you host, at most 200 characters, also as the URL parser writes it.
+  It is shown in place of CHEQ's logo, as an image with an empty `alt`. Default: CHEQ's logo, inline in the page. If
+  your image does not load, the page still works.
+- `headline`: the page's heading and its `<title>`, 1 to 60 characters. Default `Checking your browser`.
+- `message`: the text under the heading, 1 to 160 characters. It sits in a live region (`role="status"`), so screen
+  readers announce it. Default `This usually takes about a second.`
+- `lang`: the page's language, as in `<html lang="…">`: a tag such as `en` or `en-US`, at most 35 characters. Default
+  `en`.
+- The texts are escaped for HTML: they are shown as written and cannot add markup.
+- The page's other texts are fixed, in English: "We could not check your browser.", **Try again**, "Please allow
+  cookies for this site, then reload the page.", "Please turn on JavaScript, then reload the page.", `Ray ID:` and
+  "Protected by Cheq.ai". They stay in English whatever `lang` says.
+- A wrong value: a warning, and that setting's default.
+
+##### `logOutcomes`
+
+Whether the Worker sends a log line for each interstitial decision.
+
+- `true` (the default): lines go to the RTI logger, as info lines: `shown` when a page is served, `would-show` in
+  `MONITORING` mode, and on the reload `passed`, `blocked`, `redirected`, `second-verdict:<ACTION>` or
+  `no-session:<ACTION>`. Each line has the ray ids, the verdict, RTI's reason codes and the `cf-ray`. The formats are
+  in [Monitoring and logs](#monitoring-and-logs).
+- These lines are how you count what the interstitial does: how many pages were served, and what the reloads got (the
+  product spec's FR-6 and its launch number). A count per interstitial takes the first reload line per `firstRayId`.
+- `false`: no such line goes to the RTI logger. With `debug: true` the lines still go to the console. Errors are logged
+  as before (`logErrors`).
+- `customId3` on RTI's second call does not depend on this setting.
+- A wrong value: a warning, and `true`.
+
+#### The tag line
+
+Paste the tag line of your tag snippet in the CHEQ console into `tag`, as one string: the whole
+`<script …></script>` line. Put it in single quotes, because the line holds double quotes:
+
+```ts
+tag: '<script async src="https://…/i/<tagHash>.js" data-ch="…" class="ct_clicktrue_…" data-jsonp="…"></script>',
+```
+
+The Worker reads the line once, at cold start. It never writes the line into the page as text: the page's script
+builds the `<script>` element itself and sets the line's attributes on it one by one, so nothing in the line can
+become markup or code of the page.
+
+- **Kept:** every attribute but the ones left out below, so the tag gets the settings it has on your own pages. Names
+  come out in lower case.
+  Of two attributes with the same name, the first is kept. A value can be in double quotes, in single quotes or
+  without quotes. In a value, `&amp;`, `&quot;`, `&#39;`, `&lt;` and `&gt;` are read as the characters they stand for,
+  and any other `&…;` stays as written. `data-jsonp` is kept too: the function it names is on your pages, not on
+  ours, and the design says that the tag skips a callback that does not exist (read in adserver on 2026-11-17).
+- **Left out:** `async` and `defer` (the design says that a script added by code is asynchronous anyway), and any
+  attribute whose name starts with `on` (an event handler would be code in our page).
+- **Refused:** a line that does not fit turns the interstitial off, with the warning
+  `[interstitial] interstitial.tag cannot be read (<why>), the interstitial is off (see "Interstitial" in the README)`.
+  `<why>` is one of these, in the order they are checked:
+  - `it is longer than 800 characters` (without the whitespace around it)
+  - `it is not one <script …></script> element`
+  - `it has text between <script> and </script>`
+  - `it has an attribute name a page cannot set: <name>` (a name must match `^[A-Za-z][A-Za-z0-9_.:-]*$`)
+  - `it has a value with <, > or a control character`, after the five character references above are read. The line
+    separator and the paragraph separator (U+2028, U+2029) count as control characters here.
+  - `its src does not start with https://` (also for a `src` that is not a URL)
+  - `it has no class`: the design says that the tag finds its own element by its class (`ct_clicktrue_<id>`) and
+    reads its settings from that element (read in adserver on 2026-11-17)
+
+  The attributes that are left out are not checked. A line that is missing, blank or still `REPLACE_ME` gives
+  `interstitial.tag is not set, …` instead.
+
+**Your tag needs its option `ck4`.** The tag writes `_cq_duid` and `_cq_pvid` only when `ck4` is on (read in adserver
+on 2026-11-17), and the page waits for a new `_cq_pvid`. Without `ck4` each interstitial waits the whole `maxWaitMs`
+before it reloads. The design says that a tag's options are part of the script it is served as: the test tag's `.js`
+file holds `"ck4":1,"ck":1,"apd":1`. So open the `src` of your tag line and look for `"ck4":1`.
+
+**On a test host such as `*.cloudfront.net` the tag also needs its option `apd`.** The tag writes its cookies for the
+site's main domain (`.shop.com`, read in adserver on 2026-11-17). Where that domain is a public suffix, the browser
+refuses the cookie: Chrome did on `*.cloudfront.net` (checked on 2026-11-18). `apd` makes the tag write them for the
+host only. `*.workers.dev` was not checked.
+
+**`tagHash`.** The hash in the line's `src` (the `<hash>` of `…/i/<hash>.js` at the end of its path) should be your
+`tagHash`. When it is not, or one of them is missing, the Worker logs once per cold start
+`[interstitial] interstitial.tag: the hash in its src is not tagHash, check that the tag line and tagHash belong to the same tag (see "Interstitial" in the README)`.
+The interstitial stays on.
+
+#### The interstitial and the CAPTCHA
+
+"CAPTCHA on" means that `config.challenge` is set: with the shipped Turnstile example, once its three secrets are
+filled in. "Interstitial on" means that `enabled` is `true` and the tag line can be read. The tables are for
+`BLOCKING` mode and a `GET` page load that RTI wants challenged, from a visitor for whom RTI has no tag session yet.
+
+| Interstitial | CAPTCHA | The first page the visitor gets |
+|---|---|---|
+| off | off | None. The request goes to the origin with `x-cheq-rti-result`. |
+| off | on | The CAPTCHA, as before. |
+| on | off | The interstitial. |
+| on | on | The interstitial. |
+
+After the interstitial the page reloads, and RTI answers a second time:
+
+| RTI's second answer | What happens |
+|---|---|
+| Benign | The origin. |
+| Malicious | The `blockingStrategy` answer: the block page by default. |
+| Suspicious again, and RTI found the tag's session (`sessionFound: true`) | The setting `onSecondVerdict`. |
+| Suspicious again, and RTI found no tag session | The setting `onSessionNotFound`. |
+
+Both settings take the same four values:
+
+| Value | What the visitor gets |
+|---|---|
+| `Action.ALLOW` (default) | The origin, with `x-cheq-rti-result`. |
+| `Action.BLOCK` | The `blockingStrategy` answer: the block page by default. |
+| `Action.REDIRECT` | A 302 to `redirectLocation`. |
+| `Action.CHALLENGE` | The CAPTCHA when it is on, whatever `challengingStrategy` says. As for any CAPTCHA, a valid session (`validateChallenge`; `_cq_se` with the Turnstile example) waives it, and a prefetch gets the empty 403. When the CAPTCHA is off: the origin, with `x-cheq-rti-result`. |
+
+So a visitor sees both pages only when the CAPTCHA is on and the reload gets it: one of the two settings is
+`Action.CHALLENGE`, or the reload gets a block (RTI's second answer is malicious, or a setting is `Action.BLOCK`) with
+`blockingStrategy: CAPTCHA`. The interstitial is then the first of the two:
+
+```
+1  GET /sofas  (from Google)   RTI: suspicious         -> the interstitial
+2  the tag runs, the page reloads
+3  GET /sofas                  RTI: suspicious again   -> the CAPTCHA (onSecondVerdict is CHALLENGE)
+4  the visitor solves it       the Worker checks it    -> 302 to /sofas, with the pass cookie _cq_se
+5  GET /sofas                  RTI: suspicious again   -> the pass is valid -> the origin
+```
+
+- Request 5 gets no second interstitial, because RTI knows the visitor's tag session by then. It gets no second
+  CAPTCHA, because of the pass.
+- In `"header"` mode the origin gets `x-cheq-original-referer: https://www.google.com/` on request 5, as after the
+  CAPTCHA alone. In `"cookie"` mode `_cq_ref` holds it (see
+  [The original Referer after the interstitial](#the-original-referer-after-the-interstitial)).
+- A visitor whose tag did not run has no tag session. Once their mark has expired (the browser keeps it 60 seconds),
+  the next page load that RTI wants challenged gets the interstitial again. A valid CAPTCHA session does not change
+  that: it waives only the CAPTCHA, so this can happen right after a CAPTCHA that took longer than the mark's 60
+  seconds to solve.
+- In `MONITORING` mode no page is shown in any row. The Worker logs what it would have shown (see
+  [Monitoring and logs](#monitoring-and-logs)).
+
+**Only a `GET` page load can get the interstitial, and `challengingStrategy` is not used for page loads while the
+interstitial is on.** A rule of `actionOnSuspicious` that covers such a page load still decides, and its
+`Action.CHALLENGE` means the interstitial. `Action.CHALLENGE` in `onSecondVerdict` or `onSessionNotFound` means the
+CAPTCHA. Every other request (a `POST`, a `HEAD`, a script's `fetch`) gets the answer it gets with the interstitial off,
+`challengingStrategy` included. With the default `challengingStrategy` (`CAPTCHA`), a rule or a method default of
+`actionOnSuspicious` decides, and without one the request is forwarded with `x-cheq-rti-result` (see
+[Which request gets a page](#which-request-gets-a-page)). A request with a body can get the CAPTCHA there, as before.
+Another `challengingStrategy` (`ACCESS_DENIED`, `NOT_FOUND` or `REDIRECT`) applies to such a request as before: it gets
+that answer, and `actionOnSuspicious` is not asked. With `challengingStrategy` set, the Worker logs once per cold start
+`[interstitial] challengingStrategy is set but not used for page loads while the interstitial is on (see "Interstitial" in the README)`.
+
+#### The mark cookie
+
+```
+_cq_it=<setup id>|<expiresAt>.<signature>|<ray id of RTI call 1>|<page tag>|<original Referer>
+    ; Max-Age=60; Path=/; SameSite=Lax; Secure (on https only); Domain=<the site's main domain, when the browser accepts it>
+```
+
+**What it is for.** The page's script writes it right before the reload, and the reload brings it. It says that the
+page ran, so a visitor whose tag did not run gets `onSessionNotFound` and not the page again. And it carries where the
+visitor came from before the page (see
+[The original Referer after the interstitial](#the-original-referer-after-the-interstitial)).
+
+- **The setup id:** 8 hex characters of a keyed hash, made from the mark's key. It does not reveal the key. A mark with
+  another setup's id is no mark for this Worker, and the page's own mark replaces it.
+- **`expiresAt`:** when the Worker stops accepting the mark: `maxWaitMs` plus 70 seconds after the page was served.
+  The browser keeps the mark 60 seconds from the moment the script writes it (up to `maxWaitMs` after the page
+  started), and 10 seconds are allowed for the page to arrive. The 10 seconds are an allowance, not a measurement.
+- **The signature:** HMAC-SHA256, its first 32 hex characters, over
+  `JSON.stringify(["it", expiresAt, rayId, pageTag, referer, bindingKey])`, the way the CAPTCHA signs `_cq_rf`. The
+  key is made from your `apiKey`, so there is no new secret to set. A new `apiKey` ends every open mark.
+- **The page tag:** 16 hex characters of a keyed hash of the URL's path, so the cookie stays short for any URL.
+- **The ray id and the original Referer** are URL-encoded. The Referer is empty when there is none.
+- **60 seconds:** the script writes the mark with `Max-Age=60`. Without `Secure` on plain http, so that a local run
+  works.
+- **The binding.** A mark is valid only for the client it was made for, like the CAPTCHA's session. `binding` has the
+  shape and the default of the CAPTCHA's `sessionBinding` (see [Session binding](#session-binding)): the client's IP
+  (`CF-Connecting-IP`) and its User-Agent. The mark holds neither: they are only part of what is signed. A request
+  from another IP or with another User-Agent has no valid mark. For visitors whose IP changes between the page and the
+  reload (a VPN, iCloud Private Relay, a pool of addresses), set `binding: { ip: "none", userAgent: true }`.
+- **Checked on every request** while the interstitial is on, after the ignored paths and before RTI is called. Only the
+  first `_cq_it` with this setup's id is checked. A missing, expired, forged or foreign mark is ignored without a log
+  line, and RTI is called as for any request.
+
+**Why a cookie that the page's script writes.** A `Set-Cookie` on our page would hand the mark to any client that
+keeps cookies, also to one that does not run the page. **Option C, not built:** the page tells the Worker "I ran", and
+the Worker remembers the IP, User-Agent, URL and Referer for 60 seconds in Cloudflare's Cache API or in KV, so nothing
+goes into the browser. The design says that the Cache API works per data center and does nothing on `*.workers.dev`,
+that KV needs a namespace per customer, and that a visitor whose IP changes is not recognized.
+
+**For the site's main domain.** The script tries `Domain=` values built from the host name, from the shortest with two
+labels upward (`shop.com`, then `www.shop.com`), and keeps the first whose new value it can read back. A browser
+refuses a cookie for a public suffix (Chrome did for `cloudfront.net`, the design says), so the next one is tried.
+With a `Domain=` kept, the mark is sent to every host of that domain for its 60 seconds, and a reload that the origin
+redirects to the `www` host shows no second interstitial. For an IP address, for a host with one label (`localhost`),
+and when none of the `Domain=` values can be read back, the mark is written for the host only. Nobody has run this in
+a browser yet, and a local run on `localhost` cannot show it.
+
+**The mark counts on every page of the site, not only on the page it was made for** (a decision of 2026-11-22). Why:
+an origin often answers the reload with a redirect (a trailing slash, a locale, a campaign URL), and a mark for one
+page only would give a visitor whose tag did not run a second interstitial on the redirect target. Whom it concerns:
+only a client for whom RTI has no tag session, because its tag did not run or the reload came too early. When RTI has
+the session, `onSecondVerdict` applies and the mark is not used. The price: for the 60 seconds of the mark, such a
+client gets the no-session action (`onSessionNotFound`) on every page of the site that RTI wants challenged, without a
+new interstitial. The mark's Referer and `customId3` stay on the mark's own page (its path).
+
+#### The original Referer after the interstitial
+
+The same as after the CAPTCHA (see [The original Referer](#the-original-referer)). After the reload the browser's
+`Referer`, and `document.referrer` on your page, is the page's own URL: the design says that Chrome sends it on a
+script's reload (tested on 2026-11-17), and a local run with Chrome 157 saw it sent without the `#fragment`
+(2026-11-23). So the mark carries the original Referer of the request that got the page,
+built as the CAPTCHA builds it: from another site only its origin (`https://www.google.com/`), from this host the full
+URL without the `#fragment`, cut to 420 characters, and nothing for no Referer. When that request already carried an
+`x-cheq-original-referer` that this Worker set, that value goes into the mark.
+
+The Worker uses the mark's Referer only on a page load of the mark's own path whose own `Referer` is missing or is the
+page itself (the same host, path and query). A request that brings another Referer keeps its own, for example a click
+from another page of the site within the 60 seconds.
+
+On plain http a link from an https site brings no Referer under Chrome's default referrer policy: in a local run on
+`http://localhost`, Chrome 157 sent none from `https://www.google.com/`, so the mark had none. With the referrer policy
+`origin` set on that navigation, it sent `https://www.google.com/`. Check the original Referer on an https site.
+
+`originalRefererVia` (the interstitial's own setting, default `"header"`) says how the value is delivered, as the
+CAPTCHA's setting of the same name does:
+
+- `"header"`: on the reload the Worker adds `x-cheq-original-referer` to the request, before RTI is called. RTI and the
+  origin get it. A value that `config.originalReferer` gives (with the Turnstile example, a valid `_cq_rf`) wins.
+- `"cookie"`: when there is an original Referer, the page's script also writes `_cq_ref`, in the CAPTCHA's format
+  `{return URL}|{Referer}` (both URL-encoded; the return URL is the page's path, query and `#fragment`), with
+  `Max-Age=60; Path=/; SameSite=Lax`, `Secure` on https, and the mark's domain. The Worker never reads it and adds no
+  header, so RTI does not get the value, and the origin gets it only inside the `Cookie` header. The one exception:
+  when a CAPTCHA follows on the reload, the request that `config.challenge` gets carries the header for that call only,
+  so the CAPTCHA page can carry the value on. It is taken off again before the request goes on.
+
+The same snippet as for the CAPTCHA reads `_cq_ref` (see [The original Referer](#the-original-referer)). In the chain
+with both pages, the interstitial's `_cq_ref` (for the main domain) and the CAPTCHA's (for the host) can both be
+there. They hold the same Referer.
+
+The Referer's way in both modes, with the interstitial and the CAPTCHA set to the same mode (`originalRefererVia` here
+and in `turnstileConfig`). Inside the Worker the way is the same in both modes: the Worker checks the mark and hands the
+value to the CAPTCHA page on the request. The mode decides only who gets the value at the end.
+
+| Step | `"header"` | `"cookie"` |
+|---|---|---|
+| The interstitial's script, before the reload | Writes the mark. | Writes the mark, and `_cq_ref` for the site's scripts when there is an original Referer. |
+| The reload: the Worker, before RTI | Checks the mark and sets `x-cheq-original-referer` on the request. RTI gets it. | Checks the mark and keeps the value. RTI gets no extra header. |
+| No CAPTCHA follows | The origin gets the header on this request. | No header is added. `_cq_ref` is in the browser: the site's scripts read it, and the origin gets it in the `Cookie` header. |
+| A CAPTCHA follows: its page | Reads the header from the request. | Reads the header, which the Worker added to this request for the page only. |
+| The 302 after the solve | Sets `_cq_rf` (signed). | Sets `_cq_ref` (readable). |
+| The landing request | The Worker reads `_cq_rf` and sets the header. The origin and RTI get it. | No header is added. The site's scripts read `_cq_ref`, and the origin gets it in the `Cookie` header. |
+
+`document.referrer` on your page is the page's own URL in both modes, as after the CAPTCHA. No page of ours can change
+that.
+
+#### Monitoring and logs
+
+Two kinds of lines go to the RTI logger as info lines, through `waitUntil`, unless `logOutcomes` is `false`. With
+`debug: true` they also go to the console:
+
+```
+interstitial: shown, rayId=<ray id of call 1>, verdict=<verdict>, reasons=<codes>, request=<cf-ray>
+interstitial: <outcome>, firstRayId=<ray id of call 1>, rayId=<ray id of call 2>, verdict=<verdict>, reasons=<codes>, sessionFound=<true|false|null>, request=<cf-ray>
+```
+
+- **`shown`** is written when the page is served.
+- **`would-show`** takes its place in `MONITORING` mode. No page is shown there, and the request goes on as usual. The
+  line says that the page load would get the page in `BLOCKING` mode: RTI wants it challenged, the strategy is
+  `INTERSTITIAL`, the decision is "show" (so a tag session or a valid mark gives no line), and it is not a
+  prefetch.
+- **The reload line** (the second format) is written in `BLOCKING` mode for a page load with a valid mark for its own
+  page, when it is not a prefetch. `<outcome>` is `passed`, `blocked` or `redirected` when RTI's action is ALLOW,
+  BLOCK or REDIRECT. When RTI wants it challenged again, it is `second-verdict:<ACTION>` or `no-session:<ACTION>`, with
+  the value of `onSecondVerdict` or `onSessionNotFound` (`ALLOW`, `BLOCK`, `REDIRECT` or `CHALLENGE`). A reply to the
+  CAPTCHA page that the CAPTCHA answers gets no line. Neither does a challenge for which a rule of
+  `actionOnSuspicious` gives `ALLOW`, `BLOCK` or `REDIRECT`. A rule's `CHALLENGE` gets the line,
+  as without a rule. A reply that RTI blocks or redirects is not answered by the CAPTCHA: with a valid mark for its
+  page it gets a `blocked` or `redirected` line.
+  The first ray id comes from the mark, so the two lines of one visitor can be joined. A `shown` line without
+  a reload line means that the visitor left. A redirect of the reload to the same path gives a second reload line with
+  the same `firstRayId` (see [Known limits](#known-limits)), so a count per interstitial takes the first line per
+  `firstRayId`.
+- `reasons=` holds RTI's reason codes joined with `,` (empty without any), `sessionFound=` is RTI's
+  `metadata.sessionFound` (`null` when RTI does not say), and `request=` is the `cf-ray` value, or
+  `unknown_request_id`.
+
+**`customId3`.** A request with a valid mark for its own page (its path) sends RTI
+`customId3: interstitial:<ray id of call 1>`, in both modes. In RTI's data the row of call 2 can then be joined to
+the row of call 1. A visitor who loads the same page again within the mark's 60 seconds is marked again, so a query
+takes the first row per ray id.
+
+**Debug lines** (`debug: true`): `interstitial: forward, <reason>` when the interstitial's decision sends the request on
+with the verdict, where `<reason>` is `not-a-page-load`, and
+`prefetch: an empty 403 in place of the interstitial`. The strategy line reads `action strategy: INTERSTITIAL (4), …`.
+
+**Errors** are logged as `Interstitial error handling request '<id>'`, to the console and, unless `logErrors` is
+`false`, to the RTI logger. An error while the mark is read counts as no mark (RTI is still called). An error in one of
+the lines above (`shown`, `would-show` or a reload line) changes nothing else: the request gets the answer it gets
+without the line, such as the page or the block page. An error in the decision or the page forwards the request with
+the verdict. A CAPTCHA that the decision leads to keeps its own error handling (`Challenge error handling request
+'<id>'`, forwarded without the verdict).
+
+#### Known limits
+
+- **A client can avoid the page by not asking for one.** A bot can send the headers of a script's call
+  (`Sec-Fetch-Dest: empty`), and a client such as `curl` does not ask for a page at all. Such a request gets no page,
+  neither the interstitial nor the CAPTCHA, and is forwarded with the verdict. `methods: { GET: Action.CHALLENGE }`
+  gives such a `GET` the CAPTCHA (see [Which request gets a page](#which-request-gets-a-page)).
+- **A page that a site names in `<link rel="prefetch">`** is asked for as a background request and forwarded with the
+  verdict, and the browser may show it from its cache on the click, without the interstitial (see the known limits of
+  [Which request gets a page](#which-request-gets-a-page); nobody ran this in a browser).
+- **A suspicious prefetch of a page gets an empty 403,** with no mark and no log line.
+- **With `onSessionNotFound: Action.ALLOW` (the default), a client that blocks the tag passes** after one extra
+  request: the page, then the reload with the mark.
+- **A client that copies the mark out of the page** without running it gets the no-session action, like a client that
+  blocks the tag. The mark is in the page's script.
+- **For the 60 seconds of a mark, a client without a tag session gets the no-session action on every page of the
+  site that RTI wants challenged,** not only on the page that showed the interstitial (see
+  [The mark cookie](#the-mark-cookie)).
+- **A visitor whose tag is blocked gets the interstitial again,** about once a minute (each time the mark has expired),
+  as long as RTI wants their page loads challenged.
+- **Reload too early.** The design says that the tag's server saves a new session in its own region at once and copies
+  it to the other regions in the background (read in adserver on 2026-11-17). If the reload's RTI call lands in another
+  region within the first moments, RTI answers `sessionFound: false`, and the visitor gets the no-session action
+  without the tag's verdict. Not built: when a valid mark comes with a `_cq_pvid` cookie and RTI says `false`, wait
+  about 300 ms and call RTI once more.
+- **A visitor whose IP or User-Agent changes** between the page and the reload has no valid mark. When RTI has no tag
+  session either, the visitor gets the page again, and it shows "We could not check your browser." with **Try
+  again**. `binding: { ip: "none", userAgent: true }` turns the IP part off.
+- **Two tabs of a flagged visitor at the same time:** the second tab can find the first tab's fresh mark and show "We
+  could not check your browser." One click on **Try again** recovers.
+- **A tab that the browser freezes or slows** while the page waits for the tag (a background tab, an app switch on a
+  phone) can write the mark late. If it is more than the 10-second allowance late, the browser keeps the mark longer
+  than the Worker accepts it, and a page load in that time shows the same text when RTI has no tag session. One click
+  on **Try again** recovers. In a local run, headless Chrome 157 reloaded a tab that was hidden from the start after
+  1.4 seconds (0.4 seconds in front), without that text. Nobody tried a tab hidden for minutes.
+- **Cookies blocked:** the page cannot keep the mark, so it shows "Please allow cookies for this site, then reload the
+  page." and does not reload. **JavaScript off:** it shows "Please turn on JavaScript, then reload the page." Both
+  visitors stay on the page as long as RTI wants their page loads challenged.
+- **A good bot that your policy makes suspicious gets the interstitial like any visitor.** Good bots (crawlers such as
+  Google's and Bing's) are expected to get a benign verdict from RTI, and so no page. A crawler that runs no JavaScript
+  cannot pass the page. Fix it in the policy screen of the CHEQ console, not in the Worker.
+- **A second page load of the same page within the mark's 60 seconds that brings no Referer of its own** (the visitor
+  reloads, or types the address again) gets the mark's Referer once more, and `customId3` again.
+- **After a redirect of the origin, the target page gets no original Referer from the mark,** as the CAPTCHA's `_cq_rf`
+  is given only on its landing page. The exception is the next point.
+- **A redirect target with the mark's path that brings no `Referer` of its own also gets the mark's original
+  Referer:** the origin redirects the reload to the `www` host, or drops the query, and the browser sends no Referer on
+  the redirect. In `"header"` mode the origin can then see `x-cheq-original-referer` on the reload and again on the
+  target. Seen in a local Chrome run: with `Referrer-Policy: no-referrer` on the origin's 302 from `/sofas?gclid=abc` to
+  `/sofas`, both requests carried the header, at the origin and in RTI's payload. Without that policy only the reload
+  carried it. A signed tag over the host, path and query would prevent it, and was not built.
+- **A redirect of the reload to a host of another main domain** does not take the mark along, so a visitor without a
+  tag session gets a second interstitial there. A host where the Worker does not run ignores the mark.
+- **Hosts of the main domain that run the Worker with different setups** (another `apiKey`) each ignore the other's
+  mark, with no error page. The two marks have the same name, `Domain` and `Path`, so each one replaces the other (a
+  new cookie with the same name, domain and path removes the old one: RFC 6265, section 5.3, step 11, read on
+  2026-11-23). A visitor without a tag session who goes back and forth between the hosts gets the interstitial at each
+  switch, as long as RTI wants their page loads challenged.
+- **`customId3` and the reload line repeat when the origin redirects the reload to the same path,** on the same host
+  (dropping the query, for example) or on another host of the main domain. A local Chrome run saw two
+  `second-verdict:ALLOW` lines with the same `firstRayId` for one interstitial. So a count of outcomes per interstitial
+  takes the first line per `firstRayId`, and a query of RTI's data the first row per ray id.
+- **The reload line names RTI's action, not what the visitor got:** a `BLOCK` with `blockingStrategy: CAPTCHA` logs
+  `blocked` while the visitor gets the CAPTCHA (or the site, with a valid `_cq_se`).
+- **A request that carries the CAPTCHA's reply** (one that `isChallengeResponse` recognizes: with the Turnstile
+  example, `cf-turnstile-response` in the query) goes to `config.challenge` before the interstitial's decision. So with
+  `onSecondVerdict` or `onSessionNotFound` set to `Action.BLOCK` or `Action.REDIRECT`, such a request gets the CAPTCHA
+  instead. RTI is still called, and the next page load still gets the block.
+- **Not checked: a response header that your zone adds to every answer,** such as a `Content-Security-Policy` from a
+  Transform Rule, could stop the page's inline script, and the page would then not reload. Nobody checked whether such
+  rules apply to an answer the Worker builds. If your zone has one, try a flagged page load once on a test host.
 
 ### Turnstile CAPTCHA
 
@@ -651,7 +1336,8 @@ CAPTCHA vendor outage. A fallback would have to trust the browser ("the widget f
 ```
 Request arrives → strategy is CAPTCHA (CHALLENGE by default, for a page load that no rule covers, or for a request
                 that actionOnSuspicious sends to the CAPTCHA, see Which request gets a page; or BLOCK with
-                blockingStrategy: CAPTCHA)
+                blockingStrategy: CAPTCHA; while the interstitial is on, a page load gets the interstitial first,
+                and the CAPTCHA when onSecondVerdict or onSessionNotFound is CHALLENGE, see Interstitial)
                 and there is no valid session and it is not a prefetch → config.challenge() called
                     (in BLOCKING mode also for every reply, see The reply to the challenge page)
         │
@@ -788,7 +1474,7 @@ BLOCKING mode, config.challenge set, and the strategy allows a reply?   (isChall
      │
      ├── any other strategy (ACCESS_DENIED / NOT_FOUND / REDIRECT) → enforced as usual (isChallengeResponse is not called)
      │
-     └── no strategy (ALLOW) or CAPTCHA, with or without a session
+     └── no strategy (ALLOW), CAPTCHA or INTERSTITIAL, with or without a session
               │
          config.isChallengeResponse(request) === true?   (Turnstile example: cf-turnstile-response in the query, with a value)
               │
@@ -990,6 +1676,9 @@ came from (Google, an ad, a partner). The example carries the original Referer t
    - from this host, the full URL without the `#fragment`: `https://shop.com/category?page=2`
    - cut to 420 characters (the most GA4 keeps for `page_referrer`), never in the middle of an encoded character
    - nothing for no Referer, or one that is not an http(s) URL
+
+   The page takes it from the request's `x-cheq-original-referer` header when that header has a value, else from the
+   request's `Referer`.
 2. The form sends it with the token, in the reply's URL.
 3. Only on the 302 after a **verified** solve, the Worker checks it again (the client controls the URL) and hands it on
    in a cookie (below). A failed token, a retry page or a paused CAPTCHA set nothing.
@@ -1004,7 +1693,8 @@ came from (Google, an ad, a partner). The example carries the original Referer t
 **What the header is worth.** The value is what the visitor's browser reported as its Referer, carried through the
 CAPTCHA. It is as trustworthy as a `Referer` header, no more: do not treat it as verified. What the signature
 guarantees is that the header is only set after a solved CAPTCHA, for the same client, on the landing page, within 60
-seconds.
+seconds. While the interstitial is on, a valid mark sets it too: after the interstitial, for the same client, on the
+mark's page (see [The original Referer after the interstitial](#the-original-referer-after-the-interstitial)).
 
 **`"header"`:**
 
@@ -1012,8 +1702,8 @@ seconds.
   the expiry, the Referer, the landing page's path and the client binding (IP and User-Agent, per `sessionBinding`),
   like `_cq_se`. A made-up, edited, expired or copied cookie, or one sent to another page, adds no header.
 - An `x-cheq-original-referer` sent by the client is removed from the request the Worker forwards, so the header comes
-  from `config.originalReferer`: with the example, only after a solved CAPTCHA. The exception is Cloudflare's
-  pass-through after a failure, which sends what the client sent (see
+  from `config.originalReferer` (with the example, only after a solved CAPTCHA) or, while the interstitial is on, from
+  a valid mark. The exception is Cloudflare's pass-through after a failure, which sends what the client sent (see
   [What the Worker cannot clean](#what-the-worker-cannot-clean)).
 - The header is added before the RTI call, and it is on the Worker's list of headers for RTI, so RTI gets it too.
 - The cookie is not deleted after use: `config.originalReferer` sees only the request, and the origin's response goes
@@ -1039,8 +1729,9 @@ const originalReferrer = carried ? decodeURIComponent(carried.split('|')[1] ?? '
 ```
 
 The Worker never reads `_cq_ref`, so a planted or edited one never becomes `x-cheq-original-referer` (only a valid
-`_cq_rf` can), and RTI never gets it: the Worker sends RTI the three CHEQ cookies of the tag, not the `Cookie`
-header. The origin gets it inside the `Cookie` header, as the browser sent it, like any other cookie: it can fool the
+`_cq_rf` can, or a valid mark of the interstitial), and RTI never gets it: the Worker sends RTI the three CHEQ cookies
+of the tag, not the `Cookie` header. The origin gets it inside the `Cookie` header, as the browser sent it, like any
+other cookie: it can fool the
 site's own scripts, and any origin code that reads it.
 
 In both modes, **a request with a body** (`actionOnSuspicious` CHALLENGE) carries its own Referer, the form page.
@@ -1096,6 +1787,10 @@ it, when the visitor has a valid session, and when RTI fails (a stand-in `respon
 is the `cf-ray` value and not an RTI ray id, and no `addRtiResultHeader`). Without `isChallengeResponse`, replies are
 not recognized (a warning is logged once per cold start): in `BLOCKING` mode a reply that RTI allows then reaches the
 origin with the form fields.
+
+A custom `challenge` finds the original Referer where the example's challenge page finds it: in the
+`x-cheq-original-referer` header of the request it gets when that header has a value, else in its `Referer` (see
+[The original Referer](#the-original-referer)).
 
 > **Note:** If `config.challenge` throws, the error is caught and the request is passed through (fail open). Errors are
 > logged via `console.error`, and to the RTI logger unless `logErrors` is `false`. For a reply to the challenge page,

@@ -685,6 +685,45 @@ describe('cloudflare worker', () => {
             expect(challenge.mock.calls[0][0].redirect).toBe('manual');
         });
 
+        it('CHALLENGE takes x-cheq-original-referer off the GET for the CAPTCHA page only: the POST forwarded when config.challenge throws keeps it', async () => {
+            // Arrange
+            expectError = true;
+            const challenge = captchaVerdict().mockRejectedValue(new Error('challenge crash'));
+            realStrategies();
+            (config as any).actionOnSuspicious = { methods: { POST: Action.CHALLENGE } };
+            (config as any).originalReferer = vi.fn().mockReturnValue('https://www.google.com/');
+
+            // Act
+            const { forwarded, originFetch } = await run(post('/api/login', { Referer: 'https://example.com/account/login' }));
+
+            // Assert: the GET that config.challenge got
+            const pageRequest = challenge.mock.calls[0][0];
+            expect(pageRequest.method).toBe('GET');
+            expect(pageRequest.headers.get('x-cheq-original-referer')).toBeNull();
+            expect(pageRequest.headers.get('referer')).toBe('https://example.com/account/login');
+            // Assert: the POST, forwarded as it is
+            expect(originFetch).toHaveBeenCalledOnce();
+            expect(forwarded!.method).toBe('POST');
+            expect(forwarded!.headers.get('x-cheq-original-referer')).toBe('https://www.google.com/');
+            expect(mocks.loggerError).toHaveBeenCalledWith(`Challenge error handling request '${CF_RAY}': challenge crash`);
+        });
+
+        it('CHALLENGE of a GET: the request config.challenge gets keeps x-cheq-original-referer', async () => {
+            // Arrange
+            const challenge = captchaVerdict();
+            realStrategies();
+            (config as any).originalReferer = vi.fn().mockReturnValue('https://www.google.com/');
+
+            // Act
+            await run(buildWorkerRequest('/page', { extraHeaders: { Referer: 'https://example.com/sofas' }, cfRay: CF_RAY, xRealIp: '1.2.3.4' }));
+
+            // Assert
+            const pageRequest = challenge.mock.calls[0][0];
+            expect(pageRequest.method).toBe('GET');
+            expect(pageRequest.url).toBe('https://example.com/page');
+            expect(pageRequest.headers.get('x-cheq-original-referer')).toBe('https://www.google.com/');
+        });
+
         it.each([
             ['no Referer', {}],
             ['a Referer from another site', { Referer: 'https://evil.example/form' }],

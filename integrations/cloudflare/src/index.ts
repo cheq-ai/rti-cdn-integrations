@@ -1,3 +1,4 @@
+// cspell:ignore adserver CHEQ pvid
 import { config } from "./config";
 import { RTILoggerService } from "../../core/services/rti-logger.service";
 import { RTIService } from "../../core/services/rti.service";
@@ -11,26 +12,50 @@ import { ActionStrategy } from "../../core/models/action-strategy.model";
 import { generateDefaultBlockPage } from "../../core/helpers/block-page-helpers";
 import { ResponseHeaders } from "./response-headers";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
+import { InterstitialService } from "../../core/services/interstitial.service";
+import { InterstitialFacts, InterstitialRequest, ValidMark } from "../../core/models/interstitial.model";
+import { PageLoadHeaders } from "../../core/models/page-load-headers.model";
+import { hmacHex32, sessionBindingKey } from "./signing";
 
 const logger = new RTILoggerService(`${name}-${version}`, config);
 const rtiHelperService = new RTIHelperService(config);
 const rtiService = new RTIService(config);
+// The passive interstitial (README, "Interstitial"). It reads config.interstitial and its tag line once, here, and does
+// not throw. It holds nothing of a request.
+const interstitialService = new InterstitialService(config, hmacHex32);
 
-// Set only from config.originalReferer (see restoreOriginalReferer; with the shipped example, after a solved CAPTCHA). A
-// copy the client sends is removed from the request this Worker sends on. Cloudflare's own pass-through after a failure
-// sends what the client sent (README, "What the Worker cannot clean").
+// Set only from config.originalReferer (see restoreOriginalReferer; with the shipped example, after a solved CAPTCHA),
+// or in the interstitial's "header" mode from a valid mark (see readMark). In "cookie" mode a valid mark sets it only
+// for the call of config.challenge (see the CAPTCHA case of carryOutStrategy). A copy the client sends is removed from
+// the request this Worker sends on. Cloudflare's own pass-through after a failure sends what the client sent (README,
+// "What the Worker cannot clean").
 const ORIGINAL_REFERER_HEADER = RTIStatelessUtils.ORIGINAL_REFERER_HEADER;
+
+// The outcome in the reload line (README, "Interstitial") where RTI's action on the reload gives it. For CHALLENGE the
+// interstitial's decision gives it (see interstitialStrategy).
+const RELOAD_OUTCOMES: Partial<Record<Action, string>> = {
+    [Action.ALLOW]: "passed",
+    [Action.BLOCK]: "blocked",
+    [Action.REDIRECT]: "redirected",
+};
 
 // Our block, 404 and redirect answers, and the empty 403 for a prefetch, are never cached.
 const responseHeaders = new ResponseHeaders();
 
 // Once per cold start, and never fatal: an exception while the module loads breaks every request of the Worker. Only
-// reads the config and logs. The [challenge] check runs first: an actionOnSuspicious check that throws can't hide it.
+// reads the config and logs. The [challenge] and [interstitial] checks run first: an actionOnSuspicious check that
+// throws can't hide them.
 try {
     // Without isChallengeResponse a reply to the challenge page is not recognized, so in BLOCKING mode it is handled
     // like any request (e.g. forwarded with the form fields when RTI allows it).
     if (config.challenge && !config.isChallengeResponse) {
         console.warn('[challenge] config.isChallengeResponse is not set: replies to the challenge page are not recognized (see "Challenge callbacks" in the README)');
+    }
+
+    // One warning per problem in config.interstitial. With a wrong enabled or tag the interstitial is off, and a
+    // challenge is handled as before it existed.
+    for (const problem of interstitialService.problems) {
+        console.warn(`[interstitial] ${problem} (see "Interstitial" in the README)`);
     }
 
     // A wrong value in actionOnSuspicious never stops the Worker, so say what to fix. What it does instead depends on the
@@ -59,8 +84,8 @@ export default {
         // The request the origin gets, unless the Worker answers itself or config.challenge returns another request.
         const originRequest = new Request(request);
 
-        // handle only decides: our own answer (block page, redirect, challenge page, the empty 403 for a prefetch), or the
-        // request to send on.
+        // handle only decides: our own answer (block page, redirect, challenge page, interstitial page, the empty 403 for a
+        // prefetch), or the request to send on.
         const result = await handle(request, originRequest, context);
         // The copy holds the body. When the copy is not sent on, nobody reads that body, and wrangler dev then stalls the
         // next request (seen with wrangler 4.56.0; whether production does is not known). So the body is read to the end
@@ -108,9 +133,9 @@ function forwardToOrigin(request: Request): Promise<Response> {
 
 /**
  * Decides what happens to a request and never calls the origin itself: it returns either our own answer
- * (block page, redirect, challenge page, the empty 403 for a prefetch) or the request to send on. Errors fail open:
- * the request is sent on, except a reply to the challenge page, which still goes to config.challenge (see the outer
- * catch).
+ * (block page, redirect, challenge page, interstitial page, the empty 403 for a prefetch) or the request to send on.
+ * Errors fail open: the request is sent on, except a reply to the challenge page, which still goes to config.challenge
+ * (see the outer catch).
  * `originRequest` is the copy of `request` made in fetch (it holds the body). handle cleans it and returns it to send
  * on, unless it answers itself or config.challenge returns another Request.
  */
@@ -119,7 +144,7 @@ async function handle(request: Request, originRequest: Request, context: Executi
     // path, RTI error, a throw from validateChallenge or challenge, a Request that challenge returns without it)
     // its copy would reach the origin.
     originRequest.headers.delete("x-cheq-rti-result");
-    // Same for the original Referer: only config.originalReferer sets it (see ORIGINAL_REFERER_HEADER).
+    // Same for the original Referer: only config.originalReferer and a valid mark set it (see ORIGINAL_REFERER_HEADER).
     originRequest.headers.delete(ORIGINAL_REFERER_HEADER);
     await restoreOriginalReferer(originRequest);
 
@@ -130,6 +155,26 @@ async function handle(request: Request, originRequest: Request, context: Executi
         if (rtiHelperService.shouldIgnore(requestURL.pathname)) {
             return originRequest;
         }
+
+        // Whether the request is a page load: worked out once, before RTI is called, from the request sent on.
+        const method = originRequest.method;
+        // The four headers of the request sent on, for isPageLoad and isPrefetch. A missing header is null.
+        const pageLoadHeaders: PageLoadHeaders = {
+            secFetchDest: originRequest.headers.get("sec-fetch-dest"),
+            accept: originRequest.headers.get("accept"),
+            secPurpose: originRequest.headers.get("sec-purpose"),
+            purpose: originRequest.headers.get("purpose"),
+        };
+        const pageLoad = rtiHelperService.isPageLoad(method, pageLoadHeaders);
+
+        // The interstitial's mark (_cq_it), read before RTI is called while the interstitial is on. What it is for, and
+        // why it counts on every page of the site: the comments at InterstitialService.readMark.
+        const mark = interstitialService.on ? await readMark(originRequest, pageLoad, context) : undefined;
+        // "cookie" mode: the mark's original Referer is only kept here, for a CAPTCHA on this request (the CAPTCHA case of
+        // carryOutStrategy). RTI and the origin do not get it as x-cheq-original-referer. As in "header" mode, a value
+        // that config.originalReferer set wins: then nothing is kept.
+        const keptReferer = mark?.referer !== undefined && interstitialService.settings!.originalRefererVia === "cookie"
+            && !originRequest.headers.has(ORIGINAL_REFERER_HEADER) ? mark.referer : undefined;
 
         const startRTI = Date.now();
         // Built from the request the origin gets: without the client's copies, with the original Referer if set.
@@ -142,6 +187,8 @@ async function handle(request: Request, originRequest: Request, context: Executi
             channel: "cloudflare-cdn-integration",
             customId1: rtiHelperService.getEventType(requestURL.pathname, request.method),
             customId2: originRequest.headers.get("cf-ray") || undefined, // set the cloudflare request id for monitoring
+            // A valid mark for this page: the ray id of RTI call 1, so the two calls can be joined.
+            customId3: mark?.forThisPage ? `interstitial:${mark.firstRayId}` : undefined,
             endUserParams: {
                 clientIp: originRequest.headers.get("x-real-ip")!,
                 requestUrl: requestURL.href,
@@ -162,6 +209,11 @@ async function handle(request: Request, originRequest: Request, context: Executi
             console.log(`RTI Request payload: ${rtiHelperService.stringifyRedactedPayload(payload)}`);
         }
 
+        // Reload too early: not handled, only written down (the owner's decision). The design says that the tag's server
+        // saves a new session in its own region at once, and copies it to the other regions in the background (read in
+        // adserver on 2026-11-17). If the reload's RTI call lands in another region within the first moments, RTI answers
+        // sessionFound: false, and the visitor gets the no-session action without the tag's verdict. Not built: when a
+        // valid mark comes with a _cq_pvid cookie and RTI says false, wait about 300 ms and call RTI once more.
         const rtiResponse = await rtiService.callRTI(payload);
 
         if (config.debug) {
@@ -182,22 +234,20 @@ async function handle(request: Request, originRequest: Request, context: Executi
             console.log(`action upon response: ${actionName ? `${actionName} (${action})` : action}`);
         }
 
+        // MONITORING mode (FR-7): no request gets the interstitial, but a line says when a page load would get it.
+        if (interstitialService.on && config.mode === Mode.MONITORING) {
+            logWouldShow(originRequest, context, rtiResponse, requestURL.pathname, pageLoad, pageLoadHeaders, mark);
+        }
+
         // RTI's action as a strategy for this request. When RTI says CHALLENGE and the strategy is CAPTCHA, three questions
         // decide which request gets the page (README, "Which request gets a page"): a rule of config.actionOnSuspicious
         // that matches the path and covers the method, then a page load gets the page, then the method's default (ALLOW
         // without one: forwarded with the verdict). A block verdict shown as a CAPTCHA (blockingStrategy: CAPTCHA) asks no
         // question: a GET or HEAD gets the page, and a request with a body still follows actionOnSuspicious. Where the
-        // page would be the answer, a prefetch gets an empty 403 instead (see the CAPTCHA case below).
-        const method = originRequest.method;
-        // The four headers of the request sent on, for isPageLoad and isPrefetch. A missing header is null.
-        const pageLoadHeaders = {
-            secFetchDest: originRequest.headers.get("sec-fetch-dest"),
-            accept: originRequest.headers.get("accept"),
-            secPurpose: originRequest.headers.get("sec-purpose"),
-            purpose: originRequest.headers.get("purpose"),
-        };
-        const pageLoad = rtiHelperService.isPageLoad(method, pageLoadHeaders);
-        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, method, requestURL.pathname, pageLoad);
+        // page would be the answer, a prefetch gets an empty 403 instead (see the CAPTCHA case of carryOutStrategy).
+        // While the interstitial is on, the page for a page load is the interstitial (INTERSTITIAL), whatever
+        // challengingStrategy says (see interstitialStrategy).
+        const { strategy: actionStrategy, actionOnSuspicious } = rtiHelperService.getStrategyForRequest(action, method, requestURL.pathname, pageLoad, interstitialService.on);
 
         // Every value as its name and its raw value. Cannot throw: a value with no name (null, undefined, an unknown number)
         // reads as "none" next to the raw value. actionOnSuspicious is set only when it decided (a rule or a method's
@@ -206,11 +256,12 @@ async function handle(request: Request, originRequest: Request, context: Executi
             console.log(`action strategy: ${ActionStrategy[actionStrategy ?? -1] ?? "none"} (${actionStrategy}), actionOnSuspicious: ${Action[actionOnSuspicious ?? -1] ?? "none"} (${actionOnSuspicious}), method: ${method}, pageLoad: ${pageLoad}`);
         }
 
-        // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA) and
-        // whatever session the visitor has, config.challenge answers it (it verifies the answer and sends the visitor on).
-        // Forwarded instead, the origin would get the token and the form fields in place of the visitor's query string.
-        // Checked before the session waiver (two tabs, Back, refresh). Only for ALLOW or CAPTCHA (isChallengeReplyAllowed):
-        // any other strategy (blocks, 404s, redirects) is enforced as usual.
+        // The reply to a challenge page is a new request with a new verdict. Whatever that verdict (ALLOW, CAPTCHA,
+        // INTERSTITIAL) and whatever session the visitor has, config.challenge answers it (it verifies the answer and sends
+        // the visitor on). Forwarded instead, the origin would get the token and the form fields in place of the visitor's
+        // query string. Checked before the session waiver (two tabs, Back, refresh). Only for ALLOW, CAPTCHA or
+        // INTERSTITIAL (isChallengeReplyAllowed: a CAPTCHA can come after the interstitial): any other strategy (blocks,
+        // 404s, redirects) is enforced as usual.
         if (rtiHelperService.isChallengeReplyAllowed(actionStrategy) && shouldAnswerChallengeReply(originRequest, context)) {
             if (config.debug) {
                 console.log("challenge reply, passing it to challenge");
@@ -218,81 +269,28 @@ async function handle(request: Request, originRequest: Request, context: Executi
             return await answerChallengeReply(originRequest, context, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
         }
 
+        // The reload line, where RTI's action gives its outcome: ALLOW, BLOCK or REDIRECT. It is sent once the decision is
+        // known, so a reply to the challenge page (answered above) gets none. For CHALLENGE the line comes from the
+        // interstitial's decision (see interstitialStrategy). So a challenged page load for which a rule of
+        // actionOnSuspicious gives ALLOW, BLOCK or REDIRECT gets none. An error in the line is logged, and the request
+        // goes on as without it (sendReloadLine).
+        const reloadOutcome = RELOAD_OUTCOMES[action];
+        if (reloadOutcome !== undefined) {
+            sendReloadLine(context, reloadOutcome, mark, pageLoad, pageLoadHeaders, rtiResponse, originRequest);
+        }
+
         if (action !== Action.ALLOW) {
-            switch (actionStrategy) {
-                case ActionStrategy.ACCESS_DENIED:
-                    return blockPage(403, 'Access Denied', request, rtiResponse);
-                case ActionStrategy.NOT_FOUND:
-                    return blockPage(404, 'Not Found', request, rtiResponse);
-                case ActionStrategy.REDIRECT:
-                    return new Response(null, {
-                        status: 302,
-                        headers: {
-                            "x-cheq-cdn-request-id": request.headers.get("cf-ray") || '',
-                            "x-cheq-id": rtiResponse.ids.rayId,
-                            "x-cheq-page-view-id": rtiResponse.ids.pageViewId ?? '',
-                            "location": config.redirectLocation || "https://www.cheq.ai/",
-                            ...responseHeaders.noStore(),
-                        },
-                    });
-                case ActionStrategy.CAPTCHA:
-                    try {
-                        if (config.challenge) {
-                            // A visitor who already solved the challenge (valid _cq_se session) is not challenged
-                            // again: forward with the real verdict. Only the CAPTCHA is waived, never a block,
-                            // 404 or redirect. If validateChallenge throws, the catch below fails open.
-                            if (await isValidChallenge(originRequest, config.debug)) {
-                                if (config.debug) {
-                                    console.log("valid challenge session, waiving CAPTCHA");
-                                }
-                                break;
-                            }
-                            // A prefetch (Sec-Purpose or Purpose contains "prefetch") gets an empty 403 in place of the
-                            // challenge page: the owner's decision of 2026-11-23 (README, "Which request gets a page";
-                            // RTIStatelessUtils.isPrefetch says what MDN writes about it). Checked after the session
-                            // waiver, so a valid session forwards a prefetch with the verdict, as it would a visit.
-                            // Known limit, not fixed on purpose (the owner's decision of 2026-11-23): a page that a
-                            // site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty, so it is not
-                            // a page load and, as shipped, does not get here: it is forwarded with the verdict (the
-                            // JSDoc of RTIStatelessUtils.isPrefetch; README, "Known limits").
-                            if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
-                                if (config.debug) {
-                                    console.log("prefetch: an empty 403 in place of the challenge page");
-                                }
-                                return new Response(null, {
-                                    status: 403,
-                                    headers: {
-                                        "x-cheq-cdn-request-id": request.headers.get("cf-ray") || '',
-                                        "x-cheq-id": rtiResponse.ids.rayId,
-                                        "x-cheq-page-view-id": rtiResponse.ids.pageViewId ?? '',
-                                        ...responseHeaders.noStore(),
-                                    },
-                                });
-                            }
-                            // A GET gets here when it is a page load that no rule covers; a GET or HEAD also when
-                            // actionOnSuspicious or blockingStrategy: CAPTCHA sends it to the CAPTCHA (README, "Which
-                            // request gets a page"). It is challenged in place: after the challenge, the visitor is back
-                            // on the page they asked for. A request with a body (POST, PUT, PATCH, DELETE, OPTIONS) gets
-                            // the page for where the visitor came from (the Referer, same site only), or the site's home
-                            // page without a usable Referer. The body is not kept (a challenge page cannot carry it
-                            // through): the visitor can send it again after solving the challenge.
-                            const afterChallengeRequest = rtiHelperService.isBodylessMethod(method) ? originRequest : refererAfterChallengeRequest(originRequest);
-                            // Passed on as it is: a Response is our answer, a Request is forwarded. Awaited here, so
-                            // a rejection is caught below.
-                            return await config.challenge(afterChallengeRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
-                        }
-                        break;
-                    } catch (e) {
-                        logError(context, `Challenge error handling request '${getCdnRequestId(request)}'`, e);
-                        return originRequest;
-                    }
-                default:
-                    break;
+            const answer = actionStrategy === ActionStrategy.INTERSTITIAL
+                ? await interstitialStrategy(request, originRequest, context, rtiResponse, pageLoad, pageLoadHeaders, mark, keptReferer)
+                : await carryOutStrategy(actionStrategy, request, originRequest, context, rtiResponse, pageLoadHeaders, keptReferer);
+            if (answer) {
+                return answer;
             }
         }
 
         // action is Action.ALLOW, or no strategy applies (e.g. a request that actionOnSuspicious lets through, such as a GET
-        // that is not a page load), or a CAPTCHA that was waived or has no challenge: pass headers to origin request
+        // that is not a page load), or a CAPTCHA that was waived or has no challenge, or the interstitial's decision sends
+        // the request on (or it failed): pass headers to origin request
 
         // Set the RTI result header for the origin to consume. It is not visible to the client; the origin can log it
         // or act on it.
@@ -308,6 +306,282 @@ async function handle(request: Request, originRequest: Request, context: Executi
             return await answerChallengeReply(originRequest, context, rtiFailureResponse(originRequest, context));
         }
         return originRequest;
+    }
+}
+
+/**
+ * Carries out a strategy: RTI's strategy for this request, or the Action that the interstitial's decision gives. The
+ * answer is ours (the block page, a redirect, the challenge page, the empty 403 for a prefetch), a Request that
+ * config.challenge returns, or `undefined`: handle then sends the copy on with the verdict.
+ * `keptReferer` is the mark's original Referer that handle keeps in "cookie" mode, for the CAPTCHA case.
+ */
+async function carryOutStrategy(strategy: ActionStrategy | null, request: Request, originRequest: Request, context: ExecutionContext, rtiResponse: RTIResponse, pageLoadHeaders: PageLoadHeaders, keptReferer: string | undefined): Promise<Response | Request | undefined> {
+    switch (strategy) {
+        case ActionStrategy.ACCESS_DENIED:
+            return blockPage(403, 'Access Denied', request, rtiResponse);
+        case ActionStrategy.NOT_FOUND:
+            return blockPage(404, 'Not Found', request, rtiResponse);
+        case ActionStrategy.REDIRECT:
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    "x-cheq-cdn-request-id": request.headers.get("cf-ray") || '',
+                    "x-cheq-id": rtiResponse.ids.rayId,
+                    "x-cheq-page-view-id": rtiResponse.ids.pageViewId ?? '',
+                    "location": config.redirectLocation || "https://www.cheq.ai/",
+                    ...responseHeaders.noStore(),
+                },
+            });
+        case ActionStrategy.CAPTCHA:
+            try {
+                if (config.challenge) {
+                    // A visitor who already solved the challenge (valid _cq_se session) is not challenged
+                    // again: forward with the real verdict. Only the CAPTCHA is waived, never a block,
+                    // 404 or redirect. If validateChallenge throws, the catch below fails open.
+                    if (await isValidChallenge(originRequest, config.debug)) {
+                        if (config.debug) {
+                            console.log("valid challenge session, waiving CAPTCHA");
+                        }
+                        return undefined;
+                    }
+                    // A prefetch (Sec-Purpose or Purpose contains "prefetch") gets an empty 403 in place of the
+                    // challenge page: the owner's decision of 2026-11-23 (README, "Which request gets a page";
+                    // RTIStatelessUtils.isPrefetch says what MDN writes about it). Checked after the session
+                    // waiver, so a valid session forwards a prefetch with the verdict, as it would a visit.
+                    // Known limit, not fixed on purpose (the owner's decision of 2026-11-23): a page that a
+                    // site names in <link rel="prefetch"> is asked for with Sec-Fetch-Dest: empty, so it is not
+                    // a page load and, as shipped, does not get here: it is forwarded with the verdict (the
+                    // JSDoc of RTIStatelessUtils.isPrefetch; README, the known limits of "Which request gets a page").
+                    if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
+                        if (config.debug) {
+                            console.log("prefetch: an empty 403 in place of the challenge page");
+                        }
+                        return prefetchAnswer(request, rtiResponse);
+                    }
+                    // A GET gets here when it is a page load that no rule covers; a GET or HEAD also when
+                    // actionOnSuspicious or blockingStrategy: CAPTCHA sends it to the CAPTCHA (README, "Which
+                    // request gets a page"). While the interstitial is on, a page load gets here when the
+                    // interstitial's decision gives CHALLENGE. It is challenged in place: after the challenge, the
+                    // visitor is back on the page they asked for. A request with a body (POST, PUT, PATCH, DELETE,
+                    // OPTIONS) gets the page for where the visitor came from (the Referer, same site only), or the
+                    // site's home page without a usable Referer. The body is not kept (a challenge page cannot carry
+                    // it through): the visitor can send it again after solving the challenge.
+                    const afterChallengeRequest = rtiHelperService.isBodylessMethod(originRequest.method) ? originRequest : refererAfterChallengeRequest(originRequest);
+                    // "cookie" mode: the copy gets the kept original Referer as x-cheq-original-referer for this call
+                    // only, so that the CAPTCHA page can carry it on. RTI was called before, without it. The header
+                    // comes off again before the request leaves handle: from the copy and from a Request that
+                    // config.challenge returns, also when the call throws. So the origin does not get it either.
+                    const refererForCall = keptReferer !== undefined && afterChallengeRequest === originRequest;
+                    if (refererForCall) {
+                        originRequest.headers.set(ORIGINAL_REFERER_HEADER, keptReferer);
+                    }
+                    try {
+                        // Passed on as it is, without the header of this call: a Response is our answer, a Request is
+                        // forwarded. Awaited here, so a rejection is caught below.
+                        const answer = await config.challenge(afterChallengeRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+                        if (refererForCall && answer instanceof Request) {
+                            answer.headers.delete(ORIGINAL_REFERER_HEADER);
+                        }
+                        return answer;
+                    } finally {
+                        if (refererForCall) {
+                            originRequest.headers.delete(ORIGINAL_REFERER_HEADER);
+                        }
+                    }
+                }
+                return undefined;
+            } catch (e) {
+                logError(context, `Challenge error handling request '${getCdnRequestId(request)}'`, e);
+                return originRequest;
+            }
+        default:
+            return undefined;
+    }
+}
+
+// The empty 403 for a prefetch that would get a page, the challenge page or the interstitial (README, "Which request
+// gets a page"): no body, the request ids and no-store.
+function prefetchAnswer(request: Request, rtiResponse: RTIResponse): Response {
+    return new Response(null, {
+        status: 403,
+        headers: {
+            "x-cheq-cdn-request-id": request.headers.get("cf-ray") || '',
+            "x-cheq-id": rtiResponse.ids.rayId,
+            "x-cheq-page-view-id": rtiResponse.ids.pageViewId ?? '',
+            ...responseHeaders.noStore(),
+        },
+    });
+}
+
+/**
+ * The strategy INTERSTITIAL: a page load that RTI wants challenged while the interstitial is on (README,
+ * "Interstitial"). InterstitialService.decide says what the request gets:
+ * - forward: it is sent on with the verdict (a request that is not a page load).
+ * - show: the interstitial page, and the shown line. A prefetch gets the empty 403 instead: no page, no mark, no line.
+ * - act: the Action of onSecondVerdict or onSessionNotFound, carried out by carryOutStrategy. CHALLENGE is the CAPTCHA,
+ *   whatever challengingStrategy says, and ALLOW sends the request on with the verdict. The reload of the page gets the
+ *   reload line first (sendReloadLine).
+ * An error in the shown line or the reload line is logged and changes nothing else: the request still gets the page, or
+ * the answer of act. Any other error is logged, and the request is sent on with the verdict (`undefined`, as for
+ * forward). Not so for an error in the CAPTCHA case that act reaches: that case keeps its own catch, logs `Challenge
+ * error handling request …`, and sends the copy on without x-cheq-rti-result, as the CAPTCHA does without the
+ * interstitial.
+ * `keptReferer` is the mark's original Referer that handle keeps in "cookie" mode. The CAPTCHA that act reaches gets it.
+ */
+async function interstitialStrategy(request: Request, originRequest: Request, context: ExecutionContext, rtiResponse: RTIResponse, pageLoad: boolean, pageLoadHeaders: PageLoadHeaders, mark: ValidMark | undefined, keptReferer: string | undefined): Promise<Response | Request | undefined> {
+    try {
+        const outcome = interstitialService.decide(interstitialFacts(rtiResponse, pageLoad, mark));
+        switch (outcome.kind) {
+            case "forward":
+                if (config.debug) {
+                    console.log(`interstitial: forward, ${outcome.reason}`);
+                }
+                return undefined;
+            case "act": {
+                // second-verdict:<Action> (RTI found the tag's session) or no-session:<Action> (a valid mark, no session).
+                sendReloadLine(context, `${outcome.reason}:${Action[outcome.action]}`, mark, pageLoad, pageLoadHeaders, rtiResponse, originRequest);
+                const strategy = outcome.action === Action.CHALLENGE ? ActionStrategy.CAPTCHA : rtiHelperService.getActionStrategy(outcome.action);
+                return await carryOutStrategy(strategy, request, originRequest, context, rtiResponse, pageLoadHeaders, keptReferer);
+            }
+            case "show": {
+                // A prefetch gets the empty 403 in place of the page, with no mark and no shown line: the owner's
+                // decision of 2026-11-23 (README, "Which request gets a page").
+                if (rtiHelperService.isPrefetch(pageLoadHeaders)) {
+                    if (config.debug) {
+                        console.log("prefetch: an empty 403 in place of the interstitial");
+                    }
+                    return prefetchAnswer(request, rtiResponse);
+                }
+                // The copy's x-cheq-original-referer, else the value kept in "cookie" mode. A kept value comes from a
+                // valid mark, and decide shows the page only without one: the page gets a kept value only if decide
+                // changes.
+                const carriedReferer = originRequest.headers.get(ORIGINAL_REFERER_HEADER) ?? keptReferer;
+                const page = await interstitialService.page(interstitialRequest(originRequest, pageLoad), rtiResponse.ids.rayId, carriedReferer);
+                const response = new Response(page.body, { status: page.status, headers: page.headers });
+                // The shown line has its own catch: an error in it is logged, and the page is still the answer.
+                try {
+                    sendOutcomeLine(context, shownLine("shown", rtiResponse, originRequest));
+                } catch (e) {
+                    logInterstitialError(context, originRequest, e);
+                }
+                return response;
+            }
+        }
+    } catch (e) {
+        logInterstitialError(context, originRequest, e);
+        return undefined;
+    }
+}
+
+/**
+ * MONITORING mode (FR-7): no request gets the interstitial. The would-show line says that a page load would get the page
+ * in BLOCKING mode: getEnforcedAction gives CHALLENGE, the strategy for it is INTERSTITIAL, decide says show (so a valid
+ * mark gives no line), and it is not a prefetch (a prefetch would get the empty 403). An error is logged, and the request
+ * goes on as before.
+ */
+function logWouldShow(originRequest: Request, context: ExecutionContext, rtiResponse: RTIResponse, path: string, pageLoad: boolean, pageLoadHeaders: PageLoadHeaders, mark: ValidMark | undefined): void {
+    try {
+        const enforced = rtiHelperService.getEnforcedAction(rtiResponse);
+        if (enforced === Action.CHALLENGE
+            && rtiHelperService.getStrategyForRequest(enforced, originRequest.method, path, pageLoad, interstitialService.on).strategy === ActionStrategy.INTERSTITIAL
+            && interstitialService.decide(interstitialFacts(rtiResponse, pageLoad, mark)).kind === "show"
+            && !rtiHelperService.isPrefetch(pageLoadHeaders)) {
+            sendOutcomeLine(context, shownLine("would-show", rtiResponse, originRequest));
+        }
+    } catch (e) {
+        logInterstitialError(context, originRequest, e);
+    }
+}
+
+// The plain facts that InterstitialService.decide needs. `mark` is the request's valid mark (readMark), if it has one.
+function interstitialFacts(rtiResponse: RTIResponse, pageLoad: boolean, mark: ValidMark | undefined): InterstitialFacts {
+    return {
+        // A declared good bot (a crawler such as Google's or Bing's) is not checked here. RTI is expected to give it a
+        // benign verdict, so it does not reach the interstitial (agreed with the PM on 2026-11-24; the product spec's
+        // FR-2 had asked for a check). If a site's good bots get a suspicious verdict, set that in the policy screen of
+        // the CHEQ console: here they would get the interstitial like any visitor.
+        pageLoad,
+        sessionFound: rtiResponse.metadata?.sessionFound ?? null,
+        validMark: mark !== undefined,
+    };
+}
+
+/**
+ * The valid mark (_cq_it) of the copy, or `undefined` (InterstitialService.readMark). In "header" mode the mark's
+ * original Referer becomes x-cheq-original-referer on the copy, so that RTI and the origin get it, unless
+ * config.originalReferer (with the shipped example, a valid _cq_rf) already set one. handle removed the client's own
+ * copy of that header before, so the copy carries only a value this Worker set. In "cookie" mode the copy is not
+ * changed, and handle keeps the Referer (keptReferer). An error is logged and counts as no mark: RTI is still called.
+ */
+async function readMark(originRequest: Request, pageLoad: boolean, context: ExecutionContext): Promise<ValidMark | undefined> {
+    try {
+        const mark = await interstitialService.readMark(interstitialRequest(originRequest, pageLoad));
+        if (mark?.referer !== undefined && interstitialService.settings!.originalRefererVia === "header" && !originRequest.headers.has(ORIGINAL_REFERER_HEADER)) {
+            originRequest.headers.set(ORIGINAL_REFERER_HEADER, mark.referer);
+        }
+        return mark;
+    } catch (e) {
+        logInterstitialError(context, originRequest, e);
+        return undefined;
+    }
+}
+
+// Whether the request gets the reload line: in BLOCKING mode, a page load with a valid mark for its own page that is not
+// a prefetch.
+function getsReloadLine(mark: ValidMark, pageLoad: boolean, pageLoadHeaders: PageLoadHeaders): boolean {
+    return config.mode === Mode.BLOCKING && pageLoad && mark.forThisPage && !rtiHelperService.isPrefetch(pageLoadHeaders);
+}
+
+/**
+ * Sends the reload line for `outcome` when the request gets one (getsReloadLine). `mark` is the request's valid mark, if
+ * it has one. Used by handle and by the act case of interstitialStrategy. No log line may change what the request
+ * gets: an error while the line is checked, built or sent is logged, and nothing else changes.
+ */
+function sendReloadLine(context: ExecutionContext, outcome: string, mark: ValidMark | undefined, pageLoad: boolean, pageLoadHeaders: PageLoadHeaders, rtiResponse: RTIResponse, originRequest: Request): void {
+    try {
+        if (mark !== undefined && getsReloadLine(mark, pageLoad, pageLoadHeaders)) {
+            sendOutcomeLine(context, reloadLine(outcome, mark, rtiResponse, originRequest));
+        }
+    } catch (e) {
+        logInterstitialError(context, originRequest, e);
+    }
+}
+
+// The reload line for `outcome`. The first ray id comes from the mark, so it can be joined to the shown line.
+function reloadLine(outcome: string, mark: ValidMark, rtiResponse: RTIResponse, originRequest: Request): string {
+    return `interstitial: ${outcome}, firstRayId=${mark.firstRayId}, rayId=${rtiResponse.ids.rayId}, verdict=${rtiResponse.decision.verdict}, reasons=${reasons(rtiResponse)}, sessionFound=${rtiResponse.metadata?.sessionFound ?? null}, request=${getCdnRequestId(originRequest)}`;
+}
+
+// The plain facts of the request sent on (the copy) for InterstitialService. The binding key follows the interstitial's
+// `binding`. Only while the interstitial is on: its settings are there then.
+function interstitialRequest(originRequest: Request, pageLoad: boolean): InterstitialRequest {
+    return {
+        url: originRequest.url,
+        cookie: originRequest.headers.get("cookie") ?? "",
+        referer: originRequest.headers.get("referer"),
+        bindingKey: sessionBindingKey({ sessionBinding: interstitialService.settings!.binding }, originRequest),
+        pageLoad,
+    };
+}
+
+// The line for a page load that gets the interstitial ("shown"), or would get it in MONITORING mode ("would-show").
+function shownLine(kind: "shown" | "would-show", rtiResponse: RTIResponse, originRequest: Request): string {
+    return `interstitial: ${kind}, rayId=${rtiResponse.ids.rayId}, verdict=${rtiResponse.decision.verdict}, reasons=${reasons(rtiResponse)}, request=${getCdnRequestId(originRequest)}`;
+}
+
+// RTI's reason codes for an outcome line, joined with ",". "" when RTI gives none.
+function reasons(rtiResponse: RTIResponse): string {
+    return rtiResponse.cheqDetection?.reasons?.join(",") ?? "";
+}
+
+// Sends one outcome line of the interstitial: to the RTI logger through waitUntil, unless logOutcomes is false, and to
+// the console in debug mode. Only while the interstitial is on: its settings are there then.
+function sendOutcomeLine(context: ExecutionContext, line: string): void {
+    if (config.debug) {
+        console.log(line);
+    }
+    if (interstitialService.settings!.logOutcomes) {
+        context.waitUntil(logger.info(line));
     }
 }
 
@@ -380,6 +654,11 @@ function logError(context: ExecutionContext, message: string, e: unknown): void 
     }
 }
 
+// Logs an error of the interstitial's code for the request (logError): `Interstitial error handling request '<cf-ray>'`.
+function logInterstitialError(context: ExecutionContext, originRequest: Request, e: unknown): void {
+    logError(context, `Interstitial error handling request '${getCdnRequestId(originRequest)}'`, e);
+}
+
 // Whether the visitor already solved the challenge (a valid session). false when validateChallenge is not set.
 async function isValidChallenge(request: Request, isDebug: boolean | undefined): Promise<boolean> {
     return await config.validateChallenge?.(request, isDebug) ?? false;
@@ -397,15 +676,20 @@ function getCdnRequestId(request: Request): string {
  * and can send it again. Without a usable Referer (none, another site, or not a URL), a GET for the site's home page
  * ("/"): an address on another site is never used, so the CAPTCHA can't be turned into an open redirect.
  * Only the path and the query are set, on this request's own URL: a Referer path that starts with "//" stays a path
- * here, where `new URL(path, base)` would read it as another host. The body is not kept, the headers and the redirect
- * mode are. The real request is not changed: it is still the one checked for a session.
+ * here, where `new URL(path, base)` would read it as another host. The body is not kept, and neither is
+ * x-cheq-original-referer: the CAPTCHA page takes that header first, and the form page carries its own Referer (README,
+ * "The original Referer"). The other headers and the redirect mode are kept. The real request is not changed: it is
+ * still the one checked for a session, and it keeps x-cheq-original-referer.
  */
 function refererAfterChallengeRequest(request: Request): Request {
     const url = new URL(request.url);
     const referer = rtiHelperService.sameSiteReferer(request.headers.get("referer"), url.host);
     url.pathname = referer?.path ?? "/";
     url.search = referer?.query ?? "";
-    return new Request(url.href, { method: "GET", headers: request.headers, redirect: request.redirect });
+    // A copy of the headers, so x-cheq-original-referer comes off the GET only.
+    const headers = new Headers(request.headers);
+    headers.delete(ORIGINAL_REFERER_HEADER);
+    return new Request(url.href, { method: "GET", headers, redirect: request.redirect });
 }
 
 // After a solved CAPTCHA: where the visitor came from before it, as x-cheq-original-referer for RTI and the origin.

@@ -14,9 +14,15 @@ export interface CloudflareConfig extends Config {
      * request gets a page" in the README; or a BLOCK action with `blockingStrategy: CAPTCHA`) and the visitor has no
      * valid session (see `validateChallenge`). In that case a prefetch (`Sec-Purpose` or `Purpose` contains
      * `prefetch`) gets an empty 403, and `challenge` is not called.
+     * While the interstitial is on (see `interstitial` below, and "Interstitial" in the README), a GET page load that
+     * RTI wants challenged goes to the interstitial's decision in place of this call, unless a rule of
+     * `actionOnSuspicious` that covers it gives ALLOW, BLOCK or REDIRECT. The decision leads here when it gives
+     * `Action.CHALLENGE` (`onSecondVerdict` or `onSessionNotFound`), or `Action.BLOCK` with `blockingStrategy: CAPTCHA`.
+     * In the interstitial's "cookie" mode the request this gets can carry `x-cheq-original-referer` (the mark's original
+     * Referer) for the length of the call only.
      * In BLOCKING mode it is also called for every reply to the challenge page (see `isChallengeResponse`) when RTI
-     * allows it (no strategy) or the strategy is CAPTCHA (`isChallengeReplyAllowed`), with or without a valid session.
-     * Any other strategy (ACCESS_DENIED, NOT_FOUND, REDIRECT) is enforced as usual.
+     * allows it (no strategy) or the strategy is CAPTCHA or INTERSTITIAL (`isChallengeReplyAllowed`), with or without
+     * a valid session. Any other strategy (ACCESS_DENIED, NOT_FOUND, REDIRECT) is enforced as usual.
      * When a recognized reply cannot be evaluated (RTI error or timeout, a malformed RTI response, or any other error
      * before the decision), it is still called, without `addRtiResultHeader` and with a stand-in
      * `response` that is NOT an RTI answer: only `ids` exists (no `decision`, `classification`, ...). `ids.rayId` and
@@ -176,7 +182,8 @@ export const config: CloudflareConfig = {
     // Which request gets the CAPTCHA page when RTI says CHALLENGE and the strategy is CAPTCHA (challengingStrategy, the
     // default). README, "Which request gets a page":
     //   1. Does a rule below match the path and cover the method? The first such rule decides.
-    //   2. Else, is it a page load (a browser asking for a page)? It gets the CAPTCHA page.
+    //   2. Else, is it a page load (a browser asking for a page)? It gets the CAPTCHA page. While the interstitial
+    //      below is on, a GET page load gets the interstitial page instead, also for a rule's Action.CHALLENGE.
     //   3. Else, the method's default below decides (ALLOW without one).
     // Wherever this comment says the CAPTCHA page, a prefetch gets an empty 403 (README, "Which request gets a page").
     // A page load gets the CAPTCHA page unless a rule covers it: GET below is only for a GET that is not a page load.
@@ -207,6 +214,28 @@ export const config: CloudflareConfig = {
             // { path: '^/login$', methods: ['POST'], action: Action.CHALLENGE },
             // { path: '^/api/', methods: ['GET'], action: Action.ALLOW },
         ],
+    },
+
+    // Every setting below is explained in full in the README ("Interstitial", "Settings"); hover a setting's name for
+    // a summary.
+    // The passive interstitial, Cloudflare only for now (see "Interstitial" in the README): a page load that RTI wants
+    // challenged first gets a short CHEQ page, which runs your CHEQ tag and reloads; RTI then decides again with the
+    // tag's data. Off until tag is set: paste the whole tag line from the CHEQ console. The tag needs its option ck4
+    // (read in CHEQ's tag code on 2026-11-17, see the README).
+    interstitial: {
+        enabled: true,                       // false: "Standard mode", a challenge gets the CAPTCHA (if set) as before
+        tag: "REPLACE_ME",                   // '<script async src="https://…/i/<tagHash>.js" data-ch="…" class="ct_clicktrue_…" data-jsonp="…"></script>'
+        onSecondVerdict: Action.ALLOW,       // suspicious, and RTI has the tag's session (on the reload, or the tag ran on an earlier page): ALLOW, BLOCK, REDIRECT or CHALLENGE (the CAPTCHA)
+        onSessionNotFound: Action.ALLOW,     // suspicious again, with a valid mark, and RTI has no tag session: the same four
+        maxWaitMs: 5000,                     // how long the page waits for the tag before it reloads anyway
+        statusCode: 403,                     // the status of the interstitial page
+        originalRefererVia: "header",        // as the CAPTCHA: "header" (x-cheq-original-referer) or "cookie" (_cq_ref)
+        binding: { ip: "exact", userAgent: true }, // which client a mark belongs to, as the CAPTCHA's sessionBinding
+        // logoUrl: "https://www.example.com/logo.svg",
+        // headline: "Checking your browser",
+        // message: "This usually takes about a second.",
+        // lang: "en",
+        logOutcomes: true,                   // one line per interstitial decision to the RTI logger
     },
 
     timeout: 500,

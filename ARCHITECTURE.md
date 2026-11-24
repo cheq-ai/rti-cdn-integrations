@@ -1,4 +1,4 @@
-<!-- cspell:ignore CHEQ cheq cheqzone rtilogger PMUSER duid pvid akamai -->
+<!-- cspell:ignore CHEQ cheq cheqzone rtilogger PMUSER duid pvid akamai HMAC referer -->
 # Architecture
 
 How `rti-cdn-integrations` is put together: one shared core, four CDN adapters, and a shared
@@ -46,8 +46,10 @@ core.
 | Path | Responsibility |
 | --- | --- |
 | `core/models/` | Types only — `Config`, `RTIRequest`, `RTIResponse`, `Action`, `ActionStrategy`, `Mode`, `EventType` |
+| `core/models/interstitial.model.ts` | The passive interstitial's types: `config.interstitial` as written and as checked, the plain facts of a request, the decision's outcome, a valid mark, the page as a plain answer, and the type of the HMAC function the glue passes in |
 | `core/services/rti-helper.service.ts` | The decision pipeline: everything that reads `config` (ignore paths, event type, action, strategy, config validation). Extends `RTIStatelessUtils` |
-| `core/services/rti-stateless-utils.ts` | The config-free helpers every integration shares: cookie and header parsing, the `x-cheq-rti-result` header, `original_url` and host checks for challenges, debug-log redaction, `errorMessage`. No constructor arguments, no state, imports only models (its spec enforces this) |
+| `core/services/rti-stateless-utils.ts` | The config-free helpers every integration shares: cookie and header parsing, the `x-cheq-rti-result` header, `original_url` and host checks for challenges, the page-load and prefetch checks, debug-log redaction, `errorMessage`. No constructor arguments, no state, imports only models (its spec enforces this) |
+| `core/services/interstitial.service.ts` | `InterstitialService`: reads `config.interstitial` and its tag line once, at cold start, and lists the problems for the glue to log. Per request: `decide` (what a page load with the `INTERSTITIAL` strategy gets), `page` (the page and its signed mark), `readMark` (checks a mark). Imports nothing from `node:` and uses no `crypto`: the glue passes the HMAC function in. The instance is frozen and holds nothing of a request |
 | `core/services/rti-service.base.ts` | Shared RTI request flow (config, status check, JSON parse, errors); subclasses only send |
 | `core/services/rti.service.ts` | `fetch()`-based RTI client (Cloudflare) |
 | `core/services/rti-https.service.ts` | `node:https`-based RTI client (CloudFront: avoids the `fetch` cold-start cost on 128 MB Lambda@Edge) |
@@ -55,7 +57,8 @@ core.
 | `core/services/rti-logger.service.ts` | `fetch()`-based telemetry/error logger (Cloudflare) |
 | `core/services/rti-https-logger.service.ts` | `node:https`-based logger with a 1 s timeout (CloudFront) |
 | `core/services/https-client.ts` | Keep-alive `node:http`/`node:https` POST client with a single retry on a dropped pooled connection |
-| `core/helpers/block-page-helpers.ts` | Renders the HTML 403/404 block page |
+| `core/helpers/block-page-helpers.ts` | Renders the HTML 403/404 block page. Its `escapeHtml` is reused by the interstitial page |
+| `core/helpers/interstitial-page-helpers.ts` | Renders the interstitial page, with its script as one string constant (`INTERSTITIAL_SCRIPT`): it adds the customer's tag, waits for a new `_cq_pvid`, writes the mark cookie `_cq_it` and reloads |
 | `core/testing/` | Shared test harness — see [Testing](#testing) |
 
 Fastly is the exception: it shares no `core/` code, for reasons covered under
@@ -92,20 +95,33 @@ Every request follows the same path. Only the adapter layer differs per CDN.
          └── BLOCK / CHALLENGE / REDIRECT
                    │
                    ▼
-             getActionStrategy(action)
+             getStrategyForRequest(action, …)   (Akamai: getActionStrategy(action), see below)
                    ├── ACCESS_DENIED ──▶ 403 + block page
                    ├── NOT_FOUND     ──▶ 404 + block page
                    ├── REDIRECT      ──▶ 302 + Location
-                   └── CAPTCHA       ──▶ config.challenge(request, response)
+                   ├── CAPTCHA       ──▶ config.challenge(request, response)
+                   └── INTERSTITIAL  ──▶ InterstitialService.decide   (Cloudflare only, see below)
 ```
 
 CloudFront and Cloudflare differ: they do not call `validateChallenge` before RTI. They always call RTI, and check
 `validateChallenge` only in the `CAPTCHA` branch: a valid session waives the challenge and the request is
 forwarded with `x-cheq-rti-result` (the real verdict). Otherwise they call
-`config.challenge(request, response, addRtiResultHeader)`.
+`config.challenge(request, response, addRtiResultHeader)`. They get the strategy from `getStrategyForRequest`, which
+asks which request gets a page (see "Which request gets a page" in `integrations/cloudflare/README.md`).
+
+`INTERSTITIAL`, the passive interstitial, comes only from `getStrategyForRequest`, and only for a caller that passes
+`interstitialOn: true` as its fifth argument: Cloudflare's glue passes `InterstitialService.on`. It is given only to a
+`GET` page load that RTI wants challenged. Every other request gets the answer it gets without that argument,
+`challengingStrategy` included. `getAction` and `getActionStrategy`, which Akamai calls, keep their answers, and
+`getActionStrategy` never gives `INTERSTITIAL`: a configured `INTERSTITIAL` in `blockingStrategy` or
+`challengingStrategy` counts as not set, because Akamai looks those strategies up by name.
+`InterstitialService.decide` then says what the page load gets: `onSecondVerdict` (RTI found the tag's session),
+`onSessionNotFound` (a valid mark), or the interstitial page, which runs the customer's CHEQ tag and reloads so that
+RTI decides a second time with the tag's data. The glue carries the outcome out with the strategies above. CloudFront
+passes nothing, and does not read `config.interstitial`.
 
 CloudFront and Cloudflare also route the reply to their challenge page. The solved form is a new request with a new verdict, so in
-`BLOCKING` mode, when the strategy is none (ALLOW) or `CAPTCHA` (`isChallengeReplyAllowed`) and the
+`BLOCKING` mode, when the strategy is none (ALLOW), `CAPTCHA` or `INTERSTITIAL` (`isChallengeReplyAllowed`) and the
 `config.isChallengeResponse` callback recognizes the request, it goes to `config.challenge` before the session waiver,
 which verifies it and redirects to the original URL. Any other strategy (blocks, 404s, redirects) is enforced as usual. When the request cannot be
 evaluated (RTI error or timeout, a malformed RTI response, any other error before the decision), a recognized reply
@@ -137,6 +153,9 @@ telemetry still flows, but no action is ever taken. Every shipped config ships i
 | `BLOCK` | `blockingStrategy` | `ACCESS_DENIED` (403) |
 | `CHALLENGE` | `challengingStrategy` | `CAPTCHA` |
 | `REDIRECT` | — | always `REDIRECT` (302) |
+
+While Cloudflare's interstitial is on, a `GET` page load that RTI wants challenged gets `INTERSTITIAL`, whatever
+`challengingStrategy` says (see the pipeline above).
 
 `CAPTCHA` only does anything when `config.challenge` is wired up; with no challenge callback
 the request falls through to origin. Cloudflare and CloudFront ship a Cloudflare Turnstile
@@ -239,12 +258,25 @@ The cleanest reference implementation, and the best starting point for reading t
 - Config is a static object in `src/config.ts`, edited before `wrangler deploy`.
 
 In `index.ts`, `handle` decides and never calls the origin: it returns our own answer (a block page, a
-redirect, a challenge page) or the request to forward. The Worker entry makes the only origin call, in
-`forwardToOrigin`, which holds the single demo switch: `OPTION 1` (local/demo, proxy to a fixed origin)
-or `OPTION 2` (production, pass through as-is).
+redirect, a challenge page, the interstitial page, the empty 403 for a prefetch) or the request to forward. The Worker
+entry makes the only origin call, in `forwardToOrigin`, which holds the single demo switch: `OPTION 1` (local/demo,
+proxy to a fixed origin) or `OPTION 2` (production, pass through as-is).
+
+`signing.ts` holds what the Worker's signed cookies share: `hmacHex32` (HMAC-SHA256 on Web Crypto, its first 32 hex
+characters) and `sessionBindingKey` (the client's IP and User-Agent as one text, for the HMAC input). The Turnstile
+example and the interstitial's glue both use them.
 
 `turnstile-challenge-example.ts` is a port of CloudFront's Turnstile example, on Web Crypto and `fetch`.
 It keeps one thing in memory, the pause counter of its CAPTCHA, per isolate.
+
+The passive interstitial's glue is in `index.ts`. The rules, the page and the mark are in core. The glue makes one
+`InterstitialService` when the module loads, with `config` and `hmacHex32`, and logs its problems as
+`[interstitial] …` warnings. Per request, it reads the mark (`_cq_it`) before RTI is called (in `"header"` mode a
+valid mark sets `x-cheq-original-referer`), passes `customId3` to RTI for the mark's page, and passes `interstitialOn`
+to `getStrategyForRequest`. For `INTERSTITIAL` it gives `decide` the plain facts, turns the page into a `Response`, and
+carries an `Action` out like the other strategies. It sends the outcome lines to the RTI logger through `waitUntil`,
+and in `MONITORING` mode a `would-show` line in place of the page. See "Interstitial" in
+`integrations/cloudflare/README.md`.
 
 ### CloudFront — Lambda@Edge
 

@@ -9,12 +9,13 @@ import type { TurnstileSettings } from './turnstile-challenge-example';
 
 const loadConfig = async () => (await import('./config')).config;
 
-// The five secrets of config.ts that no longer hold the placeholder the repository ships. Read once, in beforeAll.
+// The values of config.ts that no longer hold the placeholder the repository ships: the five secrets and the tag line of
+// the interstitial. Read once, in beforeAll.
 let filledIn: string[] = [];
 
 // The first load of the module graph is slow (seconds on a busy machine): it happens here, with a long timeout, not in
-// the 5 s of a test. It also reads the five secrets: the Turnstile settings are not exported, so the real
-// createTurnstileChallenge is wrapped to see them. The module registry and the mocks are left clean for the tests.
+// the 5 s of a test. It also reads the values that ship as REPLACE_ME: the Turnstile settings are not exported, so the
+// real createTurnstileChallenge is wrapped to see them. The module registry and the mocks are left clean for the tests.
 beforeAll(async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     let turnstile: TurnstileSettings | undefined;
@@ -29,11 +30,13 @@ beforeAll(async () => {
         };
     });
     const config = await loadConfig();
-    const secrets = {
+    const placeholders = {
         apiKey: config.apiKey, tagHash: config.tagHash,
         siteKey: turnstile?.siteKey, secretKey: turnstile?.secretKey, sessionSigningSecret: turnstile?.sessionSigningSecret,
+        // A missing tag line counts as not filled in, so an interstitial block that went missing fails the tests below.
+        'interstitial.tag': config.interstitial?.tag ?? 'REPLACE_ME',
     };
-    filledIn = Object.entries(secrets).filter(([, value]) => value !== 'REPLACE_ME').map(([name]) => name);
+    filledIn = Object.entries(placeholders).filter(([, value]) => value !== 'REPLACE_ME').map(([name]) => name);
     vi.doUnmock('./turnstile-challenge-example');
     vi.restoreAllMocks();
     vi.resetModules();
@@ -63,7 +66,8 @@ describe('Validate config', function () {
 
 describe('shipped config.ts', () => {
     // These tests guard config.ts as this repository ships it. A filled-in config.ts is not wrong, and `npm run deploy`
-    // runs the tests first: as soon as one of the five secrets is set, they are skipped, so they do not stop a deploy.
+    // runs the tests first: as soon as one of the five secrets or interstitial.tag is set, they are skipped, so they do
+    // not stop a deploy.
     const skipIfFilledIn = (context: TestContext) =>
         context.skip(filledIn.length > 0, `config.ts is filled in (${filledIn.join(', ')} no longer REPLACE_ME)`);
 
@@ -123,6 +127,23 @@ describe('shipped config.ts', () => {
                 POST: Action.ALLOW, PUT: Action.ALLOW, PATCH: Action.ALLOW, DELETE: Action.ALLOW, OPTIONS: Action.ALLOW,
             },
             rules: [],
+        });
+    });
+
+    it('ships the interstitial block: on, its tag line REPLACE_ME, and the default of each setting', async (context) => {
+        skipIfFilledIn(context);
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const config = await loadConfig();
+        expect(config.interstitial).toEqual({
+            enabled: true,
+            tag: 'REPLACE_ME',
+            onSecondVerdict: Action.ALLOW,
+            onSessionNotFound: Action.ALLOW,
+            maxWaitMs: 5000,
+            statusCode: 403,
+            originalRefererVia: 'header',
+            binding: { ip: 'exact', userAgent: true },
+            logOutcomes: true,
         });
     });
 

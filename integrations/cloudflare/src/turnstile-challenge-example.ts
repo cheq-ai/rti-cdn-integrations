@@ -3,6 +3,12 @@ import { RTIResponse } from "../../core/models/rti-response.model";
 import { RTIStatelessUtils } from "../../core/services/rti-stateless-utils";
 import type { CloudflareConfig } from "./config";
 import { ResponseHeaders } from "./response-headers";
+import { clientIp, hmacHex32, sessionBindingKey, SessionBinding } from "./signing";
+
+// sessionBindingKey and SessionBinding moved to signing.ts. Exported here too, so code that imports them from this file
+// keeps working.
+export { sessionBindingKey };
+export type { SessionBinding };
 
 // Defined in core, so the debug logs mask the same parameter.
 const TURNSTILE_RESPONSE_QUERY_PARAM = RTIStatelessUtils.TURNSTILE_RESPONSE_QUERY_PARAM;
@@ -71,14 +77,6 @@ export interface TurnstileSettings {
      * - `"cookie"`: the site's own scripts read it from `_cq_ref` (not HttpOnly). The Worker never reads it back.
      */
     originalRefererVia?: "header" | "cookie";
-}
-
-/** See {@link sessionBindingKey}. */
-export interface SessionBinding {
-    /** `"exact"`: the client's address. `"none"`: not bound to the IP. */
-    ip: "exact" | "none";
-    /** Bind to the exact User-Agent. */
-    userAgent: boolean;
 }
 
 /** The settings once createTurnstileChallenge has checked them: every optional setting has its value. */
@@ -205,19 +203,6 @@ const requestCookies = (request: Request): string[] =>
 const cookieValue = (cookies: string[], name: string): string | undefined =>
     cookies.find(c => c.startsWith(`${name}=`))?.substring(name.length + 1);
 
-const encoder = new TextEncoder();
-
-/**
- * HMAC-SHA256 of `message`, keyed with `secret`, as its first 32 lower-case hex characters: the value CloudFront gets
- * from createHmac("sha256", secret).update(message).digest("hex").slice(0, 32). The key is imported for each call and
- * not kept: nothing but the pause counter lives in module state.
- */
-async function hmacHex32(secret: string, message: string): Promise<string> {
-    const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
-    return Array.from(mac, (byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 32);
-}
-
 /** Compares two signatures in constant time for equal lengths: every character is compared, wherever they first differ. */
 function sameSignature(expected: string, actual: string): boolean {
     if (expected.length !== actual.length) {
@@ -246,42 +231,6 @@ async function signSession(secret: string, expiresAt: number, rayId: string, bin
 /** Checks a session signature in constant time. The secret is never a placeholder: createTurnstileChallenge refuses one. */
 async function isValidSessionSignature(secret: string, expiresAt: number, rayId: string, bindingKey: string, signature: string): Promise<boolean> {
     return sameSignature(await signSession(secret, expiresAt, rayId, bindingKey), signature);
-}
-
-/** The client's address as Cloudflare reports it, or null (e.g. in a local run). */
-const clientIp = (request: Request): string | null => request.headers.get("cf-connecting-ip");
-
-/**
- * What a session is bound to: the client's IP ({@link clientIp}, per `sessionBinding.ip`) and User-Agent
- * (`sessionBinding.userAgent`; several User-Agent headers arrive joined with ", "), as one unambiguous string for the HMAC
- * input (`JSON.stringify([ip, userAgent])`, "" for a part that is not bound). Without CF-Connecting-IP (a local run) the
- * IP part is null, so it never matches an IP or an unbound one. Recomputed from each request, never stored: the cookie
- * carries neither the IP nor the User-Agent.
- */
-export function sessionBindingKey(settings: { sessionBinding: SessionBinding }, request: Request): string {
-    const { ip, userAgent } = settings.sessionBinding;
-    return JSON.stringify([sessionBindingIp(ip, clientIp(request)), userAgent ? request.headers.get("user-agent") ?? "" : ""]);
-}
-
-/**
- * The client IP as bound into the session. An IPv6 address in the URL parser's spelling (`2001:0DB8:0:0:0:0:0:1` →
- * `2001:db8::1`), so every spelling of an address is the same client; anything else as given. Three spellings differ
- * from CloudFront's. An IPv4-mapped or IPv4-compatible address is written in hex (`::ffff:102:304`, `::102:304`), and a
- * zone id is not removed (Cloudflare never sends one).
- */
-function sessionBindingIp(mode: SessionBinding["ip"], ip: string | null): string | null {
-    if (mode === "none") {
-        return "";
-    }
-    // Only hex digits, ":" and "." can spell an IPv6 address. Nothing else is put into the URL that is parsed.
-    if (ip && ip.includes(":") && /^[0-9a-f:.]+$/i.test(ip)) {
-        try {
-            return new URL(`http://[${ip}]/`).hostname.slice(1, -1);
-        } catch {
-            // not an IPv6 address: bound as given
-        }
-    }
-    return ip;
 }
 
 /**
@@ -393,12 +342,15 @@ const turnstileChallengeExample = async (settings: ResolvedTurnstileSettings, pa
         // Not solved yet. The return URL keeps the query string (gclid, utm_*, ...): url.pathname is only the path.
         const originalUrl = url.pathname + url.search;
         // Where the visitor came from, carried by the form: after the CAPTCHA the browser only knows this page.
+        // The page takes x-cheq-original-referer when that header has a value, else the request's Referer. The header
+        // can be trusted here: the handler in index.ts removes a copy the client sent, and sets it only from a valid
+        // _cq_rf cookie or a valid interstitial mark.
         // On plain http this value is lost. The cookie that carries it after the solve (_cq_rf or _cq_ref) is Secure,
         // so the browser drops it with the session cookie. On the second CAPTCHA page, on https, the browser reports
         // the site's own http address as the Referer, and that is what this line then takes. The origin and RTI end
         // up with `http://<host>/` as x-cheq-original-referer, not the page the visitor came from (README, "A
         // visitor on plain http").
-        const originalReferer = statelessUtils.originalReferer(request.headers.get("referer"), url.host);
+        const originalReferer = statelessUtils.originalReferer(request.headers.get("x-cheq-original-referer") || request.headers.get("referer"), url.host);
         return challengePage(settings, response, originalUrl, undefined, originalReferer);
     }
     // else : user already solved the challenge and submitted the form with the token. Verify it with Cloudflare's siteverify.
@@ -976,7 +928,8 @@ async function challengePassed(settings: ResolvedTurnstileSettings, request: Req
  * now shows the CAPTCHA page). Not HttpOnly, so scripts can read it. Only set on the 302 after a verified solve.
  * The same format as on CloudFront: `{return URL}|{Referer}`, both URL-encoded, Path=/, 60 seconds.
  * This code never reads it back, so a planted or edited value never becomes x-cheq-original-referer (only a valid
- * _cq_rf can), and RTI never gets it (the handler sends RTI the three CHEQ cookies of the tag, not the Cookie header).
+ * _cq_rf can, or a valid mark of the interstitial), and RTI never gets it (the handler sends RTI the three CHEQ cookies
+ * of the tag, not the Cookie header).
  * The origin gets it inside the Cookie header, as the browser sent it, like any other cookie.
  * It is Secure: a browser drops it from an answer sent over plain http, so a visitor on plain http loses the original
  * Referer (README, "A visitor on plain http").
